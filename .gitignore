@@ -1,8 +1,13 @@
 worker/node_modules/
 worker/.dev.vars
+worker/.wrangler/
 .DS_Store
 *.xcuserstate
+*.bak
 build/
 releases/
 .claude/
 coding-plans/
+.xai-api-key
+# Xcode user-specific data
+leanring-buddy.xcodeproj/xcuserdata/

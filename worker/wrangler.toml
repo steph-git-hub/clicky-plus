@@ -3,4 +3,5 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 
 [vars]
-ELEVENLABS_VOICE_ID = "kPzsL2i3teMYv0FxEYQ6"
+ELEVENLABS_VOICE_ID = "WZlYpi1yf6zJhNWXih74"
+XAI_VOICE_ID = "ara"

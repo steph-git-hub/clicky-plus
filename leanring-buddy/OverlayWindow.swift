@@ -30,6 +30,16 @@ class OverlayWindow: NSWindow {
         self.isReleasedWhenClosed = false
         self.hasShadow = false
 
+        // Exclude from cross-process window capture. Clicky's own burst /
+        // typing-mode screenshots use ScreenCaptureKit, which skips windows
+        // with sharingType = .none — so we never accidentally include our
+        // own overlay in the screenshots we send to Claude. This alone does
+        // NOT help the native Cmd+Shift+4 picker (screencaptureui uses a
+        // different capture path); that's handled by OverlayWindowManager's
+        // suspend/resume driven by the CGEventTap in GlobalPushToTalk-
+        // ShortcutMonitor.
+        self.sharingType = .none
+
         // Important: Allow the window to appear even when app is not active
         self.hidesOnDeactivate = false
 
@@ -107,6 +117,14 @@ struct BlueCursorView: View {
     let isFirstAppearance: Bool
     @ObservedObject var companionManager: CompanionManager
 
+    /// v12u (2026-04-28): Cursor presence indicator style. Reverted to
+    /// "triangle" as default after Steph tested the glow and didn't love
+    /// it. Glow stays available for future iteration. To try the glow:
+    ///   defaults write com.makesomething.leanring-buddy clicky.cursorIndicatorStyle glow
+    /// then relaunch. The system cursor itself is never modified —
+    /// macOS doesn't allow apps to recolor the global pointer.
+    @AppStorage("clicky.cursorIndicatorStyle") private var cursorIndicatorStyle: String = "triangle"
+
     @State private var cursorPosition: CGPoint
     @State private var isCursorOnThisScreen: Bool
 
@@ -180,6 +198,46 @@ struct BlueCursorView: View {
         "here it is!",
         "found it!"
     ]
+
+    /// The color used for the waveform + spinner right now. Encodes the
+    /// current capture mode so the user has immediate visual feedback
+    /// about what kind of interaction they triggered:
+    ///   cyan   → polish hotkey flash (⌃⌥⌘ or voice "polish") — brief
+    ///   yellow → capture-to-inbox mode (Fn+Opt)
+    ///   purple → voice-to-text mode (Fn+Shift), raw transcript pastes
+    ///   green  → typing mode (Fn+Cmd), Claude response pastes
+    ///   red    → burst mode (Fn+Shift+Opt), multi-frame capture
+    ///   blue   → normal push-to-talk voice
+    /// Polish flash takes precedence because it's a brief 250ms tap-fire
+    /// confirmation; the other modes are sustained holds. Order matters
+    /// only defensively — the shortcut layer already ensures the
+    /// hold-mode flags can't overlap, and the polish-flash flag is also
+    /// gated on `pendingPolishCommandTask == nil` at trigger time.
+    private var currentCursorTint: Color {
+        if companionManager.isPolishCommandFlashActive
+            || companionManager.isPolishHotkeyModifierCaptureModeActive {
+            return DS.Colors.overlayCursorCyan
+        }
+        if companionManager.isCaptureToInboxModeActive {
+            return DS.Colors.overlayCursorYellow
+        }
+        if companionManager.isVoiceToTextModeActive {
+            return DS.Colors.overlayCursorPurple
+        }
+        if companionManager.isTypingModeActive {
+            return DS.Colors.overlayCursorGreen
+        }
+        if companionManager.isBurstModeActive || companionManager.isBurstResponseCycleInFlight {
+            // Cover both the capture phase (isBurstModeActive, briefly
+            // ~hold duration) AND the processing/spinner phase that follows
+            // (isBurstResponseCycleInFlight, until response is delivered).
+            // Without the second flag, the spinner falls back to default
+            // blue instead of burst red because isBurstModeActive clears
+            // ~100ms after release.
+            return DS.Colors.overlayCursorRed
+        }
+        return DS.Colors.overlayCursorBlue
+    }
 
     var body: some View {
         ZStack {
@@ -302,13 +360,49 @@ struct BlueCursorView: View {
             // During cursor following: fast spring animation for snappy tracking.
             // During navigation: NO implicit animation — the frame-by-frame bezier
             // timer controls position directly at 60fps for a smooth arc flight.
+            // v12t: cursor presence indicator. The triangle and glow share
+            // identical visibility/animation rules; only the visual differs.
+            // Switching is controlled by the AppStorage flag at the top of
+            // BlueCursorView.
+            //
+            // The triangle (legacy) is a small filled blue arrow that
+            // navigates and rotates to face the cursor.
+            //
+            // The glow (default in v12t) is a soft tinted radial halo
+            // around the cursor hotspot — same "Clicky is running" presence
+            // signal but far less visually intrusive. It does NOT replace
+            // the system cursor (macOS doesn't allow that); it adds a
+            // halo underneath the OS-rendered pointer.
+            let presenceTint = currentCursorTint
+            let presenceVisible = buddyIsVisibleOnThisScreen
+                && !companionManager.isVoiceToTextModeActive
+                && !companionManager.isTypingModeActive
+                && !companionManager.isBurstModeActive
+                && !companionManager.isCaptureToInboxModeActive
+                && (companionManager.voiceState == .idle || companionManager.voiceState == .responding)
+
+            // Triangle path — only rendered if explicitly opted-in via
+            // UserDefaults. The default is the glow.
             Triangle()
                 .fill(DS.Colors.overlayCursorBlue)
-                .frame(width: 16, height: 16)
+                // v12u: 12pt (was 16pt) — 25% smaller per Steph's request
+                // for a more subtle presence while still keeping the
+                // triangle as the cursor indicator.
+                .frame(width: 12, height: 12)
                 .rotationEffect(.degrees(triangleRotationDegrees))
-                .shadow(color: DS.Colors.overlayCursorBlue, radius: 8 + (buddyFlightScale - 1.0) * 20, x: 0, y: 0)
+                .shadow(color: DS.Colors.overlayCursorBlue, radius: 6 + (buddyFlightScale - 1.0) * 20, x: 0, y: 0)
                 .scaleEffect(buddyFlightScale)
-                .opacity(buddyIsVisibleOnThisScreen && (companionManager.voiceState == .idle || companionManager.voiceState == .responding) ? cursorOpacity : 0)
+                // Triangle is hidden the MOMENT any capture mode goes
+                // active, not when voiceState catches up. The voiceState
+                // pipeline is async (Combine → main queue) and has a
+                // 0.25s crossfade, which caused the triangle to visibly
+                // overlap the waveform during mode startup. Mode flags
+                // flip synchronously in the shortcut handlers, so
+                // gating on them guarantees a clean handoff.
+                .opacity(
+                    cursorIndicatorStyle == "triangle" && presenceVisible
+                        ? cursorOpacity : 0
+                )
                 .position(cursorPosition)
                 .animation(
                     buddyNavigationMode == .followingCursor
@@ -316,27 +410,95 @@ struct BlueCursorView: View {
                         : nil,
                     value: cursorPosition
                 )
-                .animation(.easeIn(duration: 0.25), value: companionManager.voiceState)
+                .animation(.easeIn(duration: 0.12), value: companionManager.voiceState)
+                .animation(.easeOut(duration: 0.08), value: companionManager.isVoiceToTextModeActive)
+                .animation(.easeOut(duration: 0.08), value: companionManager.isTypingModeActive)
+                .animation(.easeOut(duration: 0.08), value: companionManager.isBurstModeActive)
+                .animation(.easeOut(duration: 0.08), value: companionManager.isCaptureToInboxModeActive)
+                .animation(.easeInOut(duration: 0.12), value: companionManager.isPolishCommandFlashActive)
+                .animation(.easeInOut(duration: 0.12), value: companionManager.isPolishHotkeyModifierCaptureModeActive)
                 .animation(
                     buddyNavigationMode == .navigatingToTarget ? nil : .easeInOut(duration: 0.3),
                     value: triangleRotationDegrees
                 )
 
-            // Blue waveform — replaces the triangle while listening
-            BlueCursorWaveformView(audioPowerLevel: companionManager.currentAudioPowerLevel)
+            // v12t: cursor presence glow — soft tinted halo CENTERED ON
+            // THE CURSOR HOTSPOT (unlike the triangle, which is offset
+            // +35x/+25y to sit beside the cursor as a "buddy"). Back out
+            // that offset so the glow renders directly under the system
+            // pointer. Same hide rules as the triangle so listening/
+            // processing modes can swap to the waveform/spinner cleanly.
+            CursorPresenceGlow(tint: presenceTint)
+                .opacity(
+                    cursorIndicatorStyle != "triangle" && presenceVisible
+                        ? cursorOpacity * 0.85 : 0
+                )
+                .position(
+                    x: cursorPosition.x - 35,
+                    y: cursorPosition.y - 25
+                )
+                .animation(.linear(duration: 0.04), value: cursorPosition)
+                .animation(.easeIn(duration: 0.20), value: companionManager.voiceState)
+                .animation(.easeOut(duration: 0.12), value: companionManager.isVoiceToTextModeActive)
+                .animation(.easeOut(duration: 0.12), value: companionManager.isTypingModeActive)
+                .animation(.easeOut(duration: 0.12), value: companionManager.isBurstModeActive)
+                .animation(.easeOut(duration: 0.12), value: companionManager.isCaptureToInboxModeActive)
+
+            // Waveform — replaces the triangle while listening.
+            // Tint encodes the current capture mode:
+            //   purple → voice-to-text mode (Fn+Shift), raw transcript pastes
+            //   green  → typing mode (Fn+Cmd), Claude response pastes
+            //   red    → burst mode (Fn+Shift+Opt), multi-frame capture
+            //   blue   → normal push-to-talk voice
+            // Order is defensive — the shortcut layer already prevents
+            // these flags from overlapping.
+            BlueCursorWaveformView(
+                audioPowerLevel: companionManager.currentAudioPowerLevel,
+                tint: currentCursorTint,
+                captureTrigger: companionManager.lastScreenshotCaptureAt
+            )
                 .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .listening ? cursorOpacity : 0)
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
+                .animation(.easeInOut(duration: 0.15), value: companionManager.isBurstModeActive)
+                .animation(.easeInOut(duration: 0.15), value: companionManager.isTypingModeActive)
+                .animation(.easeInOut(duration: 0.15), value: companionManager.isVoiceToTextModeActive)
+                .animation(.easeInOut(duration: 0.15), value: companionManager.isCaptureToInboxModeActive)
+                .animation(.easeInOut(duration: 0.12), value: companionManager.isPolishCommandFlashActive)
+                .animation(.easeInOut(duration: 0.12), value: companionManager.isPolishHotkeyModifierCaptureModeActive)
 
-            // Blue spinner — shown while the AI is processing (transcription + Claude + waiting for TTS)
-            BlueCursorSpinnerView()
+            // Spinner — shown while the AI is processing (transcription + Claude + waiting for TTS).
+            // Same mode-aware tint as the waveform above.
+            BlueCursorSpinnerView(
+                tint: currentCursorTint
+            )
                 .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .processing ? cursorOpacity : 0)
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
+                .animation(.easeInOut(duration: 0.15), value: companionManager.isBurstModeActive)
+                .animation(.easeInOut(duration: 0.15), value: companionManager.isTypingModeActive)
+                .animation(.easeInOut(duration: 0.15), value: companionManager.isVoiceToTextModeActive)
+                .animation(.easeInOut(duration: 0.15), value: companionManager.isCaptureToInboxModeActive)
+                .animation(.easeInOut(duration: 0.12), value: companionManager.isPolishCommandFlashActive)
+                .animation(.easeInOut(duration: 0.12), value: companionManager.isPolishHotkeyModifierCaptureModeActive)
+
+            // Idea-captured toast — yellow pill with the transcript,
+            // shown for ~3s after a capture-to-inbox append lands.
+            // Positioned just below the cursor so the visual chain is
+            // waveform (at cursor) → toast (below cursor) → fade.
+            if let ideaText = companionManager.recentIdeaCaptureText, buddyIsVisibleOnThisScreen {
+                IdeaCapturedToast(transcript: ideaText)
+                    .position(x: cursorPosition.x, y: cursorPosition.y + 42)
+                    .transition(.asymmetric(
+                        insertion: .opacity.combined(with: .scale(scale: 0.9)),
+                        removal: .opacity
+                    ))
+            }
 
         }
+        .animation(.easeInOut(duration: 0.18), value: companionManager.recentIdeaCaptureText)
         .frame(width: screenFrame.width, height: screenFrame.height)
         .ignoresSafeArea()
         .onAppear {
@@ -690,7 +852,10 @@ struct BlueCursorView: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
                     self.showWelcome = false
                     // Start the onboarding video right after the welcome text disappears
-                    self.companionManager.setupOnboardingVideo()
+                    // PATCH: skip intro video if onboarding already completed
+                    if !self.companionManager.hasCompletedOnboarding {
+                        self.companionManager.setupOnboardingVideo()
+                    }
                 }
                 return
             }
@@ -704,32 +869,147 @@ struct BlueCursorView: View {
 
 // MARK: - Blue Cursor Waveform
 
+/// v12t: Subtle radial glow around the system cursor.
+///
+/// Replaces the legacy blue triangle as Clicky's "I'm running" presence
+/// indicator. macOS draws the system cursor on top of all overlays at
+/// the compositor level, so the glow renders BENEATH the user's actual
+/// pointer — adding a soft halo without modifying or replacing the
+/// system cursor itself.
+///
+/// Design:
+///   - Radial gradient: tint at center 28% opacity → fully transparent at edge.
+///   - 40pt diameter: generously wider than typical cursors, so the glow
+///     reads as "around the cursor" rather than "behind a tiny patch."
+///   - 6pt blur: softens the edge so there's no visible boundary.
+///   - Tints with currentCursorTint, so mode color (idle blue, voice-mode
+///     blue, polish-flash cyan, etc.) propagates here just like it does
+///     to the audio bars and spinner.
+///
+/// Tunable via the constants below — adjust if Steph wants subtler/bolder.
+private struct CursorPresenceGlow: View {
+    var tint: Color = DS.Colors.overlayCursorBlue
+
+    /// Outer reach of the glow. Larger = softer, more "ambient."
+    private let diameter: CGFloat = 40
+    /// Blur radius applied on top of the gradient. More = softer edge.
+    private let blurRadius: CGFloat = 6
+    /// Maximum opacity at the glow's center. The radial gradient still
+    /// fades from this value to 0, so the actual peak appears slightly
+    /// lower in mid-radius.
+    private let centerOpacity: Double = 0.28
+
+    var body: some View {
+        Circle()
+            .fill(
+                RadialGradient(
+                    gradient: Gradient(stops: [
+                        .init(color: tint.opacity(centerOpacity), location: 0.0),
+                        .init(color: tint.opacity(centerOpacity * 0.6), location: 0.45),
+                        .init(color: tint.opacity(0), location: 1.0)
+                    ]),
+                    center: .center,
+                    startRadius: 0,
+                    endRadius: diameter / 2
+                )
+            )
+            .frame(width: diameter, height: diameter)
+            .blur(radius: blurRadius)
+            .allowsHitTesting(false)
+    }
+}
+
+/// One emanating sonar ring. Rings are stored in an array so rapid-fire
+/// captures (multi-frame burst, or future click-to-capture) can stack
+/// concurrent rings that fade independently instead of strobing a single
+/// flash overlay.
+private struct SonarRingState: Identifiable {
+    let id = UUID()
+    let startTime: Date
+}
+
 /// A small blue waveform that replaces the triangle cursor while
 /// the user is holding the push-to-talk shortcut and speaking.
+/// Accepts a tint so burst mode can swap blue → red.
 private struct BlueCursorWaveformView: View {
     let audioPowerLevel: CGFloat
+    var tint: Color = DS.Colors.overlayCursorBlue
+    /// Fires a sonar ring radiating outward from the orb whenever this
+    /// date changes — driven by CompanionManager.lastScreenshotCaptureAt
+    /// so each screenshot grab has a visible confirmation. v12p (2026-04-28):
+    /// replaced the strobing white camera-flash overlay with stacked sonar
+    /// rings that read as "ping" rather than "flash" — better for rapid
+    /// click-to-capture cadences where the previous flash was too noisy.
+    var captureTrigger: Date? = nil
+
+    @State private var sonarRings: [SonarRingState] = []
 
     private let barCount = 5
     private let listeningBarProfile: [CGFloat] = [0.4, 0.7, 1.0, 0.7, 0.4]
 
+    /// Sonar tuning. The ring starts at the orb's outer footprint and expands
+    /// to ~4x in 650ms while fading to zero. Stroke (not fill) so it reads
+    /// as an outward "ping" rather than a glowing blob.
+    private let ringDuration: TimeInterval = 0.65
+    private let ringStartDiameter: CGFloat = 16
+    private let ringEndDiameter: CGFloat = 64
+    private let ringInitialOpacity: Double = 0.75
+    private let ringLineWidth: CGFloat = 1.5
+
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 36.0)) { timelineContext in
-            HStack(alignment: .center, spacing: 2) {
-                ForEach(0..<barCount, id: \.self) { barIndex in
-                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
-                        .fill(DS.Colors.overlayCursorBlue)
-                        .frame(
-                            width: 2,
-                            height: barHeight(
-                                for: barIndex,
-                                timelineDate: timelineContext.date
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timelineContext in
+            ZStack {
+                // Sonar rings — drawn behind the audio bars so they never
+                // wash out the waveform. .allowsHitTesting(false) on each
+                // ring so they stay click-through.
+                ForEach(sonarRings) { ring in
+                    sonarRingView(for: ring, now: timelineContext.date)
+                }
+
+                HStack(alignment: .center, spacing: 2) {
+                    ForEach(0..<barCount, id: \.self) { barIndex in
+                        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                            .fill(tint)
+                            .frame(
+                                width: 2,
+                                height: barHeight(
+                                    for: barIndex,
+                                    timelineDate: timelineContext.date
+                                )
                             )
-                        )
+                    }
                 }
             }
-            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6, x: 0, y: 0)
+            .shadow(color: tint.opacity(0.6), radius: 6, x: 0, y: 0)
             .animation(.linear(duration: 0.08), value: audioPowerLevel)
         }
+        .onChange(of: captureTrigger) { _, newValue in
+            guard newValue != nil else { return }
+            let ring = SonarRingState(startTime: Date())
+            sonarRings.append(ring)
+            // Remove the ring from the active array slightly after the
+            // animation completes so the array stays bounded even on
+            // long sessions with many rapid captures.
+            DispatchQueue.main.asyncAfter(deadline: .now() + ringDuration + 0.1) {
+                sonarRings.removeAll { $0.id == ring.id }
+            }
+        }
+    }
+
+    /// Renders one sonar ring at its current animation progress. Ease-out
+    /// cubic on the radius so the ring shoots out fast then settles, and
+    /// linear opacity so the fade stays predictable.
+    @ViewBuilder
+    private func sonarRingView(for ring: SonarRingState, now: Date) -> some View {
+        let elapsed = now.timeIntervalSince(ring.startTime)
+        let progress = max(0, min(elapsed / ringDuration, 1.0))
+        let radiusEased = 1 - pow(1 - progress, 3)
+        let diameter = ringStartDiameter + (ringEndDiameter - ringStartDiameter) * CGFloat(radiusEased)
+        let opacity = ringInitialOpacity * (1 - progress)
+        Circle()
+            .strokeBorder(tint.opacity(opacity), lineWidth: ringLineWidth)
+            .frame(width: diameter, height: diameter)
+            .allowsHitTesting(false)
     }
 
     private func barHeight(for barIndex: Int, timelineDate: Date) -> CGFloat {
@@ -742,12 +1022,42 @@ private struct BlueCursorWaveformView: View {
     }
 }
 
+// MARK: - Idea Captured Toast
+
+/// A small yellow pill that floats below the cursor for ~3 seconds
+/// after a capture-to-inbox append, echoing the transcript that
+/// just landed in Obsidian/Idea Inbox.md. Non-interactive — doesn't
+/// steal focus, can't be clicked through to. Replaces itself if a
+/// new capture fires before the dismiss timer elapses.
+private struct IdeaCapturedToast: View {
+    let transcript: String
+
+    var body: some View {
+        Text(transcript)
+            .font(.system(size: 12, weight: .medium))
+            .foregroundColor(.black)
+            .lineLimit(3)
+            .truncationMode(.tail)
+            .multilineTextAlignment(.leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .frame(maxWidth: 320, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(DS.Colors.overlayCursorYellow)
+            )
+            .shadow(color: DS.Colors.overlayCursorYellow.opacity(0.5), radius: 8, x: 0, y: 2)
+            .allowsHitTesting(false)
+    }
+}
+
 // MARK: - Blue Cursor Spinner
 
 /// A small blue spinning indicator that replaces the triangle cursor
 /// while the AI is processing a voice input.
 private struct BlueCursorSpinnerView: View {
     @State private var isSpinning = false
+    var tint: Color = DS.Colors.overlayCursorBlue
 
     var body: some View {
         Circle()
@@ -755,8 +1065,8 @@ private struct BlueCursorSpinnerView: View {
             .stroke(
                 AngularGradient(
                     colors: [
-                        DS.Colors.overlayCursorBlue.opacity(0.0),
-                        DS.Colors.overlayCursorBlue
+                        tint.opacity(0.0),
+                        tint
                     ],
                     center: .center
                 ),
@@ -764,7 +1074,7 @@ private struct BlueCursorSpinnerView: View {
             )
             .frame(width: 14, height: 14)
             .rotationEffect(.degrees(isSpinning ? 360 : 0))
-            .shadow(color: DS.Colors.overlayCursorBlue.opacity(0.6), radius: 6, x: 0, y: 0)
+            .shadow(color: tint.opacity(0.6), radius: 6, x: 0, y: 0)
             .onAppear {
                 withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) {
                     isSpinning = true
@@ -779,6 +1089,11 @@ private struct BlueCursorSpinnerView: View {
 class OverlayWindowManager {
     private var overlayWindows: [OverlayWindow] = []
     var hasShownOverlayBefore = false
+
+    /// Whether the overlay was on-screen before the native macOS screenshot
+    /// UI (Cmd+Shift+3/4/5) began a session. Used to restore visibility
+    /// after the session ends.
+    private var wasVisibleBeforeNativeScreenshot: Bool = false
 
     func showOverlay(onScreens screens: [NSScreen], companionManager: CompanionManager) {
         // Hide any existing overlays
@@ -836,6 +1151,30 @@ class OverlayWindowManager {
 
     func isShowingOverlay() -> Bool {
         return !overlayWindows.isEmpty
+    }
+
+    // MARK: - Native screenshot session yield-and-restore
+
+    /// Hide all overlay windows for the duration of a native macOS screenshot
+    /// session (Cmd+Shift+3/4/5). Without this, the full-screen overlay ends
+    /// up as the topmost window under the cursor, so the window-mode picker
+    /// targets Clicky and the resulting screenshot is black (sharingType=
+    /// .none strips its contents). Pairs with `resumeAfterNativeScreenshot`.
+    func suspendForNativeScreenshot() {
+        wasVisibleBeforeNativeScreenshot = overlayWindows.contains(where: { $0.isVisible })
+        for window in overlayWindows {
+            window.orderOut(nil)
+        }
+    }
+
+    /// Restore overlay visibility after the native screenshot session ends.
+    /// No-op if the overlay was already hidden when the session began.
+    func resumeAfterNativeScreenshot() {
+        guard wasVisibleBeforeNativeScreenshot else { return }
+        wasVisibleBeforeNativeScreenshot = false
+        for window in overlayWindows {
+            window.orderFrontRegardless()
+        }
     }
 }
 

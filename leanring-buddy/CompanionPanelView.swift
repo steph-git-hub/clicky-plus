@@ -31,6 +31,12 @@ struct CompanionPanelView: View {
 
                 modelPickerRow
                     .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 14)
+
+                hotkeyReferenceSection
+                    .padding(.horizontal, 16)
             }
 
             if !companionManager.allPermissionsGranted {
@@ -57,14 +63,6 @@ struct CompanionPanelView: View {
             //     showClickyCursorToggleRow
             //         .padding(.horizontal, 16)
             // }
-
-            if companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-                Spacer()
-                    .frame(height: 16)
-
-                dmFarzaButton
-                    .padding(.horizontal, 16)
-            }
 
             Spacer()
                 .frame(height: 12)
@@ -161,7 +159,7 @@ struct CompanionPanelView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         } else {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Hi, I'm Farza. This is Clicky.")
+                Text("Hi, I'm Clicky.")
                     .font(.system(size: 12, weight: .bold))
                     .foregroundColor(DS.Colors.textSecondary)
 
@@ -641,43 +639,6 @@ struct CompanionPanelView: View {
         .pointerCursor()
     }
 
-    // MARK: - DM Farza Button
-
-    private var dmFarzaButton: some View {
-        Button(action: {
-            if let url = URL(string: "https://x.com/farzatv") {
-                NSWorkspace.shared.open(url)
-            }
-        }) {
-            HStack(spacing: 8) {
-                Image(systemName: "bubble.left.fill")
-                    .font(.system(size: 12, weight: .medium))
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Got feedback? DM me")
-                        .font(.system(size: 12, weight: .semibold))
-                    Text("Bugs, ideas, anything — I read every message.")
-                        .font(.system(size: 10))
-                        .foregroundColor(DS.Colors.textTertiary)
-                }
-            }
-            .foregroundColor(DS.Colors.textSecondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-            )
-        }
-        .buttonStyle(.plain)
-        .pointerCursor()
-    }
-
     // MARK: - Footer
 
     private var footerSection: some View {
@@ -756,6 +717,75 @@ struct CompanionPanelView: View {
         case .responding:
             return "Responding"
         }
+    }
+
+    // MARK: - Hotkey Reference
+
+    /// Compact, read-only reference panel listing every Clicky+ hotkey, its mode
+    /// name, and the per-mode overlay color. V1 is reference-only — rebinding is
+    /// deferred to a later pass. Rows follow the existing row style (13pt label,
+    /// tertiary metadata) and the modifier capsules reuse the subtle-fill pattern
+    /// from the model picker.
+    private var hotkeyReferenceSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Hotkeys")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer()
+            }
+            .padding(.bottom, 6)
+
+            VStack(alignment: .leading, spacing: 4) {
+                hotkeyRow(keys: ["⌃", "⌥"], label: "Push-to-talk", color: DS.Colors.overlayCursorBlue)
+                hotkeyRow(keys: ["⌘", "fn"], label: "Typing mode", color: DS.Colors.overlayCursorGreen)
+                hotkeyRow(keys: ["⌃", "fn"], label: "Voice-to-text", color: DS.Colors.overlayCursorPurple)
+                hotkeyRow(keys: ["⇧", "⌥", "fn"], label: "Burst mode", color: DS.Colors.overlayCursorRed)
+                hotkeyRow(keys: ["⌥", "fn"], label: "Capture-to-inbox", color: DS.Colors.overlayCursorYellow)
+                hotkeyRow(keys: ["⇧", "⌃"], label: "Polish (tap or hold)", color: DS.Colors.overlayCursorCyan)
+            }
+        }
+    }
+
+    private func hotkeyRow(keys: [String], label: String, color: Color) -> some View {
+        HStack(spacing: 8) {
+            HStack(spacing: 3) {
+                ForEach(keys, id: \.self) { key in
+                    hotkeyCapsule(key)
+                }
+            }
+            .frame(width: 92, alignment: .leading)
+
+            Text(label)
+                .font(.system(size: 12, weight: .regular))
+                .foregroundColor(DS.Colors.textPrimary)
+                .lineLimit(1)
+
+            Spacer()
+
+            Circle()
+                .fill(color)
+                .frame(width: 8, height: 8)
+                .shadow(color: color.opacity(0.45), radius: 3)
+        }
+        .padding(.vertical, 3)
+    }
+
+    private func hotkeyCapsule(_ symbol: String) -> some View {
+        Text(symbol)
+            .font(.system(size: 10, weight: .semibold, design: .rounded))
+            .foregroundColor(DS.Colors.textPrimary)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .frame(minWidth: 18)
+            .background(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .fill(Color.white.opacity(0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+            )
     }
 
 }

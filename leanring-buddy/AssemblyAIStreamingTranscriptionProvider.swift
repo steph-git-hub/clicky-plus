@@ -19,7 +19,7 @@ struct AssemblyAIStreamingTranscriptionProviderError: LocalizedError {
 final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider {
     /// URL for the Cloudflare Worker endpoint that returns a short-lived
     /// AssemblyAI streaming token. The real API key never leaves the server.
-    private static let tokenProxyURL = "https://your-worker-name.your-subdomain.workers.dev/transcribe-token"
+    private static let tokenProxyURL = "https://clicky-proxy.sapierso.workers.dev/transcribe-token"
 
     let displayName = "AssemblyAI"
     let requiresSpeechRecognitionPermission = false
@@ -447,7 +447,15 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
         var queryItems = [
             URLQueryItem(name: "sample_rate", value: "16000"),
             URLQueryItem(name: "encoding", value: "pcm_s16le"),
-            URLQueryItem(name: "format_turns", value: "true"),
+            // format_turns=false (v11h, 2026-04-27): AssemblyAI's
+            // pause-detection auto-punctuation inserted commas at every
+            // mid-thought pause, breaking up Steph's natural speech with
+            // unwanted punctuation. We disable formatting here and run
+            // the raw transcript through Haiku /repunctuate in the Mac
+            // app for context-based (not pause-based) punctuation.
+            // Steph's spoken-punctuation overrides ("comma", "new
+            // paragraph", etc.) still win because they apply AFTER Haiku.
+            URLQueryItem(name: "format_turns", value: "false"),
             URLQueryItem(name: "speech_model", value: "u3-rt-pro")
         ]
 

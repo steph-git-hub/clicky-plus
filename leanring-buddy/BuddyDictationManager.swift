@@ -163,7 +163,10 @@ enum BuddyPushToTalkShortcut {
         if let modifierOnlyFlags = currentShortcutOption.modifierOnlyFlags {
             guard shortcutEventType == .flagsChanged else { return .none }
 
+            // Normal (voice-only) mode is mutually exclusive with burst mode.
+            // If Fn is also held, treat as burst mode — don't fire normal here.
             let isShortcutCurrentlyPressed = modifierFlags.contains(modifierOnlyFlags)
+                && !modifierFlags.contains(.function)
 
             if isShortcutCurrentlyPressed && !wasShortcutPreviouslyPressed {
                 return .pressed
@@ -195,6 +198,292 @@ enum BuddyPushToTalkShortcut {
             return .released
         }
 
+        return .none
+    }
+
+    // MARK: - Burst Mode (Screenshot Burst) Shortcut
+    //
+    // Burst mode is activated by holding Fn + Control + Option.
+    // This is additive — it does NOT replace or interfere with the normal
+    // push-to-talk shortcut (Control + Option). The normal shortcut detector
+    // above explicitly ignores events where .function is held, so the two
+    // modes are mutually exclusive and never fire together.
+
+    // Burst hotkey: Fn + Shift + Option.
+    // Notably does NOT include .control, because holding Ctrl while clicking
+    // is hardwired by macOS to mean "secondary click" (right-click) — which
+    // made it impossible to click browser tabs while recording a burst.
+    // Normal push-to-talk (Ctrl+Opt) still works unchanged because the
+    // normal detector explicitly rejects any event that includes .function.
+    static let burstModifierFlags: NSEvent.ModifierFlags = [.shift, .option, .function]
+
+    /// Returns the burst-shortcut transition for a given modifier flag change.
+    /// Only responds to .flagsChanged events (burst mode is modifier-only,
+    /// no key code required).
+    static func burstTransition(
+        for event: NSEvent,
+        wasBurstPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        guard event.type == .flagsChanged else { return .none }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        return burstTransition(
+            modifierFlags: flags,
+            wasBurstPreviouslyPressed: wasBurstPreviouslyPressed
+        )
+    }
+
+    /// Overload for CGEvent taps that pass raw modifier flags (UInt64).
+    static func burstTransition(
+        eventType: CGEventType,
+        modifierFlagsRawValue: UInt64,
+        wasBurstPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        guard eventType == .flagsChanged else { return .none }
+        let flags = NSEvent.ModifierFlags(rawValue: UInt(modifierFlagsRawValue))
+            .intersection(.deviceIndependentFlagsMask)
+        return burstTransition(
+            modifierFlags: flags,
+            wasBurstPreviouslyPressed: wasBurstPreviouslyPressed
+        )
+    }
+
+    private static func burstTransition(
+        modifierFlags: NSEvent.ModifierFlags,
+        wasBurstPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        let isBurstCurrentlyPressed = modifierFlags.isSuperset(of: burstModifierFlags)
+
+        if isBurstCurrentlyPressed && !wasBurstPreviouslyPressed {
+            return .pressed
+        }
+        if !isBurstCurrentlyPressed && wasBurstPreviouslyPressed {
+            return .released
+        }
+        return .none
+    }
+
+    // MARK: - Typing Mode (Dictated Draft → Clipboard + Paste) Shortcut
+    //
+    // Cmd + Fn triggers "typing mode": the user speaks a request, Clicky
+    // calls Claude with the spoken transcript + a single screenshot, then
+    // copies the response to the clipboard and pastes it into whatever
+    // text field is focused. Additive — fully isolated from normal
+    // push-to-talk (Ctrl+Opt) and burst (Fn+Shift+Opt).
+    //
+    // To prevent any overlap with burst, the typing detector requires
+    // Cmd+Fn to be held WITHOUT shift, option, or control. That way
+    // holding Cmd+Shift+Opt+Fn (if that ever happens) fires burst only.
+
+    static let typingModifierFlags: NSEvent.ModifierFlags = [.command, .function]
+
+    static func typingTransition(
+        eventType: CGEventType,
+        modifierFlagsRawValue: UInt64,
+        wasTypingPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        guard eventType == .flagsChanged else { return .none }
+        let flags = NSEvent.ModifierFlags(rawValue: UInt(modifierFlagsRawValue))
+            .intersection(.deviceIndependentFlagsMask)
+        return typingTransition(
+            modifierFlags: flags,
+            wasTypingPreviouslyPressed: wasTypingPreviouslyPressed
+        )
+    }
+
+    private static func typingTransition(
+        modifierFlags: NSEvent.ModifierFlags,
+        wasTypingPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        // Must have Cmd + Fn, and must NOT include shift, option, or
+        // control — otherwise it's ambiguous with burst (shift+opt+fn)
+        // or a future combo and we'd fire two modes at once.
+        let hasRequired = modifierFlags.isSuperset(of: typingModifierFlags)
+        let hasForbidden = modifierFlags.contains(.shift)
+            || modifierFlags.contains(.option)
+            || modifierFlags.contains(.control)
+        let isTypingCurrentlyPressed = hasRequired && !hasForbidden
+
+        if isTypingCurrentlyPressed && !wasTypingPreviouslyPressed {
+            return .pressed
+        }
+        if !isTypingCurrentlyPressed && wasTypingPreviouslyPressed {
+            return .released
+        }
+        return .none
+    }
+
+    // MARK: - Voice-to-Text Mode (Dictation → Paste, NO Claude) Shortcut
+    //
+    // Fn + Shift triggers "voice-to-text mode": pure transcription piped
+    // straight through typeTextViaClipboard into whatever field has
+    // focus. No Claude call, no TTS, no conversation history — fastest
+    // path from voice to typed text.
+    //
+    // Mutual exclusion:
+    //   - Burst (shift+opt+fn)      → excluded by `.option` forbidden
+    //   - Typing (cmd+fn)           → excluded by `.command` forbidden
+    //   - Normal PTT (ctrl+opt)     → excluded by `.function` required (normal PTT explicitly rejects .function)
+    //
+    // So voice-to-text fires only when Fn+Shift are held together
+    // WITHOUT option, command, or control.
+
+    // Swapped 2026-04-26 (v10g): voice-to-text moved from Shift+Fn to Ctrl+Fn
+    // because Steph holds it constantly and Ctrl+Fn is the easier two-finger
+    // hold on the MacBook keyboard. Polish moved to Shift+Fn (it was tap-or-
+    // briefly-hold and is used less often).
+    static let voiceToTextModifierFlags: NSEvent.ModifierFlags = [.control, .function]
+
+    static func voiceToTextTransition(
+        eventType: CGEventType,
+        modifierFlagsRawValue: UInt64,
+        wasVoiceToTextPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        guard eventType == .flagsChanged else { return .none }
+        let flags = NSEvent.ModifierFlags(rawValue: UInt(modifierFlagsRawValue))
+            .intersection(.deviceIndependentFlagsMask)
+        return voiceToTextTransition(
+            modifierFlags: flags,
+            wasVoiceToTextPreviouslyPressed: wasVoiceToTextPreviouslyPressed
+        )
+    }
+
+    private static func voiceToTextTransition(
+        modifierFlags: NSEvent.ModifierFlags,
+        wasVoiceToTextPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        let hasRequired = modifierFlags.isSuperset(of: voiceToTextModifierFlags)
+        // Forbidden flags must NOT include .control (it's required now).
+        // Shift, option, command stay forbidden so this combo doesn't
+        // overlap with polish (shift+fn), burst (shift+option+fn), or typing (cmd+fn).
+        let hasForbidden = modifierFlags.contains(.shift)
+            || modifierFlags.contains(.option)
+            || modifierFlags.contains(.command)
+        let isVoiceToTextCurrentlyPressed = hasRequired && !hasForbidden
+
+        if isVoiceToTextCurrentlyPressed && !wasVoiceToTextPreviouslyPressed {
+            return .pressed
+        }
+        if !isVoiceToTextCurrentlyPressed && wasVoiceToTextPreviouslyPressed {
+            return .released
+        }
+        return .none
+    }
+
+    // MARK: - Capture-to-Inbox (Fn + Opt)
+    //
+    // Holds Fn+Opt alone → writes the transcript straight to
+    // Inbox/Idea Inbox.md with a datestamp + [?] tag. Must be
+    // mutually exclusive with every other shortcut:
+    //   - Normal PTT (ctrl+opt)        → excluded by `.function` required
+    //   - Voice-to-text (fn+shift)     → excluded by `.shift` forbidden
+    //   - Burst (fn+ctrl+opt)          → excluded by `.control` forbidden
+    //   - Typing (cmd+fn)              → excluded by `.command` forbidden
+    //
+    // So capture-to-inbox fires only when Fn+Opt are held together
+    // WITHOUT shift, command, or control.
+
+    static let captureToInboxModifierFlags: NSEvent.ModifierFlags = [.option, .function]
+
+    static func captureToInboxTransition(
+        eventType: CGEventType,
+        modifierFlagsRawValue: UInt64,
+        wasCaptureToInboxPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        guard eventType == .flagsChanged else { return .none }
+        let flags = NSEvent.ModifierFlags(rawValue: UInt(modifierFlagsRawValue))
+            .intersection(.deviceIndependentFlagsMask)
+        return captureToInboxTransition(
+            modifierFlags: flags,
+            wasCaptureToInboxPreviouslyPressed: wasCaptureToInboxPreviouslyPressed
+        )
+    }
+
+    private static func captureToInboxTransition(
+        modifierFlags: NSEvent.ModifierFlags,
+        wasCaptureToInboxPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        let hasRequired = modifierFlags.isSuperset(of: captureToInboxModifierFlags)
+        let hasForbidden = modifierFlags.contains(.shift)
+            || modifierFlags.contains(.command)
+            || modifierFlags.contains(.control)
+        let isCaptureToInboxCurrentlyPressed = hasRequired && !hasForbidden
+
+        if isCaptureToInboxCurrentlyPressed && !wasCaptureToInboxPreviouslyPressed {
+            return .pressed
+        }
+        if !isCaptureToInboxCurrentlyPressed && wasCaptureToInboxPreviouslyPressed {
+            return .released
+        }
+        return .none
+    }
+
+    // MARK: - Polish Hotkey (⌃Fn — Tap or Hold-and-Speak)
+    //
+    // Control + Fn fires polish on the currently-focused field's
+    // existing text. Two gestures supported (tap-vs-hold logic lives
+    // in CompanionManager.handlePolishHotkeyTransition):
+    //   - Quick tap (release < 300ms) → polish with no modifier, instant
+    //   - Hold > 300ms → engage dictation for spoken modifier, on
+    //     release fire polish with that as modifier
+    //
+    // Mutual exclusion vs the other 5 shortcut paths:
+    //   - Normal PTT (ctrl+opt)         → forbidden flag .option excludes Polish
+    //                                     (and PTT itself excludes when .function is held)
+    //   - Burst (fn+shift+opt)          → forbidden flags .shift + .option exclude
+    //   - Typing (cmd+fn)               → forbidden flag .command excludes
+    //                                     (typing already forbids .control)
+    //   - Voice-to-text (fn+shift)      → forbidden flag .shift excludes
+    //                                     (voice-to-text already forbids .control)
+    //   - Capture-to-inbox (fn+opt)     → forbidden flag .option excludes
+    //                                     (capture-to-inbox already forbids .control)
+    //
+    // History: an earlier version (2026-04-25 ship) used ⌃⌥⌘ modifier-only,
+    // which collided with macOS accessibility shortcuts (Voice Control /
+    // VoiceOver) when held — quick taps worked but holds got hijacked.
+    // ⌃Fn fits the existing Fn+modifier pattern of the other 4 modes and
+    // macOS doesn't use Fn-based combos for system shortcuts.
+
+    // Swapped 2026-04-27 (v11d): polish moved from Shift+Fn to Shift+Control
+    // (no Fn). Steph holds VTT (Ctrl+Fn) constantly and often fires polish
+    // immediately after — keeping Ctrl anchored and just adding Shift is
+    // the natural left-hand flow. Pure modifier-only hotkey, no Fn.
+    static let polishHotkeyModifierFlags: NSEvent.ModifierFlags = [.shift, .control]
+
+    static func polishHotkeyTransition(
+        eventType: CGEventType,
+        modifierFlagsRawValue: UInt64,
+        wasPolishHotkeyPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        guard eventType == .flagsChanged else { return .none }
+        let flags = NSEvent.ModifierFlags(rawValue: UInt(modifierFlagsRawValue))
+            .intersection(.deviceIndependentFlagsMask)
+        return polishHotkeyTransition(
+            modifierFlags: flags,
+            wasPolishHotkeyPreviouslyPressed: wasPolishHotkeyPreviouslyPressed
+        )
+    }
+
+    private static func polishHotkeyTransition(
+        modifierFlags: NSEvent.ModifierFlags,
+        wasPolishHotkeyPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        let hasRequired = modifierFlags.isSuperset(of: polishHotkeyModifierFlags)
+        // Forbid the modifiers used by other modes so polish doesn't double-fire:
+        //   - .option excludes base PTT (⌃⌥) and burst (⇧⌥Fn) and capture-to-inbox (⌥Fn)
+        //   - .command excludes typing (⌘Fn)
+        //   - .function excludes VTT (⌃Fn) and the four Fn-modes above
+        // After v11d, .control + .shift are both REQUIRED.
+        let hasForbidden = modifierFlags.contains(.option)
+            || modifierFlags.contains(.command)
+            || modifierFlags.contains(.function)
+        let isPolishHotkeyCurrentlyPressed = hasRequired && !hasForbidden
+
+        if isPolishHotkeyCurrentlyPressed && !wasPolishHotkeyPreviouslyPressed {
+            return .pressed
+        }
+        if !isPolishHotkeyCurrentlyPressed && wasPolishHotkeyPreviouslyPressed {
+            return .released
+        }
         return .none
     }
 }
@@ -264,6 +553,18 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
     private let transcriptionProvider: any BuddyTranscriptionProvider
     private let audioEngine = AVAudioEngine()
+    /// Serializes audio buffers from the tap thread so buffers captured during
+    /// the transcription provider's websocket handshake (before the session is
+    /// live) are replayed in order once the session opens. This eliminates
+    /// first-word clipping across all push-to-talk modes.
+    private let audioHandoff = TranscriptionAudioHandoff()
+    /// v13j: diagnostic — timestamp of the very first audio buffer received
+    /// in the current session's tap callback. Lets us measure the audio
+    /// engine warm-up gap (between audioEngine.start() returning and audio
+    /// actually flowing). nil until the first buffer arrives.
+    private var firstTapBufferReceivedAt: Date?
+    /// v13j: diagnostic — count of tap callbacks during the current session.
+    private var tapBufferCount: Int = 0
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
     private var activeStartSource: BuddyDictationStartSource?
     private var draftCallbacks: BuddyDictationDraftCallbacks?
@@ -499,7 +800,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         let shouldSubmitFinalDraftWhenFallbackTriggers = shouldAutomaticallySubmitFinalDraft
         let fallbackWorkItem = DispatchWorkItem { [weak self] in
             Task { @MainActor in
-                self?.finishCurrentDictationSessionIfNeeded(
+                guard let self else { return }
+                let didReceiveTranscript = !self.latestRecognizedText
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty
+                print("⏰ Dictation fallback fired (\(finalTranscriptFallbackDelaySeconds)s) — gotTranscript=\(didReceiveTranscript)")
+                self.finishCurrentDictationSessionIfNeeded(
                     shouldSubmitFinalDraft: shouldSubmitFinalDraftWhenFallbackTriggers
                 )
             }
@@ -512,12 +818,60 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private func startRecognitionSession() async throws {
+        // v13j (2026-04-30): timing diagnostics for first-word-clip debug.
+        // The audio handoff was supposed to eliminate this on 2026-04-20.
+        // If it's clipping again, these logs tell us where audio is being
+        // lost — between engine.start() and first tap callback (engine
+        // warm-up gap), or between session activation and AssemblyAI
+        // actually accepting audio (handoff flush bug).
+        let phaseStartTime = Date()
+        func elapsedMs() -> Int { Int(Date().timeIntervalSince(phaseStartTime) * 1000) }
+
         activeTranscriptionSession?.cancel()
         activeTranscriptionSession = nil
+        audioHandoff.reset()
+        print("🎙️ T+\(elapsedMs())ms: handoff reset")
 
-        print("🎙️ BuddyDictationManager: opening transcription provider \(transcriptionProvider.displayName)")
+        // Start the audio engine BEFORE opening the transcription websocket so
+        // the mic is already capturing when the user starts speaking. Audio
+        // received while the session is still handshaking is deep-copied and
+        // buffered in `audioHandoff`, then flushed in order once the session
+        // is live. Without this, the first ~100–400ms of audio (the handshake
+        // window) is silently dropped, clipping the first word.
+        let inputNode = audioEngine.inputNode
+        let inputFormat = inputNode.outputFormat(forBus: 0)
 
-        let activeTranscriptionSession = try await transcriptionProvider.startStreamingSession(
+        // Track first tap callback timing (Atomic-ish via instance var to
+        // survive across async boundaries). Reset each session.
+        firstTapBufferReceivedAt = nil
+        tapBufferCount = 0
+
+        inputNode.removeTap(onBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
+            guard let self else { return }
+            // Diagnostic: log the first tap callback so we can see how long
+            // after engine.start() it actually fires (engine warm-up gap).
+            if self.firstTapBufferReceivedAt == nil {
+                self.firstTapBufferReceivedAt = Date()
+                let warmupMs = Int(Date().timeIntervalSince(phaseStartTime) * 1000)
+                print("🎙️ T+\(warmupMs)ms: FIRST tap buffer received (engine warm-up)")
+            }
+            self.tapBufferCount += 1
+            self.updateAudioPowerLevel(from: buffer)
+            // AVAudioEngine may reuse the tap buffer's backing memory on the
+            // next callback, so we must deep-copy before queueing for async
+            // handoff. ~2 KB per copy @ 16 kHz/1024 frames ≈ 32 KB/sec churn.
+            guard let copy = buffer.clickyDeepCopy() else { return }
+            self.audioHandoff.enqueue(copy)
+        }
+
+        print("🎙️ T+\(elapsedMs())ms: tap installed; calling audioEngine.prepare()")
+        audioEngine.prepare()
+        print("🎙️ T+\(elapsedMs())ms: prepare() returned; calling audioEngine.start()")
+        try audioEngine.start()
+        print("🎙️ T+\(elapsedMs())ms: audioEngine.start() returned; opening transcription provider \(transcriptionProvider.displayName)")
+
+        let session = try await transcriptionProvider.startStreamingSession(
             keyterms: buildTranscriptionKeyterms(),
             onTranscriptUpdate: { [weak self] transcriptText in
                 Task { @MainActor in
@@ -543,20 +897,13 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             }
         )
 
-        self.activeTranscriptionSession = activeTranscriptionSession
-        print("🎙️ BuddyDictationManager: provider ready, starting audio engine")
-
-        let inputNode = audioEngine.inputNode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
-
-        inputNode.removeTap(onBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: inputFormat) { [weak self] buffer, _ in
-            self?.activeTranscriptionSession?.appendAudioBuffer(buffer)
-            self?.updateAudioPowerLevel(from: buffer)
-        }
-
-        audioEngine.prepare()
-        try audioEngine.start()
+        // Atomically hand the session to the audio handoff queue. This flushes
+        // the buffered backlog in order before any subsequent tap callback is
+        // processed, so audio arrives at the provider in capture order.
+        let flushedCount = audioHandoff.activate(session: session)
+        self.activeTranscriptionSession = session
+        let firstTapMs = firstTapBufferReceivedAt.map { Int($0.timeIntervalSince(phaseStartTime) * 1000) } ?? -1
+        print("🎙️ T+\(elapsedMs())ms: provider ready, flushed \(flushedCount) buffers (first tap was T+\(firstTapMs)ms, total taps=\(tapBufferCount))")
     }
 
     private func handleRecognitionError(_ error: Error) {
@@ -629,6 +976,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     private func resetSessionState() {
         pendingStartRequestIdentifier = UUID()
         activeTranscriptionSession = nil
+        audioHandoff.reset()
         draftCallbacks = nil
         activeStartSource = nil
         draftTextBeforeCurrentDictation = ""
@@ -649,22 +997,83 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         lastRecordedAudioPowerSampleDate = .distantPast
     }
 
-    private func buildTranscriptionKeyterms() -> [String] {
-        let baseKeyterms = [
-            "makesomething",
-            "Learning Buddy",
-            "Codex",
-            "Claude",
-            "Anthropic",
-            "OpenAI",
-            "SwiftUI",
-            "Xcode",
-            "Vercel",
-            "Next.js",
-            "localhost"
-        ]
+    /// v12m (2026-04-28): hardcoded base list of proper nouns + jargon that
+    /// Steph uses regularly. AssemblyAI's `keyterms_prompt` parameter biases
+    /// the model toward these spellings, fixing common mishearings at the
+    /// STT layer instead of relying on polish to catch them. Updated daily
+    /// by the clicky-daily-memory-scan skill via the override JSON below.
+    private static let baseTranscriptionKeyterms = [
+        // People
+        // RULE: prefer the SHORTEST unambiguous form for each name. Adding
+        // both "Bunheng" and "Bunheng Hok" caused AssemblyAI to over-force
+        // the long form even when Steph said only "Bunheng" (v12m hotfix).
+        // "Hok" gets transcribed normally; the keyterm just protects the
+        // first name.
+        "Lukas",          // commonly misheard as "Lucas"
+        "Bunheng",        // commonly misheard as "Boonhang", "Bunhang"
+        // Companies / brands
+        "Kombo",
+        "Glamnetic",
+        "Anthropic",
+        "OpenAI",
+        // Tools / platforms Steph uses daily
+        "Claude",
+        "Cowork",
+        "Clicky",
+        "Wispr",
+        "Obsidian",
+        "ClickUp",
+        "Omni",
+        "Slack",
+        "Axiom",
+        "Codex",
+        "Voicebox",
+        // Tech jargon
+        "SwiftUI",
+        "Xcode",
+        "Vercel",
+        "Next.js",
+        "localhost",
+        // Legacy carry-overs
+        "makesomething",
+        "Learning Buddy"
+    ]
 
-        let combinedKeyterms = baseKeyterms + contextualKeyterms
+    /// Path to the auto-updating keyterms override file inside Steph's
+    /// Obsidian vault. The clicky-daily-memory-scan skill writes new
+    /// keyterm candidates here based on observed mishearings. The file
+    /// is missing on first run; we treat that as "no overrides" — the
+    /// hardcoded base list still works.
+    private static let keytermsOverrideFilePath =
+        "/Users/stephenpierson/Desktop/Claude Cowork/Obsidian/Steph Vault/Clicky Logs/keyterms.json"
+
+    /// Read the override file. Expected shape:
+    /// `{ "keyterms": [ {"term": "...", ...optional metadata...} ] }`
+    /// or simply `{ "keyterms": ["term1", "term2"] }`.
+    /// Returns empty array on any error so the base list still works.
+    private func loadOverrideKeyterms() -> [String] {
+        let fileURL = URL(fileURLWithPath: Self.keytermsOverrideFilePath)
+        guard let data = try? Data(contentsOf: fileURL) else { return [] }
+        guard let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
+        guard let rawTerms = parsed["keyterms"] as? [Any] else { return [] }
+
+        var extractedTerms: [String] = []
+        for entry in rawTerms {
+            if let stringEntry = entry as? String {
+                extractedTerms.append(stringEntry)
+            } else if let dictEntry = entry as? [String: Any],
+                      let term = dictEntry["term"] as? String {
+                extractedTerms.append(term)
+            }
+        }
+        return extractedTerms
+    }
+
+    private func buildTranscriptionKeyterms() -> [String] {
+        let baseKeyterms = Self.baseTranscriptionKeyterms
+        let overrideKeyterms = loadOverrideKeyterms()
+
+        let combinedKeyterms = baseKeyterms + overrideKeyterms + contextualKeyterms
         var uniqueNormalizedKeyterms = Set<String>()
         var orderedKeyterms: [String] = []
 
@@ -862,5 +1271,87 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
 
         return fallback
+    }
+}
+
+/// Serializes audio buffers coming from the AVAudioEngine tap thread while the
+/// transcription provider's streaming session is still being established. Any
+/// buffers received before `activate(session:)` is called are retained and
+/// replayed in order once the session is live, so the first word of each
+/// push-to-talk utterance isn't dropped during the websocket handshake window.
+///
+/// All mutations run on a private serial queue so enqueued buffers and the
+/// activation hand-off cannot reorder relative to one another.
+private final class TranscriptionAudioHandoff {
+    private let queue = DispatchQueue(label: "com.clicky.buddyDictation.audioHandoff")
+    private var session: (any BuddyStreamingTranscriptionSession)?
+    private var pendingBuffers: [AVAudioPCMBuffer] = []
+
+    /// Enqueue an audio buffer from the tap thread. Buffers received before
+    /// `activate(session:)` are held; buffers received after are forwarded
+    /// directly. Non-blocking on the caller.
+    func enqueue(_ buffer: AVAudioPCMBuffer) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            if let session = self.session {
+                session.appendAudioBuffer(buffer)
+            } else {
+                self.pendingBuffers.append(buffer)
+            }
+        }
+    }
+
+    /// Atomically attach the live transcription session and flush any audio
+    /// buffered during the handshake. Returns the number of buffers flushed.
+    @discardableResult
+    func activate(session: any BuddyStreamingTranscriptionSession) -> Int {
+        return queue.sync {
+            self.session = session
+            let backlog = self.pendingBuffers
+            self.pendingBuffers.removeAll()
+            for buffer in backlog {
+                session.appendAudioBuffer(buffer)
+            }
+            return backlog.count
+        }
+    }
+
+    /// Clear any retained state. Safe to call between sessions.
+    func reset() {
+        queue.sync {
+            self.session = nil
+            self.pendingBuffers.removeAll()
+        }
+    }
+}
+
+private extension AVAudioPCMBuffer {
+    /// Deep-copies an AVAudioPCMBuffer so it can safely outlive the audio tap
+    /// callback that delivered it. AVAudioEngine may reuse the tap buffer's
+    /// backing memory on subsequent callbacks, so any buffer we want to hold
+    /// beyond the closure must own its own sample storage.
+    func clickyDeepCopy() -> AVAudioPCMBuffer? {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCapacity) else {
+            return nil
+        }
+        copy.frameLength = frameLength
+
+        let channelCount = Int(format.channelCount)
+        let frames = Int(frameLength)
+
+        if let src = floatChannelData, let dst = copy.floatChannelData {
+            for channel in 0..<channelCount {
+                memcpy(dst[channel], src[channel], frames * MemoryLayout<Float>.size)
+            }
+        } else if let src = int16ChannelData, let dst = copy.int16ChannelData {
+            for channel in 0..<channelCount {
+                memcpy(dst[channel], src[channel], frames * MemoryLayout<Int16>.size)
+            }
+        } else if let src = int32ChannelData, let dst = copy.int32ChannelData {
+            for channel in 0..<channelCount {
+                memcpy(dst[channel], src[channel], frames * MemoryLayout<Int32>.size)
+            }
+        }
+        return copy
     }
 }

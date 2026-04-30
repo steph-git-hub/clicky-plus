@@ -1,22 +1,25 @@
 //
-//  ElevenLabsTTSClient.swift
+//  GrokTTSClient.swift
 //  leanring-buddy
 //
-//  Streams text-to-speech audio from ElevenLabs and plays it back
-//  through the system audio output. Uses the streaming endpoint so
-//  playback begins before the full audio has been generated.
+//  Sends text to the Cloudflare Worker's /tts-grok endpoint, which
+//  proxies to xAI's TTS API (https://api.x.ai/v1/tts) and returns
+//  MP3 audio bytes. Plays back via AVAudioPlayer — same pattern as
+//  the ElevenLabs client so they're plug-compatible through TTSClient.
+//
+//  Voice selection lives server-side (Worker env var XAI_VOICE_ID)
+//  to keep API keys and voice choice out of the client.
 //
 
 import AVFoundation
 import Foundation
 
 @MainActor
-final class ElevenLabsTTSClient: TTSClient {
+final class GrokTTSClient: TTSClient {
     private let proxyURL: URL
     private let session: URLSession
 
-    /// The audio player for the current TTS playback. Kept alive so the
-    /// audio finishes playing even if the caller doesn't hold a reference.
+    /// Kept alive so audio finishes playing even if the caller drops us.
     private var audioPlayer: AVAudioPlayer?
 
     init(proxyURL: String) {
@@ -28,7 +31,7 @@ final class ElevenLabsTTSClient: TTSClient {
         self.session = URLSession(configuration: configuration)
     }
 
-    /// Sends `text` to ElevenLabs TTS and plays the resulting audio.
+    /// Sends `text` to Grok TTS and plays the resulting audio.
     /// Throws on network or decoding errors. Cancellation-safe.
     func speakText(_ text: String) async throws {
         var request = URLRequest(url: proxyURL)
@@ -36,13 +39,10 @@ final class ElevenLabsTTSClient: TTSClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("audio/mpeg", forHTTPHeaderField: "Accept")
 
+        // Minimal payload — the Worker fills in voice_id + language
+        // from env vars so we can retune without rebuilding the app.
         let body: [String: Any] = [
-            "text": text,
-            "model_id": "eleven_flash_v2_5",
-            "voice_settings": [
-                "stability": 0.5,
-                "similarity_boost": 0.85
-            ]
+            "text": text
         ]
 
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -50,14 +50,14 @@ final class ElevenLabsTTSClient: TTSClient {
         let (data, response) = try await session.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse else {
-            throw NSError(domain: "ElevenLabsTTS", code: -1,
+            throw NSError(domain: "GrokTTS", code: -1,
                           userInfo: [NSLocalizedDescriptionKey: "Invalid response"])
         }
 
         guard (200...299).contains(httpResponse.statusCode) else {
             let errorBody = String(data: data, encoding: .utf8) ?? "Unknown error"
-            throw NSError(domain: "ElevenLabsTTS", code: httpResponse.statusCode,
-                          userInfo: [NSLocalizedDescriptionKey: "TTS API error (\(httpResponse.statusCode)): \(errorBody)"])
+            throw NSError(domain: "GrokTTS", code: httpResponse.statusCode,
+                          userInfo: [NSLocalizedDescriptionKey: "Grok TTS API error (\(httpResponse.statusCode)): \(errorBody)"])
         }
 
         try Task.checkCancellation()
@@ -65,7 +65,7 @@ final class ElevenLabsTTSClient: TTSClient {
         let player = try AVAudioPlayer(data: data)
         self.audioPlayer = player
         player.play()
-        print("🔊 ElevenLabs TTS: playing \(data.count / 1024)KB audio")
+        print("🔊 Grok TTS: playing \(data.count / 1024)KB audio")
     }
 
     /// Whether TTS audio is currently playing back.

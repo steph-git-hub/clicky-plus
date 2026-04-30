@@ -98,11 +98,19 @@ class ClaudeAPI {
     /// Send a vision request to Claude with streaming.
     /// Calls `onTextChunk` on the main actor each time new text arrives so the UI updates progressively.
     /// Returns the full accumulated text and total duration when the stream completes.
+    ///
+    /// `personalFacts` is the optional free-form "things Clicky should
+    /// remember" string from the Mac app's persistent-facts UserDefaults.
+    /// If non-empty, it's forwarded to the Worker as a top-level
+    /// `personalFacts` field — the Worker strips it from the payload
+    /// before forwarding to Anthropic and injects it into the system
+    /// prompt block alongside the static memory context.
     func analyzeImageStreaming(
         images: [(data: Data, label: String)],
         systemPrompt: String,
         conversationHistory: [(userPlaceholder: String, assistantResponse: String)] = [],
         userPrompt: String,
+        personalFacts: String? = nil,
         onTextChunk: @MainActor @Sendable (String) -> Void
     ) async throws -> (text: String, duration: TimeInterval) {
         let startTime = Date()
@@ -139,13 +147,20 @@ class ClaudeAPI {
         ])
         messages.append(["role": "user", "content": contentBlocks])
 
-        let body: [String: Any] = [
+        var body: [String: Any] = [
             "model": model,
             "max_tokens": 1024,
             "stream": true,
             "system": systemPrompt,
             "messages": messages
         ]
+
+        // Optionally attach personalFacts. Worker handles the field
+        // (strips it before forwarding upstream + injects into system prompt).
+        if let personalFacts = personalFacts?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !personalFacts.isEmpty {
+            body["personalFacts"] = personalFacts
+        }
 
         let bodyData = try JSONSerialization.data(withJSONObject: body)
         request.httpBody = bodyData
@@ -210,6 +225,7 @@ class ClaudeAPI {
         let duration = Date().timeIntervalSince(startTime)
         return (text: accumulatedResponseText, duration: duration)
     }
+
 
     /// Non-streaming fallback for validation requests where we don't need progressive display.
     func analyzeImage(

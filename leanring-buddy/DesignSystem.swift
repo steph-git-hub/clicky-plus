@@ -107,6 +107,16 @@ enum DS {
         /// in the sidebar). Low opacity so it doesn't overpower.
         static let accentSubtle = blue500.opacity(0.10)
 
+        // ── Burst Mode (Screenshot Burst) Accent ────────────────────
+        // Used by the overlay (cursor/waveform/spinner) ONLY while the
+        // user is holding Fn+Ctrl+Opt to capture a burst. Swapping to
+        // red makes it visually obvious that something different from a
+        // normal voice interaction is happening. When burst is not
+        // active, the overlay uses `accent` (blue) exactly as before.
+        static let burstAccent = Color(hex: "#E5484D")       // Radix Red 9
+        static let burstAccentHover = Color(hex: "#CE2C31")  // Radix Red 10
+        static let burstAccentText = Color(hex: "#F87171")   // Red 400-ish
+
         // ── Semantic Colors ──────────────────────────────────────────
 
         /// Destructive/error actions — delete buttons, error messages, close button hover.
@@ -142,6 +152,36 @@ enum DS {
         /// Kept distinct from the accent since it serves a different purpose
         /// (screen overlay vs in-app UI).
         static let overlayCursorBlue = Color(hex: "#3380FF")
+
+        /// Red variant of the overlay cursor, used ONLY during burst mode
+        /// (Fn + Shift + Opt). Signals visually that the user is capturing
+        /// a screenshot burst instead of a single-screenshot voice query.
+        static let overlayCursorRed = Color(hex: "#FF3344")
+
+        /// Green variant of the overlay cursor, used ONLY during typing
+        /// mode (Fn + Cmd). Signals visually that the dictation result
+        /// will be pasted into the focused field instead of spoken aloud.
+        static let overlayCursorGreen = Color(hex: "#2FD67B")
+
+        /// Purple variant of the overlay cursor, used ONLY during
+        /// voice-to-text mode (Fn + Shift). Signals visually that the
+        /// raw transcript will be pasted into the focused field with
+        /// no Claude round-trip — pure dictation.
+        static let overlayCursorPurple = Color(hex: "#9B5CFF")
+
+        /// Yellow variant of the overlay cursor, used ONLY during
+        /// capture-to-inbox mode (Fn + Opt). Signals visually that
+        /// the transcript will be appended to the user's Obsidian
+        /// Idea Inbox instead of pasted into the focused field —
+        /// a quick "stash this thought" flow.
+        static let overlayCursorYellow = Color(hex: "#F5C518")
+
+        /// Cyan variant of the overlay cursor, used ONLY during the
+        /// polish hotkey flash (⌃⌥⌘ tap, or the voice "polish"
+        /// command in voice-to-text). Polish is a tap-and-fire action
+        /// (no hold), so this color drives a brief 250ms flash on the
+        /// orb rather than a sustained per-mode tint.
+        static let overlayCursorCyan = Color(hex: "#22D3EE")
 
         // ── Floating Button Gradient ─────────────────────────────────
 
