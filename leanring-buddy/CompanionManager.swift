@@ -83,6 +83,15 @@ struct ClickyInteractionLog: Codable {
     /// JPEG screenshot files captured for this interaction. Empty for
     /// modes that don't capture screenshots (VTT, polish, capture-inbox).
     let screenshotPaths: [String]
+    /// v15n (2026-05-01): Polish/repunctuate stage outcome, surfaced in
+    /// the Obsidian transcript so silent failures stop being silent.
+    /// nil = polish/repunctuate not applicable for this interaction.
+    /// "ok" = succeeded.
+    /// "skipped:<reason>" = intentionally not run (toggle mode skips
+    ///                      repunctuate; short-utterance bypass; etc.)
+    /// "failed:<reason>" = errored or timed out; final output is the
+    ///                     fallback (punctuated raw or unpunctuated raw).
+    let polishStatus: String?
 }
 
 /// Singleton logger that writes interactions to disk + Obsidian.
@@ -229,8 +238,24 @@ final class ClickyTranscriptLogger {
             sectionLines.append("**Said:** \(raw)")
             sectionLines.append("")
         }
-        if let final = interaction.finalOutput, !final.isEmpty,
-           final != interaction.rawTranscript {
+        // v15n: Always show Pasted block for VTT/polish modes so we can
+        // see what actually went out, even if it's identical to the raw
+        // transcript. Suppressing the block when final==raw was hiding
+        // silent polish failures (the fallback IS the raw text, so they
+        // looked indistinguishable from "perfectly clean transcript").
+        let isVoiceMode: Bool
+        switch interaction.mode {
+        case .vttHold, .vttToggle, .polish:
+            isVoiceMode = true
+        default:
+            isVoiceMode = false
+        }
+        let shouldShowPasted: Bool = {
+            guard let final = interaction.finalOutput, !final.isEmpty else { return false }
+            if isVoiceMode { return true }
+            return final != interaction.rawTranscript
+        }()
+        if shouldShowPasted, let final = interaction.finalOutput {
             sectionLines.append("**Pasted:**")
             sectionLines.append("")
             for line in final.split(separator: "\n", omittingEmptySubsequences: false) {
@@ -244,6 +269,16 @@ final class ClickyTranscriptLogger {
         }
         if let modifier = interaction.polishModifier, !modifier.isEmpty {
             sectionLines.append("**Polish modifier:** \(modifier)")
+            sectionLines.append("")
+        }
+        // v15n: surface polish/repunctuate outcome so silent failures
+        // are visible. Only annotate non-OK outcomes to keep the log
+        // readable for the common success case.
+        if let status = interaction.polishStatus,
+           !status.isEmpty,
+           status != "ok" {
+            let icon = status.hasPrefix("failed") ? "⚠️" : "ℹ️"
+            sectionLines.append("\(icon) **Polish status:** `\(status)`")
             sectionLines.append("")
         }
         if !interaction.screenshotPaths.isEmpty {
@@ -363,6 +398,31 @@ final class CompanionManager: ObservableObject {
         "/Users/stephenpierson/Desktop/Claude Cowork/Obsidian/Steph Vault/Claude Memory"
     private static let obsidianClickyProfileFileName = "Clicky Profile.md"
     private static let obsidianFactsFileName = "Facts.md"
+
+    /// v15k: timestamp captured at VTT hotkey release. Read at paste
+    /// time to compute end-to-end latency for the timing diagnostic.
+    /// Static so it survives across the various closures in the VTT
+    /// pipeline without needing to thread state through.
+    static var lastVTTReleaseTimestamp: Date?
+
+    /// v15k: file-based timing log for VTT sessions. One line per
+    /// session: indicator style, elapsed ms, char count, mode.
+    /// Tail with: tail -f /tmp/clicky_vtt_timing.log
+    static func appendVTTTimingDiag(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        let path = "/tmp/clicky_vtt_timing.log"
+        if FileManager.default.fileExists(atPath: path) {
+            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
+                defer { try? handle.close() }
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            }
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
 
     /// UserDefaults key from the v5 persistent-facts era. Contents are
     /// migrated to `Claude Memory/Facts.md` on first launch after this
@@ -778,6 +838,18 @@ final class CompanionManager: ObservableObject {
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
 
+        // VTT-SPEED Tier 1+2 (v15m, 2026-05-01): warm the Worker TLS
+        // session so the first /repunctuate (and /transcribe-token)
+        // call after launch skips the ~150-300ms cold TLS handshake.
+        // Same pattern ClaudeAPI uses; safe / silent / one-shot.
+        Self.warmUpWorkerTLSConnectionIfNeeded()
+
+        // VTT-SPEED v15o (2026-05-01): warm Haiku 4.5 itself by firing
+        // a tiny /repunctuate call. Skips the model cold-start tax on
+        // the first real VTT after launch (saves ~200-400ms). Fires on
+        // a background task so it doesn't block app boot.
+        Self.warmUpHaikuModelIfNeeded()
+
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions
         // were revoked (e.g. signing change), don't show the cursor — the
@@ -1079,17 +1151,32 @@ final class CompanionManager: ObservableObject {
         //   - Any other path that strands voiceState at .processing
         // The continuous nature means a new .pressed can't accidentally
         // skip the safety net for a still-stuck prior session.
-        $voiceState
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] newState in
-                guard let self else { return }
-                if newState == .processing {
-                    self.scheduleVoiceStateWatchdog()
-                } else {
-                    self.cancelVoiceStateWatchdog()
-                }
-            }
-            .store(in: &cancellableSet)
+        // v13u (2026-04-30): voiceState watchdog DISABLED. It was designed
+        // to catch genuinely hung .processing states, but in practice it
+        // fires on legitimate long operations (long dictation + transcription
+        // + Claude reasoning + TTS often exceed 10s) and kills the in-flight
+        // URLSession task. Result: transcripts get cancelled mid-stream,
+        // TTS gets cancelled mid-synthesis, spinner stuck because the
+        // silent-return cancellation path short-circuits cleanup.
+        //
+        // We retain Esc as the manual panic-clear (handleEscapeKeyForToggleUnlock
+        // does everything the watchdog used to do, on user demand). If a
+        // genuine hang ever happens, Esc fixes it. The auto-watchdog was
+        // causing more failures than it prevented.
+        //
+        // To re-enable: uncomment below. The schedule/cancel methods
+        // themselves are preserved.
+        // $voiceState
+        //     .receive(on: DispatchQueue.main)
+        //     .sink { [weak self] newState in
+        //         guard let self else { return }
+        //         if newState == .processing {
+        //             self.scheduleVoiceStateWatchdog()
+        //         } else {
+        //             self.cancelVoiceStateWatchdog()
+        //         }
+        //     }
+        //     .store(in: &cancellableSet)
 
         voiceStateCancellable = buddyDictationManager.$isRecordingFromKeyboardShortcut
             .combineLatest(
@@ -1338,7 +1425,14 @@ final class CompanionManager: ObservableObject {
     // explicitly ignores events that include .function, so the two modes
     // never fire together.
 
+    /// v13t (2026-04-30): burst mode disabled. Steph killed it because the
+    /// first-attempt-silent + watchdog-stuck issues weren't worth solving.
+    /// To re-enable, flip this flag to true. Code below is preserved.
+    private static let isBurstModeEnabled = false
+
     private func handleBurstTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
+        guard Self.isBurstModeEnabled else { return }
+
         switch transition {
         case .pressed:
             guard !buddyDictationManager.isDictationInProgress else { return }
@@ -1582,7 +1676,8 @@ final class CompanionManager: ObservableObject {
                     claudeResponse: spokenText,
                     polishModifier: nil,
                     appName: NSWorkspace.shared.frontmostApplication?.localizedName,
-                    screenshotPaths: burstScreenshotPaths
+                    screenshotPaths: burstScreenshotPaths,
+                    polishStatus: nil
                 ))
 
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2100,6 +2195,9 @@ final class CompanionManager: ObservableObject {
 
         case .released:
             ClickyAnalytics.trackPushToTalkReleased()
+            // v15k diagnostic: record release timestamp so we can measure
+            // end-to-end VTT latency (release → text appears).
+            Self.lastVTTReleaseTimestamp = Date()
             isVoiceToTextModeActive = false
             pendingVoiceToTextShortcutStartTask?.cancel()
             pendingVoiceToTextShortcutStartTask = nil
@@ -2637,7 +2735,8 @@ final class CompanionManager: ObservableObject {
                     claudeResponse: nil,
                     polishModifier: modifier,
                     appName: fieldContent?.appName,
-                    screenshotPaths: []
+                    screenshotPaths: [],
+                    polishStatus: "ok"
                 ))
             } catch is CancellationError {
                 // User triggered another action mid-flight — drop silently.
@@ -3015,7 +3114,8 @@ final class CompanionManager: ObservableObject {
             claudeResponse: nil,
             polishModifier: nil,
             appName: NSWorkspace.shared.frontmostApplication?.localizedName,
-            screenshotPaths: []
+            screenshotPaths: [],
+            polishStatus: nil
         ))
 
         // Surface the confirmation toast. Any prior toast is replaced.
@@ -3101,22 +3201,51 @@ final class CompanionManager: ObservableObject {
             // directly from raw text. Repunctuate was pre-flattening
             // list structure ("first... second... third...") into
             // flowing prose, which made polish blind to the list cues.
+            // v15m phase timing: capture the boundary between setup
+            // (AssemblyAI final + pre-substitution) and the repunctuate
+            // round-trip so the diagnostic log can show exactly where
+            // VTT time is spent.
+            let phaseSetupCompleteAt = Date()
+
+            // v15n: track pipeline outcome for the transcript log so
+            // silent failures (repunctuate timeout, polish error) get
+            // surfaced. Hold-mode + short-bypass paths set this to a
+            // descriptive "skipped:..." value; failures set "failed:...".
+            // Toggle mode overrides with the polish outcome below.
+            var pipelineStatus: String? = nil
+
             let punctuatedText: String
+            let repunctuateSkipped: Bool
             if polishAfterRepunctuate {
                 punctuatedText = preSubstitutedText
+                repunctuateSkipped = true
                 print("✏️ Repunctuate: skipped (toggle/polish mode — polish handles punctuation + lists end-to-end)")
+            } else if Self.shouldSkipRepunctuateForShortUtterance(preSubstitutedText) {
+                // VTT-SPEED Tier 2 (v15m, 2026-05-01): for very short
+                // utterances ("yes", "okay", "got it"), AssemblyAI's
+                // native punctuation is already correct and the
+                // ~300-500ms Haiku round-trip just adds latency. Skip.
+                punctuatedText = preSubstitutedText
+                repunctuateSkipped = true
+                pipelineStatus = "skipped:short-utterance"
+                let wordCount = preSubstitutedText.split(whereSeparator: { $0.isWhitespace }).count
+                print("✏️ Repunctuate: skipped (short utterance: \(wordCount) word(s), \(preSubstitutedText.count) chars — AssemblyAI punctuation sufficient)")
             } else {
                 do {
                     punctuatedText = try await Self.repunctuateTextViaWorker(
                         workerBaseURL: workerBaseURL,
                         rawText: preSubstitutedText
                     )
+                    repunctuateSkipped = false
                     print("✏️ Repunctuate: \(preSubstitutedText.count) chars → \(punctuatedText.count) chars")
                 } catch {
                     print("⚠️ Repunctuate failed (\(error)) — falling back to pre-substituted text")
                     punctuatedText = preSubstitutedText
+                    repunctuateSkipped = false
+                    pipelineStatus = "failed:repunctuate:\((error as NSError).localizedDescription.prefix(80))"
                 }
             }
+            let phaseRepunctuateCompleteAt = Date()
 
             guard !Task.isCancelled else { return }
 
@@ -3144,13 +3273,16 @@ final class CompanionManager: ObservableObject {
                     )
                     print("✨ VTT polish (Haiku, smart, vision=\(contextScreenshot != nil)): \(punctuatedText.count) → \(polished.count) chars")
                     textToFormat = polished
+                    pipelineStatus = "ok"
                 } catch {
                     print("⚠️ VTT polish failed (\(error)) — using punctuated raw text")
                     textToFormat = punctuatedText
+                    pipelineStatus = "failed:polish:\((error as NSError).localizedDescription.prefix(80))"
                 }
             } else {
                 textToFormat = punctuatedText
             }
+            let phasePolishCompleteAt = Date()
 
             guard !Task.isCancelled else { return }
 
@@ -3177,6 +3309,41 @@ final class CompanionManager: ObservableObject {
             // can make a good decision even in AX-blind apps.
             Self.lastVoiceToTextPasteEndedWith = cleaned.last
             Self.lastVoiceToTextPasteAt = Date()
+
+            // v15m+ diagnostic: phase-breakdown timing.
+            // Format: indicator=<style> mode=<hold|toggle> chars=N words=N
+            //         setupMs=X repunctuateMs=Y polishMs=Z finalizeMs=W totalMs=T
+            //         repunctuateSkipped=true|false
+            //
+            // - setupMs:       release → AssemblyAI final + pre-substitution
+            // - repunctuateMs: Haiku /repunctuate round-trip (0 if skipped)
+            // - polishMs:      Haiku /voice-command polish (0 if hold mode)
+            // - finalizeMs:    artifact strip + smart-space prefix (should be ~0)
+            // - totalMs:       release → ready-to-paste (excludes the
+            //                  fixed 30ms+150ms clipboard latch sleeps)
+            //
+            // Phase boundaries are taken at three Date() captures upstream
+            // (phaseSetupCompleteAt, phaseRepunctuateCompleteAt,
+            // phasePolishCompleteAt). This breakdown lets us A/B specific
+            // changes (e.g. v15m Tier 1+2) without guessing which phase
+            // moved.
+            if let releaseAt = Self.lastVTTReleaseTimestamp {
+                let now = Date()
+                let setupMs = Int(phaseSetupCompleteAt.timeIntervalSince(releaseAt) * 1000)
+                let repunctuateMs = Int(phaseRepunctuateCompleteAt.timeIntervalSince(phaseSetupCompleteAt) * 1000)
+                let polishMs = Int(phasePolishCompleteAt.timeIntervalSince(phaseRepunctuateCompleteAt) * 1000)
+                let finalizeMs = Int(now.timeIntervalSince(phasePolishCompleteAt) * 1000)
+                let totalMs = Int(now.timeIntervalSince(releaseAt) * 1000)
+                let style = UserDefaults.standard.string(forKey: "clicky.cursorIndicatorStyle") ?? "triangle"
+                let mode = polishAfterRepunctuate ? "toggle" : "hold"
+                let words = finalPayload.split(whereSeparator: { $0.isWhitespace }).count
+                Self.appendVTTTimingDiag(
+                    "indicator=\(style) mode=\(mode) chars=\(finalPayload.count) words=\(words) " +
+                    "setupMs=\(setupMs) repunctuateMs=\(repunctuateMs) polishMs=\(polishMs) finalizeMs=\(finalizeMs) totalMs=\(totalMs) " +
+                    "repunctuateSkipped=\(repunctuateSkipped)"
+                )
+                Self.lastVTTReleaseTimestamp = nil
+            }
 
             await Self.typeTextViaClipboard(finalPayload)
 
@@ -3207,7 +3374,8 @@ final class CompanionManager: ObservableObject {
                 claudeResponse: nil,
                 polishModifier: nil,
                 appName: focusedContext?.appName,
-                screenshotPaths: vttScreenshotPaths
+                screenshotPaths: vttScreenshotPaths,
+                polishStatus: pipelineStatus
             ))
 
             if !Task.isCancelled {
@@ -3215,6 +3383,27 @@ final class CompanionManager: ObservableObject {
                 self?.scheduleTransientHideIfNeeded()
             }
         }
+    }
+
+    /// Returns true if `text` is short enough that we can skip the
+    /// /repunctuate Haiku round-trip without quality loss. AssemblyAI's
+    /// native punctuation is already very good on simple utterances —
+    /// the value of /repunctuate is in multi-clause sentences and
+    /// disfluencies, neither of which fit in <3 words or <15 chars.
+    ///
+    /// Saves 300-500ms on the very common "quick reply" case
+    /// ("yes", "okay", "got it", "sounds good", "thanks", etc.).
+    /// VTT-SPEED Tier 2 (v15m, 2026-05-01).
+    private static func shouldSkipRepunctuateForShortUtterance(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count < 15 {
+            return true
+        }
+        let wordCount = trimmed.split(whereSeparator: { $0.isWhitespace }).count
+        if wordCount < 3 {
+            return true
+        }
+        return false
     }
 
     /// POST raw transcript text to the Worker's /repunctuate route.
@@ -3263,6 +3452,105 @@ final class CompanionManager: ObservableObject {
         }
 
         return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Worker TLS warmup (v15m T1+T2, 2026-05-01)
+    //
+    // Pre-establish a TLS session to clicky-proxy.sapierso.workers.dev so
+    // the first VTT after launch doesn't pay for a cold TLS handshake
+    // (~150-300ms saved depending on network). Mirrors the pattern in
+    // ClaudeAPI.warmUpTLSConnectionIfNeeded.
+    //
+    // The TLS session ticket is host-scoped so warming the root host
+    // covers /repunctuate, /transcribe-token, and any other Worker route
+    // we add later. Failures are silently ignored — this is purely
+    // an optimization.
+
+    private static let workerTLSWarmupLock = NSLock()
+    private static var hasStartedWorkerTLSWarmup = false
+
+    /// Fires a no-op HEAD request against the Worker host to warm the
+    /// TLS session ticket cache. Idempotent — only runs once per app
+    /// launch. Safe to call from any thread.
+    static func warmUpWorkerTLSConnectionIfNeeded() {
+        workerTLSWarmupLock.lock()
+        let shouldStart = !hasStartedWorkerTLSWarmup
+        if shouldStart {
+            hasStartedWorkerTLSWarmup = true
+        }
+        workerTLSWarmupLock.unlock()
+
+        guard shouldStart else { return }
+
+        guard var components = URLComponents(string: workerBaseURL) else {
+            return
+        }
+        components.path = "/"
+        components.query = nil
+        components.fragment = nil
+
+        guard let warmupURL = components.url else {
+            return
+        }
+
+        var request = URLRequest(url: warmupURL)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 10
+        URLSession.shared.dataTask(with: request) { _, _, _ in
+            // Response doesn't matter — the TLS handshake is the goal.
+        }.resume()
+    }
+
+    // MARK: - Haiku model warmup (v15o, 2026-05-01)
+    //
+    // The TLS warmup above gets the network connection hot, but the
+    // Haiku 4.5 MODEL itself can also pay a "cold start" tax of
+    // 200-400ms on the first call after a long idle period. We can
+    // pre-warm the model by firing a tiny /repunctuate call that's
+    // small enough to be ~free (a few tokens of input/output) but
+    // exercises the full path: TLS → Worker → Anthropic API → Haiku.
+    //
+    // After this completes, the user's first real VTT (whether hold or
+    // toggle) hits a hot Haiku and skips that cold-start delay.
+    //
+    // Idempotent — only fires once per app launch. Safe to call from
+    // any thread. Completely silent on failure (it's just an
+    // optimization).
+
+    private static let haikuWarmupLock = NSLock()
+    private static var hasStartedHaikuWarmup = false
+
+    /// Fires a tiny `/repunctuate` request to warm Haiku 4.5 on the
+    /// Anthropic side so the user's first real VTT doesn't pay for
+    /// model cold-start. ~10 input + ~5 output tokens — fractional
+    /// cents per launch.
+    static func warmUpHaikuModelIfNeeded() {
+        haikuWarmupLock.lock()
+        let shouldStart = !hasStartedHaikuWarmup
+        if shouldStart {
+            hasStartedHaikuWarmup = true
+        }
+        haikuWarmupLock.unlock()
+
+        guard shouldStart else { return }
+
+        guard let routeURL = URL(string: "\(workerBaseURL)/repunctuate") else {
+            return
+        }
+
+        Task.detached(priority: .background) {
+            var request = URLRequest(url: routeURL)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "content-type")
+            // 10s timeout — generous because this is the cold-start case.
+            request.timeoutInterval = 10
+            let body: [String: Any] = ["text": "warmup"]
+            request.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+            // Result is intentionally discarded — purpose is to exercise
+            // the path, not consume the output. Errors are silently swallowed.
+            _ = try? await URLSession.shared.data(for: request)
+        }
     }
 
     /// Rolling memory for voice-to-text smart-spacing. Static because
@@ -3552,9 +3840,18 @@ final class CompanionManager: ObservableObject {
             }
 
             guard let self else { return }
+            // v13n: keep voiceState at .processing (spinner) throughout
+            // synthesis + playback. Was flipping to .responding BEFORE the
+            // await, which meant during the TTS synthesis delay the orb
+            // showed .responding (no spinner) — Steph rightly noted this
+            // looked like nothing was happening. speakText is one blocking
+            // call doing both synthesis and playback; the spinner is the
+            // honest signal that Clicky is working.
             self.voiceState = .processing
+            // Force stopPlayback to drain any residual TTS state (same
+            // root cause as the v13m burst fix).
+            self.ttsClient.stopPlayback()
             do {
-                self.voiceState = .responding
                 try await self.ttsClient.speakText(responseText)
                 print("🔁 Voice replay: TTS playback finished cleanly")
             } catch is CancellationError {
@@ -4212,7 +4509,8 @@ final class CompanionManager: ObservableObject {
                         claudeResponse: nil,
                         polishModifier: nil,
                         appName: focusedContext?.appName,
-                        screenshotPaths: typingScreenshotPaths
+                        screenshotPaths: typingScreenshotPaths,
+                        polishStatus: nil
                     ))
                 }
             } catch is CancellationError {
@@ -4649,13 +4947,37 @@ final class CompanionManager: ObservableObject {
 
         // Give the destination app a beat to notice the new clipboard
         // contents, then fire Cmd+V.
-        try? await Task.sleep(nanoseconds: 80_000_000) // 80ms
+        // VTT-SPEED Tier 1 (v15m, 2026-05-01): tightened 80ms → 30ms.
+        // Most apps notice clipboard changes in well under 30ms; the
+        // older 80ms was conservative padding from when we were also
+        // restoring the prior clipboard (which we no longer do).
+        //
+        // Tunable via UserDefaults `clicky.prePasteLatchMs` (default 30,
+        // clamped 0...500) so we can A/B if 30ms turns out too tight
+        // for any app without rebuilding.
+        let prePasteLatchMs = max(0, min(500,
+            UserDefaults.standard.object(forKey: "clicky.prePasteLatchMs") as? Int ?? 30
+        ))
+        if prePasteLatchMs > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(prePasteLatchMs) * 1_000_000)
+        }
         synthesizeCommandV()
 
-        // Wait for the paste to land. 400ms is conservative — most apps
-        // consume the pasteboard in well under 100ms, but some (Electron,
-        // web text inputs) are slower.
-        try? await Task.sleep(nanoseconds: 400_000_000) // 400ms
+        // Wait for the paste to land.
+        // VTT-SPEED Tier 1 (v15m, 2026-05-01): tightened 400ms → 150ms.
+        // Empirically, AppKit / WebKit / Electron all consume the
+        // pasteboard in 30–80ms after Cmd+V. 150ms keeps a safety
+        // margin for slow Electron apps without burning a quarter
+        // second of perceived latency on every VTT.
+        //
+        // Tunable via UserDefaults `clicky.postPasteWaitMs` (default 150,
+        // clamped 0...2000) for the same A/B reasons.
+        let postPasteWaitMs = max(0, min(2000,
+            UserDefaults.standard.object(forKey: "clicky.postPasteWaitMs") as? Int ?? 150
+        ))
+        if postPasteWaitMs > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(postPasteWaitMs) * 1_000_000)
+        }
 
         // SAFETY NET (v11i, 2026-04-27): we INTENTIONALLY leave the
         // transcript in the clipboard rather than restoring the user's
@@ -5028,7 +5350,8 @@ final class CompanionManager: ObservableObject {
                     claudeResponse: spokenText,
                     polishModifier: nil,
                     appName: NSWorkspace.shared.frontmostApplication?.localizedName,
-                    screenshotPaths: basePTTScreenshotPaths
+                    screenshotPaths: basePTTScreenshotPaths,
+                    polishStatus: nil
                 ))
 
                 // Play the response via TTS. Two paths:

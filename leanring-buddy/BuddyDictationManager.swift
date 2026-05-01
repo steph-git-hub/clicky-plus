@@ -565,6 +565,17 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     private var firstTapBufferReceivedAt: Date?
     /// v13j: diagnostic — count of tap callbacks during the current session.
     private var tapBufferCount: Int = 0
+    /// v14 (2026-04-30): cumulative audio engine start/stop cycle count
+    /// across the app lifetime. Bumped on every cleanup. Useful for
+    /// correlating CoreAudio degradation with cycle count — high cycle
+    /// counts strongly suggest cumulative-state issues.
+    private var audioSessionCycleCount: Int = 0
+    /// v14: re-entry guard. Cleanup paths can race when (e.g.) Esc fires
+    /// during finalize, or when shortcut release coincides with cancel.
+    /// Without this, two cleanup calls could overlap, double-stopping the
+    /// engine or double-cancelling the transcription session — both of
+    /// which contribute to orphan-state buildup in CoreAudio.
+    private var isCleaningUpAudioCapture: Bool = false
     private var activeTranscriptionSession: (any BuddyStreamingTranscriptionSession)?
     private var activeStartSource: BuddyDictationStartSource?
     private var draftCallbacks: BuddyDictationDraftCallbacks?
@@ -643,11 +654,76 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             draftCallbacks?.updateDraftText(currentDraftText)
         }
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
-        activeTranscriptionSession?.cancel()
+        cleanupAudioCapture(cancelTranscription: true)
 
         resetSessionState()
+    }
+
+    /// v14 (2026-04-30): unified audio-capture cleanup. Was duplicated across
+    /// 4 sites with subtle variations that contributed to orphan-state buildup
+    /// in CoreAudio over many sessions. Now every cleanup path goes through
+    /// here:
+    ///   - re-entry guard (prevents double-cleanup races)
+    ///   - idempotent engine stop (only if running, AVAudioEngine.stop on
+    ///     a stopped engine is technically safe but generates needless work)
+    ///   - explicit tap removal
+    ///   - optional graceful transcription session close (Terminate JSON +
+    ///     .goingAway WebSocket frame, see AssemblyAIStreamingTranscriptionProvider.cancel)
+    ///   - cycle counter bump for diagnostic correlation
+    ///
+    /// - Parameter cancelTranscription: when true (cancel/destroy paths),
+    ///   immediately cancels the transcription session. When false (the
+    ///   release-to-finalize path in stopPushToTalk), leaves the
+    ///   transcription session alive so it can drain its final transcript
+    ///   before being teardown'd in finishCurrentDictationSessionIfNeeded.
+    private func cleanupAudioCapture(cancelTranscription: Bool) {
+        guard !isCleaningUpAudioCapture else {
+            Self.appendAudioDiag("RE-ENTRY BLOCKED at cycle=\(audioSessionCycleCount)")
+            return
+        }
+        isCleaningUpAudioCapture = true
+        defer { isCleaningUpAudioCapture = false }
+
+        audioSessionCycleCount += 1
+        let diagLine = "cycle=\(audioSessionCycleCount) cancelTranscription=\(cancelTranscription) engine.isRunning=\(audioEngine.isRunning)"
+        print("🎙️ cleanupAudioCapture #\(audioSessionCycleCount) \(diagLine)")
+        Self.appendAudioDiag(diagLine)
+
+        // v14 Item 2 reverted (2026-05-01): the engine-warm experiment held
+        // up for many sessions but introduced a new failure mode where the
+        // audio input device powered down after several minutes of warm-but-
+        // idle running. Reverting to stop/start per session as the known-
+        // working baseline. Item 1's cleanup unification stays.
+        // File-based diag at /tmp/clicky_audio_diag.log captures every cycle
+        // for offline analysis when failure recurs.
+        if audioEngine.isRunning {
+            audioEngine.stop()
+        }
+        audioEngine.inputNode.removeTap(onBus: 0)
+
+        if cancelTranscription {
+            activeTranscriptionSession?.cancel()
+        }
+    }
+
+    /// File-based diagnostic logger for audio cleanup events. Bypasses OSLog
+    /// because Swift print() from a sandboxed Mac app doesn't reliably
+    /// surface there. Plain-text JSONL-ish format we can grep + correlate
+    /// with user-reported failures.
+    static func appendAudioDiag(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        let path = "/tmp/clicky_audio_diag.log"
+        if FileManager.default.fileExists(atPath: path) {
+            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
+                defer { try? handle.close() }
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            }
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
     }
 
     func requestInitialPushToTalkPermissionsIfNeeded() async {
@@ -752,9 +828,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             try await startRecognitionSession()
             guard !Task.isCancelled else {
                 print("🎙️ BuddyDictationManager: start cancelled (shortcut released during session start)")
-                audioEngine.stop()
-                audioEngine.inputNode.removeTap(onBus: 0)
-                activeTranscriptionSession?.cancel()
+                cleanupAudioCapture(cancelTranscription: true)
                 resetSessionState()
                 return
             }
@@ -792,8 +866,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         let finalTranscriptFallbackDelaySeconds = activeTranscriptionSession?.finalTranscriptFallbackDelaySeconds
             ?? Self.defaultFinalTranscriptFallbackDelaySeconds
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
+        // v14: leave transcription alive so it can drain final transcript
+        cleanupAudioCapture(cancelTranscription: false)
         activeTranscriptionSession?.requestFinalTranscript()
 
         finalizeFallbackWorkItem?.cancel()
@@ -940,9 +1014,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             currentDraftCallbacks?.updateDraftText(finalDraftText)
         }
 
-        audioEngine.stop()
-        audioEngine.inputNode.removeTap(onBus: 0)
-        activeTranscriptionSession?.cancel()
+        cleanupAudioCapture(cancelTranscription: true)
 
         resetSessionState()
 

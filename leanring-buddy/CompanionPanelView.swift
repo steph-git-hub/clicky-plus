@@ -37,6 +37,12 @@ struct CompanionPanelView: View {
 
                 hotkeyReferenceSection
                     .padding(.horizontal, 16)
+
+                Spacer()
+                    .frame(height: 14)
+
+                indicatorStylePickerSection
+                    .padding(.horizontal, 16)
             }
 
             if !companionManager.allPermissionsGranted {
@@ -740,9 +746,75 @@ struct CompanionPanelView: View {
                 hotkeyRow(keys: ["⌃", "⌥"], label: "Push-to-talk", color: DS.Colors.overlayCursorBlue)
                 hotkeyRow(keys: ["⌘", "fn"], label: "Typing mode", color: DS.Colors.overlayCursorGreen)
                 hotkeyRow(keys: ["⌃", "fn"], label: "Voice-to-text", color: DS.Colors.overlayCursorPurple)
-                hotkeyRow(keys: ["⇧", "⌥", "fn"], label: "Burst mode", color: DS.Colors.overlayCursorRed)
+                // v13t: burst mode killed — hotkey is a no-op now. Hidden from UI.
                 hotkeyRow(keys: ["⌥", "fn"], label: "Capture-to-inbox", color: DS.Colors.overlayCursorYellow)
                 hotkeyRow(keys: ["⇧", "⌃"], label: "Polish (tap or hold)", color: DS.Colors.overlayCursorCyan)
+            }
+        }
+    }
+
+    // MARK: - Indicator Style Picker (v15b 2026-05-01)
+    //
+    // A small picker in the panel that lets Steph swap between cursor/edge
+    // indicator styles without dropping to Terminal. Backed by the same
+    // @AppStorage flag as OverlayWindow.swift, so the switch is reactive
+    // (no relaunch needed).
+    @AppStorage("clicky.cursorIndicatorStyle") private var cursorIndicatorStyle: String = "triangle"
+
+    private struct IndicatorStyleOption: Identifiable {
+        let id: String
+        let label: String
+        let hint: String
+    }
+
+    private static let indicatorStyleOptions: [IndicatorStyleOption] = [
+        .init(id: "triangle", label: "Triangle", hint: "Classic — small blue triangle by cursor"),
+        .init(id: "cursorDot", label: "Cursor dot", hint: "Tiny pulsing dot near cursor"),
+        .init(id: "bottomEdgeLine", label: "Bottom-edge line", hint: "Horizontal line at the bottom of the screen"),
+        .init(id: "sideStrip", label: "Side strip", hint: "Vertical strip on right edge, pulses"),
+    ]
+
+    private var indicatorStylePickerSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Indicator")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer()
+            }
+            .padding(.bottom, 6)
+
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(Self.indicatorStyleOptions) { option in
+                    Button {
+                        cursorIndicatorStyle = option.id
+                    } label: {
+                        HStack(spacing: 8) {
+                            ZStack {
+                                Circle()
+                                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                                    .frame(width: 14, height: 14)
+                                if cursorIndicatorStyle == option.id {
+                                    Circle()
+                                        .fill(DS.Colors.overlayCursorBlue)
+                                        .frame(width: 8, height: 8)
+                                }
+                            }
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(option.label)
+                                    .font(.system(size: 12, weight: .regular))
+                                    .foregroundColor(DS.Colors.textPrimary)
+                                Text(option.hint)
+                                    .font(.system(size: 10, weight: .regular))
+                                    .foregroundColor(DS.Colors.textSecondary)
+                            }
+                            Spacer()
+                        }
+                        .padding(.vertical, 3)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
     }

@@ -338,11 +338,48 @@ async function handleVoiceCommandPolish(
       `- DO NOT use em-dashes anywhere in the output. Use commas, periods, semicolons, or "and"/"but" instead. Steph dislikes em-dashes; never produce one.\n` +
       `- DO NOT restructure sentence order or inject new ideas/transitions/framing.\n` +
       `\n` +
-      `LIST RULES:\n` +
-      `- Bullets are DEFAULT for any clearly-enumerated content ("first/second/third" ordinals, "a few things", "here are", "we need to do", "things to check", "let me list", "also/another/next/then" repeated, comma-separated items after a list-introducing phrase).\n` +
-      `- Numbered list ONLY when the speaker said literal CARDINAL numbers ("one, two, three" or "1, 2, 3" out loud). Ordinals like "first/second/third" → bullets, not numbered.\n` +
-      `- ALWAYS preserve the lead-in sentence above the list (often ending with ":"). Don't drop "Three things I want to do today:" just because a 3-item list follows it.\n` +
-      `- Don't bullet pure inline grammar like "I bought milk, eggs, and bread" without a list-introducing phrase.\n` +
+      `LIST RULES (v15n, 2026-05-01 — split into MUST and MAY tiers):\n` +
+      `\n` +
+      `MUST FORMAT AS A LIST — these speech cues OVERRIDE the destination context. Even if the screenshot shows prose, output a list when the speaker did any of:\n` +
+      `  • Ordinal sequence: "first ... second ... third ..."\n` +
+      `  • Cardinal sequence: "one ... two ... three ..." or "1 ... 2 ... 3 ..."\n` +
+      `  • Item-count opener: "three things to do", "four reasons", "five points"\n` +
+      `  • Explicit list openers: "a few things", "here are", "let me list", "we need to do", "things to check"\n` +
+      `\n` +
+      `MAY FORMAT AS A LIST — when there's no speech cue but the destination invites one:\n` +
+      `  • Replying to a message that asked a numbered set of questions → answer in matching numbered format\n` +
+      `  • Replying in a thread that's already using bullets → match the surrounding style\n` +
+      `  • Otherwise default to prose\n` +
+      `\n` +
+      `LIST STYLE WHEN FORMATTING:\n` +
+      `- ORDINAL CUES ("first/second/third") → use a NUMBERED list ("1. ", "2. ", "3. "). Drop the "first"/"second"/"third" labels themselves; they're now redundant with the numbers.\n` +
+      `- CARDINAL CUES ("one/two/three" or "1/2/3" said aloud) → also use a NUMBERED list.\n` +
+      `- ITEM-COUNT OPENERS without explicit ordinals ("a few things", "here are some") → use a BULLETED list with "- " (hyphen + space).\n` +
+      `- BULLET CHARACTER for unordered lists: ALWAYS "- " (hyphen + space). NEVER "• " — it doesn't render in markdown apps (Cowork, Slack, Obsidian, Notion, GitHub).\n` +
+      `\n` +
+      `LEAD-IN SENTENCE (HARD RULE):\n` +
+      `ALWAYS preserve the lead-in sentence above the list. Convert it to end with ":" if it doesn't already. Concrete example:\n` +
+      `  Input:  "Three things to do today. First, follow up with the team. Second, finalize the deck. Third, send the email."\n` +
+      `  CORRECT output:\n` +
+      `    Three things to do today:\n` +
+      `    1. Follow up with the team.\n` +
+      `    2. Finalize the deck.\n` +
+      `    3. Send the email.\n` +
+      `  WRONG output (lead-in dropped):\n` +
+      `    1. Follow up with the team.\n` +
+      `    ...\n` +
+      `\n` +
+      `DON'T-LIST CASES:\n` +
+      `- Pure inline grammar ("I bought milk, eggs, and bread") with no list-introducing phrase → keep as prose.\n` +
+      `- Single-item utterances → keep as prose.\n` +
+      `\n` +
+      `NUMERAL PRESERVATION (HARD RULE):\n` +
+      `Keep numerals and abbreviations EXACTLY as the speaker said them. Do NOT spell them out, do NOT expand them.\n` +
+      `  • "Q3" stays "Q3" (NOT "Q three", NOT "third quarter")\n` +
+      `  • "4 topics" stays "4 topics" (NOT "four topics")\n` +
+      `  • "10 days" stays "10 days" (NOT "ten days")\n` +
+      `  • "2026" stays "2026"\n` +
+      `  • Same for "EOD", "EOW", "EOM", "ASAP", "FYI", "TBD" — keep as the speaker said them.\n` +
       `\n` +
       ``
     : `LIGHT EDIT MODE. The user typed (or otherwise produced) this text and wants it cleaned up. Be conservative:\n` +

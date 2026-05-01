@@ -213,6 +213,65 @@ struct BlueCursorView: View {
     /// only defensively — the shortcut layer already ensures the
     /// hold-mode flags can't overlap, and the polish-flash flag is also
     /// gated on `pendingPolishCommandTask == nil` at trigger time.
+    /// v15f: maps voiceState to the cursor dot's animation mode.
+    /// Used only when cursorIndicatorStyle == "cursorDot" — the dot
+    /// becomes the universal indicator across idle/listening/processing
+    /// states instead of swapping in the waveform/spinner views.
+    private var dotModeForVoiceState: CursorPresenceDot.DotMode {
+        switch companionManager.voiceState {
+        case .listening:
+            return .listening
+        case .processing:
+            return .processing
+        case .idle, .responding:
+            return .idle
+        }
+    }
+
+    /// v15i: capture the most-recent NON-default tint so the indicator
+    /// keeps the active mode color through the processing phase.
+    /// Without this, after VTT (purple), release transitions to .processing
+    /// and the mode flag (isVoiceToTextModeActive) clears — currentCursorTint
+    /// falls back to default blue. With this cache, we keep showing purple
+    /// throughout the processing phase too, then back to default blue when
+    /// fully idle again.
+    @State private var rememberedActiveModeTint: Color = DS.Colors.overlayCursorBlue
+
+    /// The tint to actually use in indicator views — substitutes the
+    /// remembered mode tint during processing when no mode flag is set.
+    private var indicatorTint: Color {
+        if companionManager.voiceState == .processing
+            && currentCursorTint == DS.Colors.overlayCursorBlue {
+            return rememberedActiveModeTint
+        }
+        return currentCursorTint
+    }
+
+    /// v15g: same idea for edge-line indicators (bottomEdgeLine, sideStrip).
+    /// Each indicator is fully self-contained — handles idle, listening
+    /// (audio-reactive thickness + opacity), and processing (faster
+    /// heartbeat pulse) without falling back to the cursor waveform.
+    private var lineModeForVoiceState: EdgeLineIndicator.LineMode {
+        switch companionManager.voiceState {
+        case .listening:
+            return .listening
+        case .processing:
+            return .processing
+        case .idle, .responding:
+            return .idle
+        }
+    }
+
+    /// v15g: which non-cursor styles fully replace the waveform/spinner.
+    /// When any of these is the selected indicator, the legacy cursor
+    /// waveform and spinner views are hidden — the indicator itself
+    /// handles all states with its own animation language.
+    private var selfContainedStyleActive: Bool {
+        cursorIndicatorStyle == "cursorDot"
+            || cursorIndicatorStyle == "bottomEdgeLine"
+            || cursorIndicatorStyle == "sideStrip"
+    }
+
     private var currentCursorTint: Color {
         if companionManager.isPolishCommandFlashActive
             || companionManager.isPolishHotkeyModifierCaptureModeActive {
@@ -430,7 +489,7 @@ struct BlueCursorView: View {
             // processing modes can swap to the waveform/spinner cleanly.
             CursorPresenceGlow(tint: presenceTint)
                 .opacity(
-                    cursorIndicatorStyle != "triangle" && presenceVisible
+                    cursorIndicatorStyle == "glow" && presenceVisible
                         ? cursorOpacity * 0.85 : 0
                 )
                 .position(
@@ -443,6 +502,73 @@ struct BlueCursorView: View {
                 .animation(.easeOut(duration: 0.12), value: companionManager.isTypingModeActive)
                 .animation(.easeOut(duration: 0.12), value: companionManager.isBurstModeActive)
                 .animation(.easeOut(duration: 0.12), value: companionManager.isCaptureToInboxModeActive)
+
+            // v15 (2026-05-01): cursor dot — tiny pulsing dot tucked at
+            // bottom-right of cursor (+18, +18 from actual cursor).
+            // v15f: dot is now the UNIVERSAL indicator across all states
+            // when cursorDot is selected — replaces the waveform during
+            // listening (dot scales with audio level) and the spinner
+            // during processing (dot inside a spinning ring). Tint
+            // automatically reflects active mode color via currentCursorTint.
+            CursorPresenceDot(
+                tint: indicatorTint,
+                mode: dotModeForVoiceState,
+                audioPowerLevel: companionManager.currentAudioPowerLevel
+            )
+                .opacity(
+                    cursorIndicatorStyle == "cursorDot" && buddyIsVisibleOnThisScreen
+                        ? cursorOpacity : 0
+                )
+                .position(
+                    x: cursorPosition.x - 17,
+                    y: cursorPosition.y - 7
+                )
+                .animation(.linear(duration: 0.04), value: cursorPosition)
+                .animation(.easeInOut(duration: 0.2), value: companionManager.voiceState)
+                .animation(.linear(duration: 0.04), value: cursorPosition)
+                .animation(.easeIn(duration: 0.20), value: companionManager.voiceState)
+                .animation(.easeOut(duration: 0.12), value: companionManager.isVoiceToTextModeActive)
+                .animation(.easeOut(duration: 0.12), value: companionManager.isTypingModeActive)
+                .animation(.easeOut(duration: 0.12), value: companionManager.isBurstModeActive)
+                .animation(.easeOut(duration: 0.12), value: companionManager.isCaptureToInboxModeActive)
+
+            // v15g: top-edge line — full-screen-width horizontal line.
+            // Universal indicator across all voice states — color from
+            // currentCursorTint (mode-aware), thickness pulses with audio
+            // during listening, faster pulse during processing.
+            EdgeLineIndicator(
+                orientation: .bottom,
+                tint: indicatorTint,
+                mode: lineModeForVoiceState,
+                audioPowerLevel: companionManager.currentAudioPowerLevel
+            )
+                .opacity(
+                    cursorIndicatorStyle == "bottomEdgeLine" && buddyIsVisibleOnThisScreen
+                        ? cursorOpacity : 0
+                )
+                .animation(.easeIn(duration: 0.20), value: companionManager.voiceState)
+                .animation(.easeOut(duration: 0.20), value: companionManager.isVoiceToTextModeActive)
+                .animation(.easeOut(duration: 0.20), value: companionManager.isTypingModeActive)
+                .animation(.easeOut(duration: 0.20), value: companionManager.isBurstModeActive)
+                .animation(.easeOut(duration: 0.20), value: companionManager.isCaptureToInboxModeActive)
+
+            // v15g: side strip — full-screen-height vertical strip on the
+            // right edge. Same universal-indicator pattern as top-edge.
+            EdgeLineIndicator(
+                orientation: .right,
+                tint: indicatorTint,
+                mode: lineModeForVoiceState,
+                audioPowerLevel: companionManager.currentAudioPowerLevel
+            )
+                .opacity(
+                    cursorIndicatorStyle == "sideStrip" && buddyIsVisibleOnThisScreen
+                        ? cursorOpacity : 0
+                )
+                .animation(.easeIn(duration: 0.20), value: companionManager.voiceState)
+                .animation(.easeOut(duration: 0.20), value: companionManager.isVoiceToTextModeActive)
+                .animation(.easeOut(duration: 0.20), value: companionManager.isTypingModeActive)
+                .animation(.easeOut(duration: 0.20), value: companionManager.isBurstModeActive)
+                .animation(.easeOut(duration: 0.20), value: companionManager.isCaptureToInboxModeActive)
 
             // Waveform — replaces the triangle while listening.
             // Tint encodes the current capture mode:
@@ -457,7 +583,15 @@ struct BlueCursorView: View {
                 tint: currentCursorTint,
                 captureTrigger: companionManager.lastScreenshotCaptureAt
             )
-                .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .listening ? cursorOpacity : 0)
+                // v15g: hide waveform when any self-contained indicator
+                // style is selected (cursorDot, bottomEdgeLine, sideStrip).
+                // Each handles its own listening visual.
+                .opacity(
+                    buddyIsVisibleOnThisScreen
+                        && companionManager.voiceState == .listening
+                        && !selfContainedStyleActive
+                        ? cursorOpacity : 0
+                )
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
@@ -473,7 +607,14 @@ struct BlueCursorView: View {
             BlueCursorSpinnerView(
                 tint: currentCursorTint
             )
-                .opacity(buddyIsVisibleOnThisScreen && companionManager.voiceState == .processing ? cursorOpacity : 0)
+                // v15g: hide spinner when any self-contained indicator
+                // style is selected. Each handles its own processing visual.
+                .opacity(
+                    buddyIsVisibleOnThisScreen
+                        && companionManager.voiceState == .processing
+                        && !selfContainedStyleActive
+                        ? cursorOpacity : 0
+                )
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
@@ -529,6 +670,14 @@ struct BlueCursorView: View {
             timer?.invalidate()
             navigationAnimationTimer?.invalidate()
             companionManager.tearDownOnboardingVideo()
+        }
+        // v15i: capture the active mode tint while in .listening so the
+        // indicator can keep showing that color through .processing
+        // (when the underlying mode flag has reset to false).
+        .onChange(of: companionManager.voiceState) { newState in
+            if newState == .listening && currentCursorTint != DS.Colors.overlayCursorBlue {
+                rememberedActiveModeTint = currentCursorTint
+            }
         }
         .onChange(of: companionManager.detectedElementScreenLocation) { newLocation in
             // When a UI element location is detected, navigate the buddy to
@@ -916,6 +1065,323 @@ private struct CursorPresenceGlow: View {
             .frame(width: diameter, height: diameter)
             .blur(radius: blurRadius)
             .allowsHitTesting(false)
+    }
+}
+
+/// v15 (2026-05-01): tiny pulsing dot near the cursor. Universal indicator
+/// when cursorIndicatorStyle == "cursorDot" — replaces the waveform during
+/// listening (dot scales with audio level) and the spinner during
+/// processing (dot inside a slowly-spinning ring).
+///
+/// State mapping:
+///   .idle / .responding → gentle ambient pulse
+///   .listening → audio-reactive scale + brighter opacity
+///   .processing → static dot inside a spinning dashed ring
+///
+/// Tint comes from currentCursorTint upstream — automatically picks up
+/// the active mode color (purple for VTT, green for typing, cyan for
+/// polish, yellow for capture-to-inbox, blue for base PTT).
+private struct CursorPresenceDot: View {
+    enum DotMode {
+        case idle
+        case listening
+        case processing
+    }
+
+    var tint: Color = DS.Colors.overlayCursorBlue
+    var mode: DotMode = .idle
+    /// 0.0–1.0 audio level. Only used in .listening mode.
+    var audioPowerLevel: CGFloat = 0
+
+    private let idleDiameter: CGFloat = 7
+    private let baseDiameter: CGFloat = 6
+    // v15h: listening max bumped 16 → 26 for more dramatic audio feedback
+    private let listeningMaxDiameter: CGFloat = 26
+
+    @State private var processingSpin: Double = 0
+
+    var body: some View {
+        ZStack {
+            // Spinning dashed ring around dot during processing
+            Circle()
+                .stroke(tint, style: StrokeStyle(lineWidth: 1.2, dash: [3, 2.5]))
+                .frame(width: 18, height: 18)
+                .opacity(mode == .processing ? 0.7 : 0)
+                .rotationEffect(.degrees(processingSpin))
+
+            // Main dot
+            Circle()
+                .fill(tint)
+                .frame(width: dotDiameter, height: dotDiameter)
+                .opacity(dotOpacity)
+                .shadow(color: tint.opacity(0.6), radius: 2)
+        }
+        .allowsHitTesting(false)
+        .onAppear {
+            // v15h: idle is now SOLID (no pulse). Spin animation only used
+            // when in .processing state but kept always-on so transitioning
+            // into processing has the ring already moving smoothly.
+            withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
+                processingSpin = 360
+            }
+        }
+        .animation(.spring(response: 0.18, dampingFraction: 0.65), value: dotDiameter)
+        .animation(.easeInOut(duration: 0.2), value: mode)
+    }
+
+    private var dotDiameter: CGFloat {
+        switch mode {
+        case .idle:
+            return idleDiameter
+        case .listening:
+            // Audio-reactive scaling. Power level is clamped 0..1 and
+            // raised to 0.7 to give visual response at lower mic levels
+            // (linear scaling makes quiet speech look invisible).
+            let level = max(0, min(1, audioPowerLevel))
+            let eased = pow(level, 0.7)
+            return baseDiameter + (listeningMaxDiameter - baseDiameter) * eased
+        case .processing:
+            return baseDiameter + 1
+        }
+    }
+
+    private var dotOpacity: Double {
+        switch mode {
+        case .idle:
+            // v15h: solid in idle (no pulse). Steph's call — pulsing is
+            // reserved for actual feedback (listening, processing).
+            return 0.85
+        case .listening:
+            let level = Double(max(0, min(1, audioPowerLevel)))
+            return 0.65 + level * 0.35
+        case .processing:
+            return 0.85
+        }
+    }
+}
+
+/// v15: full-screen-edge indicator. Spans the full length of one screen
+/// edge. Used by both the top-edge line (orientation: .bottom, horizontal,
+/// full screen width) and the side-strip indicator (orientation: .right,
+/// vertical, full screen height).
+///
+/// v15g: edge-line is now a UNIVERSAL indicator across all states like
+/// the cursor dot. Replaces the waveform during listening (line thickens
+/// + brightens with audio level) and the spinner during processing (line
+/// pulses faster, like a heartbeat). Tint comes from currentCursorTint
+/// upstream so color matches the active mode.
+private struct EdgeLineIndicator: View {
+    enum Orientation {
+        // v15j (2026-05-01): renamed .top → .bottom because Steph's eyes
+        // are at the bottom of the screen (text inputs live there). The
+        // line renders at the bottom edge; the halo blooms upward.
+        case bottom
+        case right
+    }
+    enum LineMode {
+        case idle
+        case listening
+        case processing
+    }
+
+    let orientation: Orientation
+    var tint: Color = DS.Colors.overlayCursorBlue
+    var mode: LineMode = .idle
+    /// 0.0–1.0 audio level. Only used in .listening mode.
+    var audioPowerLevel: CGFloat = 0
+
+    private let processingPulseDuration: Double = 0.65
+
+    // v15h: idle is SOLID (no pulse). One fixed opacity per state.
+    private let idleOpacity: Double = 0.85
+    private let processingMinOpacity: Double = 0.55
+    private let processingMaxOpacity: Double = 1.0
+
+    // v15i: line is now a TWO-LAYER glow:
+    //   - inner solid core (constant thickness, always visible)
+    //   - outer gradient halo (expands inward with audio level, fades
+    //     to transparent at the far edge — like Claude's listening UI)
+    //
+    // Idle: just the core (no halo).
+    // Listening: core stays consistent + halo extends with audio level.
+    // Processing: core does the heartbeat pulse; no halo.
+    private let topCoreThickness: CGFloat = 3
+    private let sideCoreThickness: CGFloat = 3
+    private let haloMaxExtension: CGFloat = 80   // inward extension at peak audio
+    private let haloPeakOpacity: Double = 0.55   // alpha at the line edge of the halo
+
+    @State private var processingPulse: Bool = false
+
+    var body: some View {
+        ZStack(alignment: orientation == .bottom ? .bottom : .trailing) {
+            Color.clear
+
+            // v15l: LOADING SHIMMER — only visible during processing.
+            // A brighter highlight slides along the line continuously,
+            // giving an obvious "loading is happening" cue distinct from
+            // both idle (static) and listening (audio-reactive halo).
+            if mode == .processing {
+                LineLoadingShimmer(orientation: orientation, tint: tint)
+            }
+
+            // OUTER HALO — listening only. Linear gradient from full
+            // tint at the line edge to transparent at the far end.
+            // Extends inward (top → downward, right → leftward).
+            Rectangle()
+                .fill(haloGradient)
+                .frame(
+                    width: orientation == .right ? haloExtension : nil,
+                    height: orientation == .bottom ? haloExtension : nil
+                )
+                .frame(
+                    maxWidth: orientation == .bottom ? .infinity : haloExtension,
+                    maxHeight: orientation == .right ? .infinity : haloExtension
+                )
+                .opacity(haloOpacity)
+                .allowsHitTesting(false)
+
+            // INNER SOLID CORE — always present in self-contained mode.
+            // Idle = static, listening = same constant thickness (the
+            // halo provides the audio-reactive feedback), processing =
+            // heartbeat opacity pulse on the core itself.
+            Rectangle()
+                .fill(tint)
+                .frame(
+                    width: orientation == .right ? sideCoreThickness : nil,
+                    height: orientation == .bottom ? topCoreThickness : nil
+                )
+                .frame(
+                    maxWidth: orientation == .bottom ? .infinity : sideCoreThickness,
+                    maxHeight: orientation == .right ? .infinity : topCoreThickness
+                )
+                .opacity(coreOpacity)
+        }
+        .allowsHitTesting(false)
+        .animation(.easeInOut(duration: 0.18), value: mode)
+        .animation(.spring(response: 0.18, dampingFraction: 0.7), value: audioPowerLevel)
+        .onAppear {
+            // v15h: idle is solid — only kick off the processing-state
+            // animation. (Idle no longer pulses per Steph's call.)
+            withAnimation(
+                .easeInOut(duration: processingPulseDuration).repeatForever(autoreverses: true)
+            ) {
+                processingPulse = true
+            }
+        }
+    }
+
+    /// Halo gradient — full tint at the line edge, transparent at the
+    /// far end. Direction depends on orientation.
+    private var haloGradient: LinearGradient {
+        let stops: [Gradient.Stop] = [
+            .init(color: tint.opacity(haloPeakOpacity), location: 0.0),
+            .init(color: tint.opacity(0), location: 1.0)
+        ]
+        switch orientation {
+        case .bottom:
+            // Halo blooms UPWARD from the bottom edge — full color at
+            // the bottom (where the solid core lives), fading to
+            // transparent at the top of the halo region.
+            return LinearGradient(stops: stops, startPoint: .bottom, endPoint: .top)
+        case .right:
+            return LinearGradient(stops: stops, startPoint: .trailing, endPoint: .leading)
+        }
+    }
+
+    /// How far the halo extends inward. Zero in idle/processing,
+    /// scales 0..haloMaxExtension with audio level during listening.
+    private var haloExtension: CGFloat {
+        switch mode {
+        case .idle, .processing:
+            return 0
+        case .listening:
+            let level = max(0, min(1, audioPowerLevel))
+            // Use a slightly less aggressive easing than core thickness
+            // — the halo should grow visibly even at moderate audio levels
+            let eased = pow(level, 0.55)
+            return haloMaxExtension * eased
+        }
+    }
+
+    /// Halo opacity multiplier — 0 in idle/processing, audio-reactive
+    /// during listening (so the halo fades in/out smoothly with voice).
+    private var haloOpacity: Double {
+        switch mode {
+        case .idle, .processing:
+            return 0
+        case .listening:
+            let level = Double(max(0, min(1, audioPowerLevel)))
+            return 0.4 + level * 0.6
+        }
+    }
+
+    /// Inner core opacity — constant in idle/listening, heartbeat in processing.
+    private var coreOpacity: Double {
+        switch mode {
+        case .idle, .listening:
+            return idleOpacity
+        case .processing:
+            return processingPulse ? processingMaxOpacity : processingMinOpacity
+        }
+    }
+}
+
+/// v15l: a brighter "highlight" segment that slides along an edge-line
+/// indicator during processing. Provides the obvious "loading is
+/// happening" visual that the prior heartbeat opacity pulse lacked.
+/// The shimmer is short relative to the full line and moves left→right
+/// (bottom edge) or top→bottom (right edge) on a continuous loop.
+private struct LineLoadingShimmer: View {
+    let orientation: EdgeLineIndicator.Orientation
+    let tint: Color
+
+    /// What fraction of the line length the shimmer spans.
+    private let shimmerLengthFraction: CGFloat = 0.28
+    /// How long one full traversal takes. Faster = more urgent feeling.
+    private let cycleDuration: Double = 1.4
+    /// Shimmer thickness — slightly thicker than the core line so it
+    /// reads as a brighter "puck" overlay rather than a same-thickness
+    /// segment that just travels.
+    private let shimmerThickness: CGFloat = 5
+
+    @State private var phase: CGFloat = -0.3
+
+    var body: some View {
+        GeometryReader { geo in
+            let length = orientation == .bottom ? geo.size.width : geo.size.height
+            let shimmerLength = max(60, length * shimmerLengthFraction)
+
+            Rectangle()
+                .fill(LinearGradient(
+                    colors: [
+                        tint.opacity(0),
+                        tint.opacity(1.0),
+                        tint.opacity(0)
+                    ],
+                    startPoint: orientation == .bottom ? .leading : .top,
+                    endPoint: orientation == .bottom ? .trailing : .bottom
+                ))
+                .frame(
+                    width: orientation == .bottom ? shimmerLength : shimmerThickness,
+                    height: orientation == .bottom ? shimmerThickness : shimmerLength
+                )
+                .offset(
+                    x: orientation == .bottom ? phase * length : 0,
+                    y: orientation == .right ? phase * length : 0
+                )
+        }
+        .frame(
+            maxWidth: orientation == .bottom ? .infinity : shimmerThickness,
+            maxHeight: orientation == .right ? .infinity : shimmerThickness
+        )
+        .allowsHitTesting(false)
+        .onAppear {
+            withAnimation(.linear(duration: cycleDuration).repeatForever(autoreverses: false)) {
+                // Start off-screen to the leading edge, end off-screen at
+                // the trailing edge — gives a clean continuous traverse.
+                phase = 1.0
+            }
+        }
     }
 }
 
