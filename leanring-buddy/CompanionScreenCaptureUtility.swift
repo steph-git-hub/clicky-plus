@@ -129,4 +129,113 @@ enum CompanionScreenCaptureUtility {
 
         return capturedScreens
     }
+
+    /// v15p2 (2026-05-02): Capture ONLY the active screen — the one
+    /// containing the window with keyboard focus. Used by Realtime
+    /// conversation mode to send a single per-press screenshot.
+    ///
+    /// Active screen detection priority:
+    ///   1. NSScreen.main — the screen of the focused window (what
+    ///      Apple semantically calls "main"). This is what users mean
+    ///      by "active screen" — the one their focused app is on.
+    ///   2. Cursor screen — if NSScreen.main is nil (rare), fall back
+    ///      to whichever screen contains the mouse cursor.
+    ///   3. NSScreen.screens.first — last-ditch fallback (primary
+    ///      with menu bar).
+    static func captureActiveScreenAsJPEG() async throws -> CompanionScreenCapture {
+        let content = try await SCShareableContent.excludingDesktopWindows(
+            false, onScreenWindowsOnly: true
+        )
+
+        guard !content.displays.isEmpty else {
+            throw NSError(
+                domain: "CompanionScreenCapture",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "No display available for capture"]
+            )
+        }
+
+        // Determine the target screen via NSScreen.main (focused-window
+        // screen). Falls back to cursor screen, then primary.
+        let mouseLocation = NSEvent.mouseLocation
+        let targetNSScreen: NSScreen = {
+            if let main = NSScreen.main {
+                return main
+            }
+            if let cursorScreen = NSScreen.screens.first(where: { $0.frame.contains(mouseLocation) }) {
+                return cursorScreen
+            }
+            return NSScreen.screens.first ?? NSScreen.screens[0]
+        }()
+
+        guard let targetDisplayID = targetNSScreen
+            .deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID else {
+            throw NSError(
+                domain: "CompanionScreenCapture",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "Could not determine display ID for active screen"]
+            )
+        }
+
+        guard let targetDisplay = content.displays.first(where: { $0.displayID == targetDisplayID }) else {
+            throw NSError(
+                domain: "CompanionScreenCapture",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "Active screen not found in shareable content"]
+            )
+        }
+
+        // Exclude Clicky's own windows so the AI sees only Steph's content.
+        let ownBundleIdentifier = Bundle.main.bundleIdentifier
+        let ownAppWindows = content.windows.filter { window in
+            window.owningApplication?.bundleIdentifier == ownBundleIdentifier
+        }
+
+        let displayFrame = targetNSScreen.frame
+        let isCursorScreen = displayFrame.contains(mouseLocation)
+
+        let filter = SCContentFilter(display: targetDisplay, excludingWindows: ownAppWindows)
+
+        let configuration = SCStreamConfiguration()
+        let maxDimension = 1280
+        let aspectRatio = CGFloat(targetDisplay.width) / CGFloat(targetDisplay.height)
+        if targetDisplay.width >= targetDisplay.height {
+            configuration.width = maxDimension
+            configuration.height = Int(CGFloat(maxDimension) / aspectRatio)
+        } else {
+            configuration.height = maxDimension
+            configuration.width = Int(CGFloat(maxDimension) * aspectRatio)
+        }
+
+        let cgImage = try await SCScreenshotManager.captureImage(
+            contentFilter: filter,
+            configuration: configuration
+        )
+
+        guard let jpegData = NSBitmapImageRep(cgImage: cgImage)
+                .representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else {
+            throw NSError(
+                domain: "CompanionScreenCapture",
+                code: -5,
+                userInfo: [NSLocalizedDescriptionKey: "Failed to encode JPEG"]
+            )
+        }
+
+        // Build a label with enough info to debug screen-selection issues.
+        // Format: "active screen — <displayID> — <WxH> @ origin (X,Y)"
+        let label = "active screen (focused-window display \(targetDisplayID), " +
+                    "\(Int(displayFrame.width))×\(Int(displayFrame.height)) @ " +
+                    "(\(Int(displayFrame.origin.x)),\(Int(displayFrame.origin.y))))"
+
+        return CompanionScreenCapture(
+            imageData: jpegData,
+            label: label,
+            isCursorScreen: isCursorScreen,
+            displayWidthInPoints: Int(displayFrame.width),
+            displayHeightInPoints: Int(displayFrame.height),
+            displayFrame: displayFrame,
+            screenshotWidthInPixels: configuration.width,
+            screenshotHeightInPixels: configuration.height
+        )
+    }
 }

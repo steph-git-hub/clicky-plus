@@ -173,9 +173,11 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
 
         if alreadyActive {
             // Warm session resumption: cancel pending auto-close,
-            // clear any stale server-side audio buffer, keep going.
+            // clear any stale server-side audio buffer, send a fresh
+            // screenshot for this turn, keep going.
             cancelWarmSessionAutoClose()
             sendJSON(["type": "input_audio_buffer.clear"])
+            captureAndSendActiveScreenshot()
             Self.appendDiag("startSession on warm session — continuing")
             return
         }
@@ -191,6 +193,11 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                 let token = try await self.fetchEphemeralToken()
                 try await self.openWebSocket(token: token)
                 try self.startAudioCapture()
+                // v15p2 P3: capture + send active-screen screenshot
+                // before audio chunks land at the server. Fire-and-
+                // forget — Realtime processes events in order so the
+                // image arrives ahead of the eventual audio commit.
+                self.captureAndSendActiveScreenshot()
                 await MainActor.run {
                     self.state = .listening
                 }
@@ -579,6 +586,64 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         }
         sendJSON(["type": "input_audio_buffer.commit"])
         sendJSON(["type": "response.create"])
+    }
+
+    // MARK: - Vision (active screen capture per press)
+    //
+    // v15p2 P3 (2026-05-02): per-press screenshot of the cursor's active
+    // screen, sent as a conversation.item.create with an input_image
+    // content block before the audio commit fires. The model gets fresh
+    // visual context every turn so it can answer "what's on my screen"
+    // questions truthfully instead of hallucinating.
+    //
+    // Reuses CompanionScreenCaptureUtility.captureAllScreensAsJPEG —
+    // that utility already excludes Clicky's own windows and sorts so
+    // the cursor screen is at index 0. We just take that one.
+
+    /// Fire-and-forget screenshot capture + send. Safe to call from any
+    /// thread; the actual capture work runs on MainActor (the underlying
+    /// utility is @MainActor-isolated).
+    ///
+    /// v15p2 (2026-05-02): switched from `captureAllScreensAsJPEG` →
+    /// `captureActiveScreenAsJPEG`. The all-screens helper sorted by
+    /// cursor position then took index 0, but on multi-monitor setups
+    /// the cursor-containment check could fail and fall back to the
+    /// original SCShareableContent order — leading to "always picks
+    /// secondary monitor" behavior. The active-screen helper uses
+    /// `NSScreen.main` (the focused-window screen), which is exactly
+    /// what users mean by "active screen."
+    private func captureAndSendActiveScreenshot() {
+        Task { @MainActor in
+            do {
+                let active = try await CompanionScreenCaptureUtility.captureActiveScreenAsJPEG()
+                let base64 = active.imageData.base64EncodedString()
+                let payload: [String: Any] = [
+                    "type": "conversation.item.create",
+                    "item": [
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            [
+                                "type": "input_text",
+                                "text": "[\(active.label) — visible to you for this turn]",
+                            ],
+                            [
+                                "type": "input_image",
+                                "image_url": "data:image/jpeg;base64,\(base64)",
+                            ],
+                        ],
+                    ],
+                ]
+                self.sendJSON(payload)
+                Self.appendDiag(
+                    "vision: sent screenshot — \(active.imageData.count) bytes, " +
+                    "\(active.screenshotWidthInPixels)x\(active.screenshotHeightInPixels) px, " +
+                    "label=\"\(active.label)\""
+                )
+            } catch {
+                Self.appendDiag("vision: capture failed — \(error.localizedDescription)")
+            }
+        }
     }
 
     // MARK: - Audio playback (server → speakers)

@@ -2344,6 +2344,15 @@ final class CompanionManager: ObservableObject {
             disengageVoiceModeToggle()
         }
 
+        // v15p2 (2026-05-02): Realtime emergency stop. If Marin is
+        // mid-response, send response.cancel + drain playback so she
+        // shuts up immediately. Then end the session so the user can
+        // re-engage cleanly with Fn+Opt for a fresh turn.
+        if let realtimeManager, realtimeManager.state.isActive {
+            realtimeManager.cancelCurrentResponse()
+            realtimeManager.endSession()
+        }
+
         // Force voiceState to idle if it's in any active state. The orb
         // will fade out and the overlay will hide on its normal schedule.
         if voiceState != .idle {
