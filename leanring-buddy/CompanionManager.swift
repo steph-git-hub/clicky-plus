@@ -47,6 +47,9 @@ enum ClickyInteractionMode: String, Codable {
     case polish = "polish"
     case burst = "burst"
     case captureInbox = "capture_inbox"
+    /// v15p2 (2026-05-02): OpenAI Realtime conversation. One log entry
+    /// per turn (user utterance + Marin's response).
+    case realtime = "realtime"
 
     var displayLabel: String {
         switch self {
@@ -57,6 +60,7 @@ enum ClickyInteractionMode: String, Codable {
         case .polish: return "Polish"
         case .burst: return "Burst"
         case .captureInbox: return "Capture-to-inbox"
+        case .realtime: return "Realtime (Marin)"
         }
     }
 }
@@ -563,7 +567,14 @@ final class CompanionManager: ObservableObject {
     private var typingTransitionCancellable: AnyCancellable?
     private var voiceToTextTransitionCancellable: AnyCancellable?
     private var captureToInboxTransitionCancellable: AnyCancellable?
+    private var realtimeTransitionCancellable: AnyCancellable?
     private var polishHotkeyTransitionCancellable: AnyCancellable?
+
+    /// Realtime conversation manager (v15p2, OpenAI Realtime API).
+    /// Lazily created on first hotkey press so its setup cost doesn't
+    /// hit app boot.
+    private var realtimeManager: RealtimeConversationManager?
+    private var realtimeManagerStateCancellable: AnyCancellable?
     /// Subscriptions for double-tap engage / single-tap disengage toggles
     /// (v11f + v11g): Ctrl/Cmd alone double-tap LOCKS VTT/typing on,
     /// single-tap or Esc UNLOCKS. Held continuously while CompanionManager lives.
@@ -725,6 +736,10 @@ final class CompanionManager: ObservableObject {
     /// no Claude, no TTS, no focused-field interaction. Fully isolated
     /// from every other mode.
     @Published private(set) var isCaptureToInboxModeActive: Bool = false
+    /// True while a Realtime conversation session is active (Fn+Opt held
+    /// or warm session window). Drives the magenta cursor indicator.
+    /// v15p2 (2026-05-02).
+    @Published private(set) var isRealtimeModeActive: Bool = false
     /// Transcript of the most recent capture-to-inbox append. Drives the
     /// yellow confirmation toast in the overlay. Nil when no toast is
     /// showing; set to the last transcript at write time; cleared ~3s
@@ -1245,6 +1260,14 @@ final class CompanionManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] transition in
                 self?.handleCaptureToInboxTransition(transition)
+            }
+
+        // v15p2 (2026-05-02): Realtime conversation hotkey (Fn + Opt).
+        realtimeTransitionCancellable = globalPushToTalkShortcutMonitor
+            .realtimeTransitionPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] transition in
+                self?.handleRealtimeTransition(transition)
             }
 
         polishHotkeyTransitionCancellable = globalPushToTalkShortcutMonitor
@@ -2527,6 +2550,65 @@ final class CompanionManager: ObservableObject {
     /// it easily and intentional holds blow past it without thinking,
     /// so the user never has to reason about "did I hold long enough."
     private static let polishHotkeyHoldThresholdSeconds: TimeInterval = 0.3
+
+    // MARK: - Realtime conversation handler (v15p2, 2026-05-02)
+    //
+    // Press Fn+Opt → start (or resume warm) OpenAI Realtime session.
+    // Release Fn+Opt → commit pending audio, request response, schedule
+    // 2-minute auto-close.
+
+    private func handleRealtimeTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
+        switch transition {
+        case .pressed:
+            guard !buddyDictationManager.isDictationInProgress else { return }
+            guard !showOnboardingVideo else { return }
+
+            // Cancel any in-flight Claude/TTS so Realtime doesn't fight
+            // for the audio device.
+            currentResponseTask?.cancel()
+            ttsClient.stopPlayback()
+
+            // Bring overlay forward so the magenta indicator confirms
+            // engagement immediately.
+            transientHideTask?.cancel()
+            transientHideTask = nil
+            if !isClickyCursorEnabled && !isOverlayVisible {
+                overlayWindowManager.hasShownOverlayBefore = true
+                overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+                isOverlayVisible = true
+            }
+
+            // Flip flag so cursor goes magenta.
+            isRealtimeModeActive = true
+
+            // Lazily create the manager + bind state observation on
+            // first use.
+            if realtimeManager == nil {
+                realtimeManager = RealtimeConversationManager()
+                bindRealtimeManagerState()
+            }
+            realtimeManager?.startSession()
+
+        case .released:
+            realtimeManager?.handleHotkeyRelease()
+
+        case .none:
+            break
+        }
+    }
+
+    private func bindRealtimeManagerState() {
+        guard let manager = realtimeManager else { return }
+        realtimeManagerStateCancellable = manager.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                guard let self else { return }
+                self.isRealtimeModeActive = state.isActive
+                if !state.isActive {
+                    self.scheduleTransientHideIfNeeded()
+                }
+            }
+    }
 
     private func handlePolishHotkeyTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {

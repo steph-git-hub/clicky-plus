@@ -369,20 +369,20 @@ enum BuddyPushToTalkShortcut {
         return .none
     }
 
-    // MARK: - Capture-to-Inbox (Fn + Opt)
+    // MARK: - Capture-to-Inbox (Fn + Shift)
     //
-    // Holds Fn+Opt alone → writes the transcript straight to
+    // v15p2 (2026-05-02): MOVED from Fn+Opt → Fn+Shift to free up Fn+Opt
+    // for the new Realtime mode. Fn+Shift was previously empty.
+    //
+    // Holds Fn+Shift alone → writes the transcript straight to
     // Inbox/Idea Inbox.md with a datestamp + [?] tag. Must be
     // mutually exclusive with every other shortcut:
-    //   - Normal PTT (ctrl+opt)        → excluded by `.function` required
-    //   - Voice-to-text (fn+shift)     → excluded by `.shift` forbidden
-    //   - Burst (fn+ctrl+opt)          → excluded by `.control` forbidden
+    //   - VTT (fn+ctrl)                → excluded by `.control` forbidden
+    //   - Burst (fn+shift+opt)         → excluded by `.option` forbidden
     //   - Typing (cmd+fn)              → excluded by `.command` forbidden
-    //
-    // So capture-to-inbox fires only when Fn+Opt are held together
-    // WITHOUT shift, command, or control.
+    //   - Realtime (fn+opt)            → excluded by `.option` forbidden
 
-    static let captureToInboxModifierFlags: NSEvent.ModifierFlags = [.option, .function]
+    static let captureToInboxModifierFlags: NSEvent.ModifierFlags = [.shift, .function]
 
     static func captureToInboxTransition(
         eventType: CGEventType,
@@ -403,7 +403,10 @@ enum BuddyPushToTalkShortcut {
         wasCaptureToInboxPreviouslyPressed: Bool
     ) -> ShortcutTransition {
         let hasRequired = modifierFlags.isSuperset(of: captureToInboxModifierFlags)
-        let hasForbidden = modifierFlags.contains(.shift)
+        // v15p2: Fn+Shift is required; .option/.command/.control are
+        // forbidden so we don't double-fire with Realtime (fn+opt),
+        // burst (fn+shift+opt), typing (cmd+fn), or VTT (fn+ctrl).
+        let hasForbidden = modifierFlags.contains(.option)
             || modifierFlags.contains(.command)
             || modifierFlags.contains(.control)
         let isCaptureToInboxCurrentlyPressed = hasRequired && !hasForbidden
@@ -412,6 +415,54 @@ enum BuddyPushToTalkShortcut {
             return .pressed
         }
         if !isCaptureToInboxCurrentlyPressed && wasCaptureToInboxPreviouslyPressed {
+            return .released
+        }
+        return .none
+    }
+
+    // MARK: - Realtime conversation (Fn + Opt)
+    //
+    // v15p2 (2026-05-02): NEW (re-added after v15p revert). Holds Fn+Opt
+    // alone → opens an OpenAI Realtime API WebSocket session for live
+    // speech-to-speech conversation. Additive — Base PTT (Ctrl-tap) and
+    // every other mode are unchanged.
+    //
+    // Mutually exclusive with every other shortcut:
+    //   - VTT (fn+ctrl)                → excluded by `.control` forbidden
+    //   - Capture-to-inbox (fn+shift)  → excluded by `.shift` forbidden
+    //   - Burst (fn+shift+opt)         → excluded by `.shift` forbidden
+    //   - Typing (cmd+fn)              → excluded by `.command` forbidden
+
+    static let realtimeModifierFlags: NSEvent.ModifierFlags = [.option, .function]
+
+    static func realtimeTransition(
+        eventType: CGEventType,
+        modifierFlagsRawValue: UInt64,
+        wasRealtimePreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        guard eventType == .flagsChanged else { return .none }
+        let flags = NSEvent.ModifierFlags(rawValue: UInt(modifierFlagsRawValue))
+            .intersection(.deviceIndependentFlagsMask)
+        return realtimeTransition(
+            modifierFlags: flags,
+            wasRealtimePreviouslyPressed: wasRealtimePreviouslyPressed
+        )
+    }
+
+    private static func realtimeTransition(
+        modifierFlags: NSEvent.ModifierFlags,
+        wasRealtimePreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        let hasRequired = modifierFlags.isSuperset(of: realtimeModifierFlags)
+        let hasForbidden = modifierFlags.contains(.shift)
+            || modifierFlags.contains(.command)
+            || modifierFlags.contains(.control)
+        let isRealtimeCurrentlyPressed = hasRequired && !hasForbidden
+
+        if isRealtimeCurrentlyPressed && !wasRealtimePreviouslyPressed {
+            return .pressed
+        }
+        if !isRealtimeCurrentlyPressed && wasRealtimePreviouslyPressed {
             return .released
         }
         return .none

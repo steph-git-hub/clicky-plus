@@ -277,6 +277,12 @@ struct BlueCursorView: View {
             || companionManager.isPolishHotkeyModifierCaptureModeActive {
             return DS.Colors.overlayCursorCyan
         }
+        // v15p2 (2026-05-02): Realtime mode (Fn+Opt) → magenta.
+        // Checked first because Realtime owns the audio device while
+        // active and cannot be co-active with anything else.
+        if companionManager.isRealtimeModeActive {
+            return DS.Colors.overlayCursorMagenta
+        }
         if companionManager.isCaptureToInboxModeActive {
             return DS.Colors.overlayCursorYellow
         }

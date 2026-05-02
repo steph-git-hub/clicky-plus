@@ -183,6 +183,13 @@ enum DS {
         /// orb rather than a sustained per-mode tint.
         static let overlayCursorCyan = Color(hex: "#22D3EE")
 
+        /// Realtime conversation mode (Fn+Opt, OpenAI Realtime + Marin).
+        /// v15p2 (2026-05-02): magenta — distinct from blue (PTT),
+        /// purple (VTT), green (typing), yellow (capture), red (burst),
+        /// cyan (polish flash). When held, the cursor indicator pulses
+        /// magenta to confirm Marin is listening.
+        static let overlayCursorMagenta = Color(hex: "#FF3FB5")
+
         // ── Floating Button Gradient ─────────────────────────────────
 
         /// The floating session button gradient colors (unchanged from original —

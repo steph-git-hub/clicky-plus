@@ -28,6 +28,10 @@ interface Env {
   ASSEMBLYAI_API_KEY: string;
   XAI_API_KEY: string;
   XAI_VOICE_ID: string;
+  /// OpenAI Realtime API key. Used to mint ephemeral session tokens.
+  /// The real key never leaves the Worker. Stored via
+  /// `npx wrangler secret put OPENAI_API_KEY`.
+  OPENAI_API_KEY: string;
 }
 
 export default {
@@ -61,6 +65,10 @@ export default {
 
       if (url.pathname === "/repunctuate") {
         return await handleRepunctuate(request, env);
+      }
+
+      if (url.pathname === "/realtime-session") {
+        return await handleRealtimeSession(request, env);
       }
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
@@ -182,6 +190,110 @@ async function handleTranscribeToken(env: Env): Promise<Response> {
   if (!response.ok) {
     const errorBody = await response.text();
     console.error(`[/transcribe-token] AssemblyAI token error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, {
+      status: response.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const data = await response.text();
+  return new Response(data, {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * /realtime-session — mints an ephemeral OpenAI Realtime session token.
+ *
+ * Pattern mirrors /transcribe-token (AssemblyAI): the real OPENAI_API_KEY
+ * lives only as a Worker secret. The Mac app calls this route, gets back
+ * a short-lived ephemeral token (~1 min TTL) plus session config, then
+ * opens a WebSocket directly to wss://api.openai.com/v1/realtime using
+ * that token. The real key never leaves Cloudflare.
+ *
+ * Defaults baked in (callers can override via request body):
+ *   - model: "gpt-realtime"
+ *   - voice: "marin"
+ *   - turn_detection: null (manual mode — Mac app uses true push-to-talk
+ *     semantics; client decides when the user's turn ends, server only
+ *     responds on explicit `response.create`)
+ *   - input/output: PCM16 24kHz mono
+ *   - input_audio_transcription: whisper-1 (so we can see what server
+ *     actually heard, surface it in the Obsidian transcript log)
+ *   - instructions: minimal "stay in English, don't hallucinate" persona
+ *
+ * v15p2 (2026-05-02): re-added after the v15p revert. Same shape as
+ * v15p but with the lessons-learned baked in (manual turn detection
+ * from the start, language locked, transcription enabled).
+ */
+async function handleRealtimeSession(request: Request, env: Env): Promise<Response> {
+  let overrides: Record<string, unknown> = {};
+  try {
+    const text = await request.text();
+    if (text.trim().length > 0) {
+      overrides = JSON.parse(text) as Record<string, unknown>;
+    }
+  } catch {
+    overrides = {};
+  }
+
+  // Compose instructions string. Optional `personalFacts` override
+  // gets injected as a memory block — same pattern as polish/PTT.
+  const personalFacts = typeof overrides.personalFacts === "string"
+    ? (overrides.personalFacts as string).trim()
+    : "";
+
+  const basePersona = [
+    "You are Clicky, a fast and friendly voice assistant on Steph's Mac.",
+    "ALWAYS respond in English regardless of what you think you heard. Never switch languages.",
+    "If you cannot understand the user's question or hear them clearly, say 'sorry, I didn't catch that' and stop. Do not invent or guess what they said.",
+    "Keep responses tight and conversational — usually 1–2 short sentences unless the question genuinely needs more.",
+    "Never read out asterisks, bullet markers, or formatting characters.",
+    "If asked something you can't do without tools, say so briefly.",
+    "Match Steph's energy: he's direct and casual; mirror that, don't over-formalize.",
+  ].join(" ");
+
+  const composedInstructions = personalFacts.length > 0
+    ? `${basePersona}\n\n[Steph's persistent memory — apply where relevant during conversation]\n\n${personalFacts}`
+    : basePersona;
+
+  const sessionRequest: Record<string, unknown> = {
+    model: overrides.model ?? "gpt-realtime",
+    voice: overrides.voice ?? "marin",
+    modalities: overrides.modalities ?? ["audio", "text"],
+    input_audio_format: overrides.input_audio_format ?? "pcm16",
+    output_audio_format: overrides.output_audio_format ?? "pcm16",
+    // Manual turn detection — Mac app uses true PTT, client commits
+    // explicitly on hotkey release. Server VAD was triggering responses
+    // from background noise and Marin's own voice through the mic in
+    // v15p; null mode eliminates that class of bug entirely.
+    turn_detection: overrides.turn_detection !== undefined
+      ? overrides.turn_detection
+      : null,
+    instructions: overrides.instructions ?? composedInstructions,
+    input_audio_transcription: overrides.input_audio_transcription ?? {
+      model: "whisper-1",
+    },
+  };
+
+  const response = await fetch(
+    "https://api.openai.com/v1/realtime/sessions",
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(sessionRequest),
+    }
+  );
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(
+      `[/realtime-session] OpenAI session error ${response.status}: ${errorBody}`
+    );
     return new Response(errorBody, {
       status: response.status,
       headers: { "content-type": "application/json" },

@@ -29,11 +29,16 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// transcript is pasted directly into the focused field. Kept on
     /// its own publisher so a key event can never toggle multiple modes.
     let voiceToTextTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
-    /// Separate publisher for the capture-to-inbox shortcut (Fn + Opt).
+    /// Separate publisher for the capture-to-inbox shortcut (Fn + Shift, v15p2).
     /// Capture-to-inbox is pure transcription that appends directly to the
     /// user's Obsidian Idea Inbox — no paste, no Claude, no TTS. Kept on
     /// its own publisher for the same independence guarantees as the rest.
     let captureToInboxTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
+    /// Separate publisher for the Realtime conversation shortcut (Fn + Opt, v15p2).
+    /// Holds Fn+Opt → opens an OpenAI Realtime API WebSocket session for live
+    /// speech-to-speech. Audio is streamed bidirectionally rather than
+    /// transcribed-then-acted-on like the other modes.
+    let realtimeTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
     /// Separate publisher for the polish hotkey (⌃⌥⌘ tap). Unlike the
     /// other 5 modes, polish is NOT a hold — subscribers should only
     /// react to `.pressed` transitions and ignore `.released`. Polish
@@ -97,10 +102,10 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// independence guarantees as the other three — a single key event
     /// cannot toggle more than one mode.
     @Published private(set) var isVoiceToTextShortcutCurrentlyPressed = false
-    /// Parallel state for the capture-to-inbox shortcut (Fn + Opt). Same
-    /// independence guarantees — a single key event cannot toggle more
-    /// than one mode.
+    /// Parallel state for the capture-to-inbox shortcut (Fn + Shift, v15p2).
     @Published private(set) var isCaptureToInboxShortcutCurrentlyPressed = false
+    /// Parallel state for the Realtime conversation shortcut (Fn + Opt, v15p2).
+    @Published private(set) var isRealtimeShortcutCurrentlyPressed = false
     /// Parallel state for the polish hotkey (⌃⌥⌘). Tracked the same way
     /// as the other modes so press/release transitions debounce correctly,
     /// even though only `.pressed` is acted upon downstream.
@@ -288,10 +293,11 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             voiceToTextTransitionPublisher.send(.released)
         }
 
-        // Capture-to-inbox shortcut (Fn + Opt) is detected in parallel.
-        // Its transition function forbids .shift/.command/.control, so
-        // it can't double-fire with voice-to-text (fn+shift), burst
-        // (fn+ctrl+opt), typing (cmd+fn), or normal PTT (ctrl+opt).
+        // Capture-to-inbox shortcut (Fn + Shift, v15p2) is detected in
+        // parallel. Its transition function forbids .option/.command/
+        // .control, so it can't double-fire with VTT (fn+ctrl), burst
+        // (fn+shift+opt), typing (cmd+fn), Realtime (fn+opt), or
+        // normal PTT (ctrl+opt).
         let captureToInboxTransition = BuddyPushToTalkShortcut.captureToInboxTransition(
             eventType: eventType,
             modifierFlagsRawValue: event.flags.rawValue,
@@ -307,6 +313,28 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         case .released:
             isCaptureToInboxShortcutCurrentlyPressed = false
             captureToInboxTransitionPublisher.send(.released)
+        }
+
+        // Realtime conversation shortcut (Fn + Opt, v15p2) is detected
+        // in parallel. Its transition function forbids .shift/.command/
+        // .control, so it can't double-fire with VTT (fn+ctrl),
+        // capture-to-inbox (fn+shift), burst (fn+shift+opt), typing
+        // (cmd+fn), or normal PTT (ctrl+opt).
+        let realtimeTransition = BuddyPushToTalkShortcut.realtimeTransition(
+            eventType: eventType,
+            modifierFlagsRawValue: event.flags.rawValue,
+            wasRealtimePreviouslyPressed: isRealtimeShortcutCurrentlyPressed
+        )
+
+        switch realtimeTransition {
+        case .none:
+            break
+        case .pressed:
+            isRealtimeShortcutCurrentlyPressed = true
+            realtimeTransitionPublisher.send(.pressed)
+        case .released:
+            isRealtimeShortcutCurrentlyPressed = false
+            realtimeTransitionPublisher.send(.released)
         }
 
         // Polish hotkey (⌃⌥⌘) is detected in parallel. Its transition
