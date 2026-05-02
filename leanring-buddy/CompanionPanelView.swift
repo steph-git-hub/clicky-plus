@@ -743,11 +743,17 @@ struct CompanionPanelView: View {
             .padding(.bottom, 6)
 
             VStack(alignment: .leading, spacing: 4) {
-                hotkeyRow(keys: ["⌃", "⌥"], label: "Push-to-talk", color: DS.Colors.overlayCursorBlue)
-                hotkeyRow(keys: ["⌘", "fn"], label: "Typing mode", color: DS.Colors.overlayCursorGreen)
+                // v15p2 (2026-05-02): updated for Realtime mode +
+                // hotkey swap. Realtime modes lead the list since
+                // they're the highest-frequency. Magenta = Realtime
+                // (Marin), blue = legacy Base PTT.
+                hotkeyRow(keys: ["⌃", "⌥"], label: "Realtime (Marin)", color: DS.Colors.overlayCursorMagenta)
+                hotkeyRow(keys: ["⌥", "⌥"], label: "Realtime hands-free (2-tap)", color: DS.Colors.overlayCursorMagenta)
                 hotkeyRow(keys: ["⌃", "fn"], label: "Voice-to-text", color: DS.Colors.overlayCursorPurple)
-                // v13t: burst mode killed — hotkey is a no-op now. Hidden from UI.
-                hotkeyRow(keys: ["⌥", "fn"], label: "Capture-to-inbox", color: DS.Colors.overlayCursorYellow)
+                hotkeyRow(keys: ["⌘", "fn"], label: "Typing mode", color: DS.Colors.overlayCursorGreen)
+                hotkeyRow(keys: ["⇧", "fn"], label: "Capture-to-inbox", color: DS.Colors.overlayCursorYellow)
+                hotkeyRow(keys: ["⌥", "fn"], label: "Base PTT (Claude+TTS)", color: DS.Colors.overlayCursorBlue)
+                hotkeyRow(keys: ["⇧", "⌥", "fn"], label: "Base voice-mode (tap)", color: DS.Colors.overlayCursorBlue)
                 hotkeyRow(keys: ["⇧", "⌃"], label: "Polish (tap or hold)", color: DS.Colors.overlayCursorCyan)
             }
         }

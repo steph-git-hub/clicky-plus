@@ -39,6 +39,9 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// speech-to-speech. Audio is streamed bidirectionally rather than
     /// transcribed-then-acted-on like the other modes.
     let realtimeTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
+    /// Separate publisher for the Realtime hands-free toggle (Fn+Cmd+Opt, v15p2).
+    /// Single tap → flip hands-free state. State persists in UserDefaults.
+    let realtimeHandsFreeToggleTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
     /// Separate publisher for the polish hotkey (⌃⌥⌘ tap). Unlike the
     /// other 5 modes, polish is NOT a hold — subscribers should only
     /// react to `.pressed` transitions and ignore `.released`. Polish
@@ -106,6 +109,8 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     @Published private(set) var isCaptureToInboxShortcutCurrentlyPressed = false
     /// Parallel state for the Realtime conversation shortcut (Fn + Opt, v15p2).
     @Published private(set) var isRealtimeShortcutCurrentlyPressed = false
+    /// Parallel state for the Realtime hands-free toggle (Fn+Cmd+Opt, v15p2).
+    @Published private(set) var isRealtimeHandsFreeToggleShortcutCurrentlyPressed = false
     /// Parallel state for the polish hotkey (⌃⌥⌘). Tracked the same way
     /// as the other modes so press/release transitions debounce correctly,
     /// even though only `.pressed` is acted upon downstream.
@@ -335,6 +340,26 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         case .released:
             isRealtimeShortcutCurrentlyPressed = false
             realtimeTransitionPublisher.send(.released)
+        }
+
+        // Realtime hands-free toggle (Fn+Cmd+Opt, v15p2) is detected
+        // in parallel. Forbidden flags (.shift/.control) keep it
+        // mutually exclusive with everything else.
+        let realtimeHandsFreeToggleTransition = BuddyPushToTalkShortcut.realtimeHandsFreeToggleTransition(
+            eventType: eventType,
+            modifierFlagsRawValue: event.flags.rawValue,
+            wasPreviouslyPressed: isRealtimeHandsFreeToggleShortcutCurrentlyPressed
+        )
+
+        switch realtimeHandsFreeToggleTransition {
+        case .none:
+            break
+        case .pressed:
+            isRealtimeHandsFreeToggleShortcutCurrentlyPressed = true
+            realtimeHandsFreeToggleTransitionPublisher.send(.pressed)
+        case .released:
+            isRealtimeHandsFreeToggleShortcutCurrentlyPressed = false
+            realtimeHandsFreeToggleTransitionPublisher.send(.released)
         }
 
         // Polish hotkey (⌃⌥⌘) is detected in parallel. Its transition

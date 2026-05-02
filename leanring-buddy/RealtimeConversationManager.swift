@@ -125,6 +125,27 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     private var inputAudioBuffer = Data()
     private let targetInputChunkBytes = 24_000 * 2 / 20 // 50ms of PCM16 mono = 2400 bytes
     private var isHotkeyHeld: Bool = false
+    /// v15p2 (2026-05-02): hands-free mode flag. When true, audio
+    /// streams continuously regardless of hotkey state and the server
+    /// uses VAD turn detection to auto-respond. Toggled by Marin via
+    /// the set_listening_mode tool. Lives under audioStateLock since
+    /// the audio thread reads it on every tap callback.
+    private var isContinuousListening: Bool = false
+
+    /// v15p2 (2026-05-02): true while Marin is generating/speaking a
+    /// response. Used to drop incoming mic audio so the server's VAD
+    /// can't trigger a new response off Marin's own voice played
+    /// through the speakers (classic feedback loop). Set on
+    /// response.created, cleared on response.done / response.cancel.
+    ///
+    /// Hotfix2: clearing it requires BOTH `responseDoneReceived` AND
+    /// `outputBuffersInFlight == 0` — `response.done` fires when the
+    /// model is done GENERATING, but audio is still playing through
+    /// the speakers for another ~200-500ms. Re-opening the mic before
+    /// playback drains lets server VAD trigger off the speaker echo.
+    private var isModelSpeaking: Bool = false
+    private var responseDoneReceived: Bool = false
+    private var outputBuffersInFlight: Int = 0
     private var bytesSentInCurrentPress: Int = 0
     private var maxInputLevelInCurrentPress: Float = 0
     private var pressStartedAt: Date?
@@ -132,6 +153,31 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     // Warm session auto-close (continuous conversation).
     private static let warmSessionTimeoutSeconds: TimeInterval = 120
     private var warmSessionAutoCloseTask: Task<Void, Never>?
+
+    // MARK: - Function calling state (v15p2 Chunk 1, 2026-05-02)
+    //
+    // The Realtime model emits a function_call output item when it
+    // wants to invoke one of our locally-defined tools. The lifecycle:
+    //   1. response.output_item.added with item.type=function_call →
+    //      we record (call_id, name) so we know what tool to dispatch.
+    //   2. response.function_call_arguments.delta (zero or more) →
+    //      streaming JSON args; we don't need to act on partial args.
+    //   3. response.function_call_arguments.done → full args available;
+    //      we look up name from pendingFunctionCalls, dispatch.
+    //   4. We send conversation.item.create with function_call_output
+    //      including the same call_id + the result, then response.create
+    //      so Marin continues speaking with the result in context.
+    //
+    // Pending calls are kept under audioStateLock since both the audio
+    // thread and main thread can read the websocket state and these
+    // dispatches go through sendJSON which itself locks.
+
+    private var pendingFunctionCalls: [String: String] = [:] // call_id → name
+
+    /// On-screen highlight overlay used by the `highlight_element` tool.
+    /// Lazily created on first use; lives on MainActor since it manages
+    /// AppKit windows.
+    @MainActor private var highlightOverlay: RealtimeHighlightOverlayManager?
 
     // MARK: - Diagnostics
     //
@@ -190,13 +236,25 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         Task.detached { [weak self] in
             guard let self = self else { return }
             do {
+                // v15p2 hotfix (2026-05-02): start audio capture FIRST,
+                // before token mint + WebSocket open. The audio tap
+                // begins delivering buffers immediately and they
+                // accumulate in inputAudioBuffer (gated on isHotkeyHeld
+                // = true, which we set on press). Once the WebSocket
+                // is up, the accumulated audio gets force-flushed.
+                // Without this, the user's first ~500ms of speech was
+                // captured into nothing because the engine wasn't
+                // running yet.
+                try self.startAudioCapture()
                 let token = try await self.fetchEphemeralToken()
                 try await self.openWebSocket(token: token)
-                try self.startAudioCapture()
-                // v15p2 P3: capture + send active-screen screenshot
-                // before audio chunks land at the server. Fire-and-
-                // forget — Realtime processes events in order so the
-                // image arrives ahead of the eventual audio commit.
+                // Flush any audio captured during the WebSocket setup
+                // gap so it arrives at the server in the right order
+                // (audio first, then screenshot).
+                self.forceFlushAccumulatedAudio()
+                // P3: capture + send active-screen screenshot. Fire-
+                // and-forget — Realtime processes events in order so
+                // the image arrives ahead of the audio commit.
                 self.captureAndSendActiveScreenshot()
                 await MainActor.run {
                     self.state = .listening
@@ -244,8 +302,115 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         teardown()
     }
 
+    /// v15p2 (2026-05-02): direct API for the hands-free toggle hotkey.
+    /// Same effect as the model calling set_listening_mode(true), but
+    /// triggered by Fn+Cmd+Opt without involving Marin. If no session
+    /// is currently active, starts one in continuous mode right away.
+    func engageContinuousListening() {
+        // Set the gate flag first so audio flows before/after the
+        // server.update arrives.
+        audioStateLock.lock()
+        isContinuousListening = true
+        // Treat hotkey-held semantics as engaged so the audio gate
+        // is open without requiring an actual press.
+        isHotkeyHeld = true
+        audioStateLock.unlock()
+
+        if state.isActive {
+            // Already running — push the server-side change.
+            cancelWarmSessionAutoClose()
+            sendJSON([
+                "type": "session.update",
+                "session": [
+                    "turn_detection": [
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 800,
+                    ],
+                ],
+            ])
+            Self.appendDiag("engageContinuousListening: live toggle on existing session")
+        } else {
+            // Start cold. Same path as a normal startSession but the
+            // gate flag is already set so as soon as the WebSocket
+            // opens the session.update we send below will switch
+            // turn_detection. Also, the warm-session timeout won't
+            // fire because we'll keep cancelling it via continuous
+            // mode.
+            Self.appendDiag("engageContinuousListening: starting fresh session in continuous mode")
+            Task { @MainActor in
+                self.state = .connecting
+            }
+            Task.detached { [weak self] in
+                guard let self else { return }
+                do {
+                    try self.startAudioCapture()
+                    let token = try await self.fetchEphemeralToken()
+                    try await self.openWebSocket(token: token)
+                    self.forceFlushAccumulatedAudio()
+                    // Push hands-free turn_detection up-front so the
+                    // server enters VAD mode from the start.
+                    self.sendJSON([
+                        "type": "session.update",
+                        "session": [
+                            "turn_detection": [
+                                "type": "server_vad",
+                                "threshold": 0.5,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 800,
+                            ],
+                        ],
+                    ])
+                    self.captureAndSendActiveScreenshot()
+                    await MainActor.run {
+                        self.state = .listening
+                    }
+                    Self.appendDiag("engageContinuousListening: session ready")
+                } catch {
+                    Self.appendDiag("engageContinuousListening failed: \(error.localizedDescription)")
+                    await MainActor.run {
+                        self.state = .errored(error.localizedDescription)
+                    }
+                    self.teardown()
+                }
+            }
+        }
+    }
+
+    /// v15p2 (2026-05-02): direct API to disengage hands-free.
+    func disengageContinuousListening() {
+        audioStateLock.lock()
+        isContinuousListening = false
+        isHotkeyHeld = false
+        audioStateLock.unlock()
+        if state.isActive {
+            sendJSON([
+                "type": "session.update",
+                "session": ["turn_detection": NSNull()],
+            ])
+            sendJSON(["type": "input_audio_buffer.clear"])
+            Self.appendDiag("disengageContinuousListening: back to PTT")
+        }
+    }
+
+    /// Returns true if Marin is currently generating or playing an
+    /// audio response. Used by CompanionManager's Esc handler to
+    /// distinguish "interrupt the speech" from "end the session."
+    func isModelCurrentlySpeaking() -> Bool {
+        audioStateLock.lock(); defer { audioStateLock.unlock() }
+        return isModelSpeaking || outputBuffersInFlight > 0
+    }
+
     /// Emergency stop: tell the server to cancel the current response
-    /// and drain local playback. Session stays warm (re-press to continue).
+    /// and drain local playback. Session stays alive — user can keep
+    /// speaking immediately.
+    ///
+    /// v15p2 hotfix (2026-05-02): mic reopen now goes through the
+    /// grace-period path. Without it, the mic re-opened the instant
+    /// cancel was called, while speaker tail audio was still emitting,
+    /// causing server VAD to pick up the echo as user speech and
+    /// chain into runaway feedback turns.
     func cancelCurrentResponse() {
         let active: Bool = {
             audioStateLock.lock(); defer { audioStateLock.unlock() }
@@ -256,8 +421,9 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
 
         sendJSON(["type": "response.cancel"])
 
-        // Drain playback queue on the main thread (AVAudioPlayerNode
-        // mutations should happen on a consistent thread).
+        // Stop the player immediately (cuts audio) but keep the
+        // isModelSpeaking gate CLOSED so server VAD can't re-trigger
+        // off speaker tail. The grace will flip it false safely.
         Task { @MainActor in
             if self.outputPlayer.isPlaying {
                 self.outputPlayer.stop()
@@ -269,6 +435,17 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             self.liveAssistantTranscript = ""
             self.outputAudioLevel = 0
         }
+
+        audioStateLock.lock()
+        // isModelSpeaking stays TRUE; the grace timer below will
+        // flip it to false once any echo tail has died down.
+        responseDoneReceived = true
+        outputBuffersInFlight = 0
+        audioStateLock.unlock()
+
+        // Schedule mic reopen after grace, but DO NOT end session
+        // — user explicitly interrupted to speak again.
+        scheduleMicReopenAfterGrace(naturalCompletion: false)
     }
 
     // MARK: - Token mint
@@ -360,10 +537,72 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         case "session.created", "session.updated":
             Self.appendDiag(type)
 
+        case "response.created":
+            // Marin is about to speak — silence the mic until both
+            // (a) response.done fires AND (b) playback queue drains.
+            // v15p2 hotfix2 (2026-05-02).
+            audioStateLock.lock()
+            isModelSpeaking = true
+            responseDoneReceived = false
+            // Don't reset outputBuffersInFlight — buffers from a prior
+            // response (rare) shouldn't be forgotten. They'll drain on
+            // their own.
+            audioStateLock.unlock()
+
         case "input_audio_buffer.speech_started":
+            // v15p2 (2026-05-02): if Marin is currently speaking
+            // when the user starts a new turn, that's a barge-in
+            // (interruption). Server VAD will cancel her response
+            // automatically; we need to drain the local playback
+            // queue so the audio she already streamed stops coming
+            // out of the speakers.
+            let wasSpeaking: Bool = {
+                audioStateLock.lock(); defer { audioStateLock.unlock() }
+                return isModelSpeaking
+            }()
+            if wasSpeaking {
+                Self.appendDiag("speech_started during model response — barge-in detected, draining playback")
+                Task { @MainActor in
+                    if self.outputPlayer.isPlaying {
+                        self.outputPlayer.stop()
+                    }
+                    if self.outputEngine.isRunning {
+                        self.outputPlayer.play()
+                    }
+                    self.outputAudioLevel = 0
+                    self.liveAssistantTranscript = ""
+                }
+                audioStateLock.lock()
+                isModelSpeaking = false
+                responseDoneReceived = false
+                outputBuffersInFlight = 0
+                audioStateLock.unlock()
+            }
+
             Task { @MainActor in
                 self.state = .listening
                 self.liveUserTranscript = ""
+            }
+            // v15p2 (2026-05-02): in hands-free mode, refresh the
+            // active-screen screenshot at the start of each user turn
+            // so Marin sees the CURRENT view rather than whatever was
+            // on screen when the session started. Without this, if
+            // Steph navigates between turns Marin keeps responding
+            // based on the stale screen.
+            //
+            // Fire-and-forget. By the time the user finishes speaking
+            // (~1-2s) and server VAD commits, the screenshot
+            // (~50-200ms to capture) has already arrived in the
+            // conversation context for the upcoming response.
+            //
+            // Only fires in continuous mode — PTT already captures
+            // per-press in startSession.
+            let inContinuous: Bool = {
+                audioStateLock.lock(); defer { audioStateLock.unlock() }
+                return isContinuousListening
+            }()
+            if inContinuous {
+                captureAndSendActiveScreenshot()
             }
 
         case "input_audio_buffer.speech_stopped":
@@ -384,8 +623,65 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                 }
             }
 
+        // ── Function calling events (v15p2 Chunk 1) ──────────────
+        case "response.output_item.added":
+            // The model added an output item to the current response.
+            // If it's a function_call, capture the call_id → name
+            // mapping so we know which tool to dispatch when args arrive.
+            if let item = json["item"] as? [String: Any],
+               let itemType = item["type"] as? String,
+               itemType == "function_call",
+               let callId = item["call_id"] as? String,
+               let name = item["name"] as? String {
+                audioStateLock.lock()
+                pendingFunctionCalls[callId] = name
+                audioStateLock.unlock()
+                Self.appendDiag("function_call started: name=\(name) call_id=\(callId)")
+            }
+
+        case "response.function_call_arguments.done":
+            // Args are complete. Look up the function name, dispatch.
+            guard let callId = json["call_id"] as? String,
+                  let argumentsJSON = json["arguments"] as? String else {
+                Self.appendDiag("function_call_arguments.done malformed: \(text.prefix(200))")
+                break
+            }
+            // Some events include `name` directly; fall back to our map.
+            let name: String
+            if let directName = json["name"] as? String {
+                name = directName
+            } else {
+                audioStateLock.lock()
+                name = pendingFunctionCalls[callId] ?? ""
+                audioStateLock.unlock()
+            }
+            guard !name.isEmpty else {
+                Self.appendDiag("function_call: no name for call_id=\(callId)")
+                break
+            }
+            Self.appendDiag("function_call ready: name=\(name) call_id=\(callId) args=\(argumentsJSON.prefix(200))")
+            dispatchFunctionCall(name: name, callId: callId, argumentsJSON: argumentsJSON)
+            // Clean up pending tracking.
+            audioStateLock.lock()
+            pendingFunctionCalls.removeValue(forKey: callId)
+            audioStateLock.unlock()
+
         case "response.done":
             writeRealtimeTurnToTranscriptLog()
+            // v15p2 hotfix2 (2026-05-02): mark response as done. Mic
+            // does NOT reopen yet — wait for the playback queue to
+            // drain via handleOutputBufferCompleted. If buffers are
+            // already at zero (rare — usually some still queued when
+            // response.done arrives), trigger the grace-period reopen
+            // here.
+            audioStateLock.lock()
+            responseDoneReceived = true
+            let canReopenNow = outputBuffersInFlight == 0
+            audioStateLock.unlock()
+            if canReopenNow {
+                // Natural completion — PTT mode will auto-end session.
+                scheduleMicReopenAfterGrace(naturalCompletion: true)
+            }
             Task { @MainActor in
                 self.state = .listening
                 self.liveAssistantTranscript = ""
@@ -439,6 +735,15 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
 
         // ── INPUT ENGINE ─ mic → tap (capture only) ───────────────
         let inputNode = inputEngine.inputNode
+
+        // v15p2 (2026-05-02): voice processing was tried for AEC +
+        // noise suppression but on Steph's audio device setup it
+        // forced a 9-channel input format that broke the PCM16 mono
+        // converter (bytesSent=0). Reverted. We rely on the
+        // mute-during-speech logic to break the feedback loop and
+        // accept that natural voice interruption isn't supported on
+        // this hardware — Esc is the kill switch.
+
         let inputFormat = inputNode.outputFormat(forBus: 0)
         inputDeviceFormat = inputFormat
         Self.appendDiag(
@@ -517,13 +822,31 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
 
         // Lock-protected buffer accumulation. NO @MainActor hop here.
         audioStateLock.lock()
+        // v15p2 (2026-05-02): hands-free mode treats audio as
+        // always-streaming, regardless of hotkey state. Server VAD
+        // handles turn detection.
+        //
+        // While Marin is speaking we DROP mic input. Voice processing
+        // (AEC) would let us avoid this and support natural voice
+        // interruption, but on Steph's hardware it broke the audio
+        // pipeline — see comment above the inputNode setup. So we
+        // mute during her speech to prevent feedback. Esc remains
+        // the interrupt mechanism.
+        let shouldStreamAudio = (isHotkeyHeld || isContinuousListening) && !isModelSpeaking
         let shouldFlush: Bool
-        if isHotkeyHeld {
+        if shouldStreamAudio {
             inputAudioBuffer.append(bytes)
             if rms > maxInputLevelInCurrentPress {
                 maxInputLevelInCurrentPress = rms
             }
+            // v15p2 hotfix: only flush if the WebSocket is actually
+            // open. If we're still in cold-start setup, KEEP
+            // accumulating — the audio captured during setup will be
+            // force-flushed by `forceFlushAccumulatedAudio` once the
+            // WebSocket comes up. Without this gate, sendAudioChunk
+            // silently drops bytes when webSocketTask is nil.
             shouldFlush = inputAudioBuffer.count >= targetInputChunkBytes
+                && webSocketTask != nil
         } else {
             // Drop buffered bytes from previous press so they don't
             // leak into the next response.
@@ -568,6 +891,31 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             if let error {
                 Self.appendDiag("audio send error: \(error.localizedDescription)")
             }
+        }
+    }
+
+    /// v15p2 hotfix (2026-05-02): flush all currently-buffered audio
+    /// to the server, regardless of chunk threshold. Called once after
+    /// the WebSocket comes up during cold-start so audio that was
+    /// captured during the token-mint + WebSocket-open gap (~500ms)
+    /// reaches the server. Without this, the user's first words are
+    /// lost.
+    private func forceFlushAccumulatedAudio() {
+        audioStateLock.lock()
+        let bytesToFlush: Data?
+        if !inputAudioBuffer.isEmpty {
+            bytesToFlush = inputAudioBuffer
+            inputAudioBuffer.removeAll(keepingCapacity: true)
+            bytesSentInCurrentPress += bytesToFlush?.count ?? 0
+        } else {
+            bytesToFlush = nil
+        }
+        audioStateLock.unlock()
+        if let bytesToFlush, !bytesToFlush.isEmpty {
+            sendAudioChunk(bytesToFlush)
+            Self.appendDiag(
+                "post-connect flush: \(bytesToFlush.count) bytes of pre-WebSocket audio"
+            )
         }
     }
 
@@ -646,6 +994,475 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Tool dispatcher (v15p2 Chunk 1, 2026-05-02)
+    //
+    // Routes a function call from Marin to a local Swift handler.
+    // Handlers can be sync (return value immediately) or async (wrap
+    // in a Task and call sendFunctionCallResult when done). After the
+    // handler returns, we send `conversation.item.create` with the
+    // function_call_output item (includes the same call_id) and then
+    // a `response.create` so Marin continues speaking with the
+    // result in context.
+    //
+    // Adding a new tool = three steps:
+    //   1. Define it in the Worker /realtime-session route
+    //   2. Add a case here that runs the work
+    //   3. Make sure the persona / instructions know it's available
+    //
+    // Errors from tool execution should NOT crash the app. If a tool
+    // fails, send back a JSON object like {"error": "<reason>"} so
+    // Marin can verbalize the failure.
+
+    private func dispatchFunctionCall(name: String, callId: String, argumentsJSON: String) {
+        // Parse arguments. Tools that take no parameters get an
+        // empty dictionary.
+        let args: [String: Any] = {
+            guard let data = argumentsJSON.data(using: .utf8),
+                  let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return [:] }
+            return parsed
+        }()
+
+        switch name {
+        case "get_current_time":
+            let result = toolGetCurrentTime(args: args)
+            sendFunctionCallResult(callId: callId, name: name, result: result)
+
+        case "set_listening_mode":
+            let continuous = (args["continuous"] as? Bool) ?? false
+            let result = toolSetListeningMode(continuous: continuous)
+            sendFunctionCallResult(callId: callId, name: name, result: result)
+
+        // ── Research tools (v15p2, 2026-05-02) ────────────────
+        case "list_scheduled_tasks":
+            Task { @MainActor [weak self] in
+                let result = MarinResearchTools.listScheduledTasks()
+                self?.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        case "list_skills":
+            Task { @MainActor [weak self] in
+                let result = MarinResearchTools.listSkills()
+                self?.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        case "list_plugins":
+            Task { @MainActor [weak self] in
+                let result = MarinResearchTools.listPlugins()
+                self?.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        case "search_obsidian":
+            let query = (args["query"] as? String) ?? ""
+            Task { @MainActor [weak self] in
+                let result = MarinResearchTools.searchObsidian(query: query)
+                self?.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        case "read_obsidian_note":
+            let path = (args["path"] as? String) ?? ""
+            Task { @MainActor [weak self] in
+                let result = MarinResearchTools.readObsidianNote(path: path)
+                self?.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        case "search_clicky_codebase":
+            let query = (args["query"] as? String) ?? ""
+            Task { @MainActor [weak self] in
+                let result = MarinResearchTools.searchClickyCodebase(query: query)
+                self?.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        case "read_clicky_roadmap":
+            Task { @MainActor [weak self] in
+                let result = MarinResearchTools.readClickyRoadmap()
+                self?.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        case "list_memory_files":
+            Task { @MainActor [weak self] in
+                let result = MarinResearchTools.listMemoryFiles()
+                self?.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        case "read_memory_file":
+            let memoryName = (args["name"] as? String) ?? ""
+            Task { @MainActor [weak self] in
+                let result = MarinResearchTools.readMemoryFile(name: memoryName)
+                self?.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        case "highlight_element":
+            // Async because AX search + drawing happens on MainActor.
+            // We hop to MainActor, do the work, then call back to send
+            // the result. This keeps the audio thread / receive loop
+            // unblocked.
+            let description = (args["description"] as? String) ?? ""
+            let dwellSeconds = (args["dwell_seconds"] as? Double) ?? 4.0
+            Task { [weak self] in
+                guard let self else { return }
+                let result = await self.toolHighlightElement(
+                    description: description,
+                    dwellSeconds: dwellSeconds
+                )
+                self.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        default:
+            Self.appendDiag("unknown tool: \(name) — sending error to model")
+            let errorResult: [String: Any] = ["error": "Tool '\(name)' is not implemented on the Mac client."]
+            sendFunctionCallResult(callId: callId, name: name, result: errorResult)
+        }
+    }
+
+    /// Send the function-call result back to the Realtime session so
+    /// Marin can continue speaking. Two events: (1) the conversation
+    /// item carrying the result, (2) response.create to trigger the
+    /// next speech turn.
+    private func sendFunctionCallResult(callId: String, name: String, result: Any) {
+        // Stringify the result. The server expects `output` to be a
+        // string (typically JSON), even for trivial values.
+        let outputString: String
+        if let str = result as? String {
+            outputString = str
+        } else if let data = try? JSONSerialization.data(withJSONObject: result),
+                  let json = String(data: data, encoding: .utf8) {
+            outputString = json
+        } else {
+            outputString = "{}"
+        }
+
+        let item: [String: Any] = [
+            "type": "conversation.item.create",
+            "item": [
+                "type": "function_call_output",
+                "call_id": callId,
+                "output": outputString,
+            ],
+        ]
+        sendJSON(item)
+        sendJSON(["type": "response.create"])
+        Self.appendDiag("function_call result sent: name=\(name) call_id=\(callId) output=\(outputString.prefix(200))")
+    }
+
+    // MARK: - Tool implementations
+
+    /// Returns true if the given app's AX tree is too sparse / noisy
+    /// to use for element finding. These are mostly browsers (Chrome,
+    /// Safari, etc.) where AX only exposes the chrome (tabs, toolbar)
+    /// rather than page content, and Electron apps where AX coverage
+    /// is unreliable.
+    ///
+    /// For these, the highlight_element tool skips AX entirely and
+    /// goes straight to vision. v15p2 hotfix3 (2026-05-02).
+    private func isAXUnreliableApp(bundleID: String) -> Bool {
+        let unreliable: Set<String> = [
+            // Browsers — only browser chrome exposed via AX.
+            "com.google.Chrome",
+            "com.google.Chrome.canary",
+            "com.google.Chrome.beta",
+            "com.brave.Browser",
+            "com.microsoft.edgemac",
+            "org.mozilla.firefox",
+            "org.mozilla.nightly",
+            "company.thebrowser.Browser", // Arc
+            "com.apple.Safari",
+            "com.apple.SafariTechnologyPreview",
+            // Electron / Chromium-based desktop apps — AX is patchy.
+            "com.anthropic.claudefordesktop",  // Cowork / Claude desktop
+            "com.openai.chat",                 // ChatGPT Atlas
+            "com.tinyspeck.slackmacgap",       // Slack
+            "com.hnc.Discord",                 // Discord
+            "com.microsoft.teams2",            // Microsoft Teams
+            "com.figma.Desktop",               // Figma
+            "com.notion.id",                   // Notion
+            "md.obsidian",                     // Obsidian
+            "com.linear",                      // Linear
+            "com.electron.cursor",             // Cursor
+            "com.todesktop.230313mzl4w4u92",   // Cursor (alt bundle)
+        ]
+        return unreliable.contains(bundleID)
+    }
+
+    /// v15p2 (2026-05-02): hands-free toggle. Switches the session
+    /// between push-to-talk (default) and continuous listening with
+    /// server-side VAD turn detection.
+    ///
+    /// Implementation: send `session.update` to flip turn_detection
+    /// (null ↔ server_vad), and toggle the local audio gate. The
+    /// audio engine + tap stay running across the toggle so there's
+    /// no setup latency.
+    private func toolSetListeningMode(continuous: Bool) -> [String: Any] {
+        // Update the local gate first so audio behavior switches
+        // before we send the session.update event (avoids a brief
+        // window where the server expects continuous audio but we're
+        // still gating on hotkey).
+        audioStateLock.lock()
+        isContinuousListening = continuous
+        audioStateLock.unlock()
+
+        if continuous {
+            // Switch the server to use VAD turn detection. Threshold
+            // tuned a bit higher than default 0.5 to reduce false
+            // triggers from background noise during tutoring.
+            let updatePayload: [String: Any] = [
+                "type": "session.update",
+                "session": [
+                    "turn_detection": [
+                        "type": "server_vad",
+                        "threshold": 0.5,
+                        "prefix_padding_ms": 300,
+                        "silence_duration_ms": 800,
+                    ],
+                ],
+            ]
+            sendJSON(updatePayload)
+            Self.appendDiag("set_listening_mode: ENGAGED hands-free (server_vad)")
+            return [
+                "status": "ok",
+                "mode": "continuous",
+                "note": "Hands-free engaged. Steph can speak naturally without holding any keys.",
+            ]
+        } else {
+            // Switch back to manual mode (client commits explicitly
+            // on hotkey release).
+            let updatePayload: [String: Any] = [
+                "type": "session.update",
+                "session": [
+                    "turn_detection": NSNull(),
+                ],
+            ]
+            sendJSON(updatePayload)
+            // Clear any in-flight audio buffer on the server side so
+            // residual noise from the transition doesn't trigger a
+            // bonus response.
+            sendJSON(["type": "input_audio_buffer.clear"])
+            Self.appendDiag("set_listening_mode: DISENGAGED hands-free (back to PTT)")
+            return [
+                "status": "ok",
+                "mode": "push_to_talk",
+                "note": "Back to push-to-talk. Steph holds Fn+Opt for each turn.",
+            ]
+        }
+    }
+
+    /// Returns the current local date/time. Trivial sanity-check tool
+    /// for Chunk 1 — proves the function-calling round trip works.
+    private func toolGetCurrentTime(args: [String: Any]) -> [String: Any] {
+        let now = Date()
+        let formatter = DateFormatter()
+        formatter.locale = Locale.current
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "EEEE, MMMM d, yyyy 'at' h:mm a zzz"
+        let humanReadable = formatter.string(from: now)
+        let iso = ISO8601DateFormatter().string(from: now)
+        return [
+            "human_readable": humanReadable,
+            "iso8601": iso,
+            "timezone_identifier": TimeZone.current.identifier,
+        ]
+    }
+
+    /// Find a UI element matching the description and draw a magenta
+    /// highlight on it for the dwell duration. Strategy:
+    ///
+    ///   1. AX search (fast, ~50ms when it works). Native macOS apps,
+    ///      most well-built apps. Strong score → use the AX rect.
+    ///   2. Vision fallback (~1-2s). Capture the active screen, send
+    ///      to Sonnet with the description, get a bounding box back.
+    ///      Used when AX has no match, OR when AX has a weak match
+    ///      (low score → likely false positive on a single keyword).
+    ///
+    /// Returns a JSON-friendly status describing what was found.
+    @MainActor
+    private func toolHighlightElement(
+        description: String,
+        dwellSeconds: Double
+    ) async -> [String: Any] {
+        guard !description.isEmpty else {
+            return ["status": "error", "reason": "empty description"]
+        }
+        let clampedDwell = max(1.0, min(15.0, dwellSeconds))
+
+        // Lazily create the overlay manager on first use.
+        if highlightOverlay == nil {
+            highlightOverlay = RealtimeHighlightOverlayManager()
+        }
+
+        // ── Path 1: AX search (skipped for web/Electron) ──────────
+        // For browsers and Electron apps, the AX tree only exposes
+        // the chrome (tabs, menu bar, toolbar buttons) — never the
+        // actual page content the user is asking about. Going to
+        // vision directly avoids guaranteed false positives like
+        // "highlight the email body" → "New Tab" (the tab strip's
+        // role description happened to contain 'tab').
+        // v15p2 hotfix3 (2026-05-02).
+        let frontAppBundleID = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+        let shouldSkipAX = isAXUnreliableApp(bundleID: frontAppBundleID)
+        if shouldSkipAX {
+            Self.appendDiag(
+                "highlight_element: skipping AX for app=\(frontAppBundleID) (web/Electron) — straight to vision"
+            )
+        }
+
+        // Threshold for "AX is confident": score must be >= 6. Below
+        // that, the match is likely a single-keyword false positive.
+        let axHit = shouldSkipAX ? nil : AXElementSearch.find(description: description)
+        if let hit = axHit, hit.score >= 6 {
+            highlightOverlay?.show(
+                screenRect: hit.screenRect,
+                label: hit.matchedDescription,
+                dwellSeconds: clampedDwell
+            )
+            Self.appendDiag(
+                "highlight_element AX hit: \"\(hit.matchedDescription)\" " +
+                "score=\(hit.score) " +
+                "rect=\(Int(hit.screenRect.origin.x)),\(Int(hit.screenRect.origin.y)) " +
+                "\(Int(hit.screenRect.width))x\(Int(hit.screenRect.height)) " +
+                "dwell=\(clampedDwell)s"
+            )
+            return [
+                "status": "ok",
+                "method": "ax",
+                "matched_label": hit.matchedDescription,
+                "match_score": hit.score,
+                "dwell_seconds": clampedDwell,
+            ]
+        }
+
+        // ── Path 2: Vision fallback ──────────────────────────────
+        // AX missed (or was too weak) — capture the active screen
+        // and ask Sonnet to find the element. Slower but works on
+        // web pages, Electron, anywhere AX can't see.
+        if let axHit {
+            Self.appendDiag(
+                "highlight_element AX weak (score=\(axHit.score), label=\"\(axHit.matchedDescription)\") — falling back to vision"
+            )
+        } else {
+            Self.appendDiag("highlight_element AX miss — falling back to vision")
+        }
+
+        do {
+            let visionRect = try await findElementViaVision(description: description)
+            if let visionRect {
+                highlightOverlay?.show(
+                    screenRect: visionRect,
+                    label: description,
+                    dwellSeconds: clampedDwell
+                )
+                Self.appendDiag(
+                    "highlight_element vision hit: " +
+                    "rect=\(Int(visionRect.origin.x)),\(Int(visionRect.origin.y)) " +
+                    "\(Int(visionRect.width))x\(Int(visionRect.height)) " +
+                    "dwell=\(clampedDwell)s"
+                )
+                return [
+                    "status": "ok",
+                    "method": "vision",
+                    "matched_label": description,
+                    "dwell_seconds": clampedDwell,
+                ]
+            } else {
+                Self.appendDiag("highlight_element vision: not found")
+                return [
+                    "status": "not_found",
+                    "reason": "I couldn't find that element on screen, even with vision. Could you describe it differently?",
+                ]
+            }
+        } catch {
+            Self.appendDiag("highlight_element vision error: \(error.localizedDescription)")
+            return [
+                "status": "error",
+                "reason": "Vision lookup failed: \(error.localizedDescription)",
+            ]
+        }
+    }
+
+    /// Capture the active screen, send the screenshot + description
+    /// to the Worker's /find-ui-element route, parse Sonnet's bounding
+    /// box, scale from screenshot pixel space back to screen point
+    /// space, return as a CGRect ready for the highlight overlay.
+    /// Returns nil if Sonnet says the element isn't visible.
+    @MainActor
+    private func findElementViaVision(description: String) async throws -> CGRect? {
+        // Fresh capture for the lookup. We could reuse the per-press
+        // screenshot we already sent to Marin, but a dedicated capture
+        // is simpler and the user might have changed screens since.
+        let screen = try await CompanionScreenCaptureUtility.captureActiveScreenAsJPEG()
+        let base64 = screen.imageData.base64EncodedString()
+
+        guard let url = URL(string: "https://clicky-proxy.sapierso.workers.dev/find-ui-element") else {
+            throw NSError(
+                domain: "ClickyRealtimeError",
+                code: -10,
+                userInfo: [NSLocalizedDescriptionKey: "Bad Worker URL for /find-ui-element"]
+            )
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.timeoutInterval = 15
+        let body: [String: Any] = [
+            "description": description,
+            "imageBase64": base64,
+            "imageWidth": screen.screenshotWidthInPixels,
+            "imageHeight": screen.screenshotHeightInPixels,
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let bodyText = String(data: data, encoding: .utf8) ?? "<binary>"
+            throw NSError(
+                domain: "ClickyRealtimeError",
+                code: http.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: "Worker /find-ui-element returned \(http.statusCode): \(bodyText)"]
+            )
+        }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(
+                domain: "ClickyRealtimeError",
+                code: -11,
+                userInfo: [NSLocalizedDescriptionKey: "Could not parse vision response"]
+            )
+        }
+        guard let found = json["found"] as? Bool, found,
+              let bbox = json["bbox_pixels"] as? [String: Any],
+              let bx = (bbox["x"] as? NSNumber).map({ $0.doubleValue }),
+              let by = (bbox["y"] as? NSNumber).map({ $0.doubleValue }),
+              let bw = (bbox["w"] as? NSNumber).map({ $0.doubleValue }),
+              let bh = (bbox["h"] as? NSNumber).map({ $0.doubleValue }),
+              bw > 0, bh > 0 else {
+            // Sonnet said "not found" or the response shape was off.
+            return nil
+        }
+
+        // Scale from screenshot pixel coords (origin top-left) to
+        // screen point coords on the active screen, then convert to
+        // global AppKit coords (bottom-left origin) by adding the
+        // active screen's frame origin.
+        let imgW = Double(screen.screenshotWidthInPixels)
+        let imgH = Double(screen.screenshotHeightInPixels)
+        let scaleX = Double(screen.displayWidthInPoints) / imgW
+        let scaleY = Double(screen.displayHeightInPoints) / imgH
+        let pointWidth = bw * scaleX
+        let pointHeight = bh * scaleY
+        // Image origin is top-left; flip y to AppKit bottom-left
+        // origin within the screen, then offset by the screen's
+        // global AppKit origin.
+        let pointX_local = bx * scaleX
+        let pointTop_localFromTop = by * scaleY  // distance from top of screen
+        let pointY_localFromBottom = Double(screen.displayHeightInPoints) - pointTop_localFromTop - pointHeight
+
+        let globalRect = CGRect(
+            x: screen.displayFrame.origin.x + CGFloat(pointX_local),
+            y: screen.displayFrame.origin.y + CGFloat(pointY_localFromBottom),
+            width: CGFloat(pointWidth),
+            height: CGFloat(pointHeight)
+        )
+        return globalRect
+    }
+
     // MARK: - Audio playback (server → speakers)
 
     private func playPCM16Chunk(_ pcmData: Data) {
@@ -665,9 +1482,84 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         }
 
         let rms = Self.computeRMS(of: pcmBuffer)
+        // Track this buffer as "in flight" so we know when playback
+        // truly finishes. Server's response.done fires when generation
+        // is complete, but the queue here may still have several
+        // chunks of audio left to play. Mic must stay muted until
+        // these all finish, otherwise speaker echo re-triggers VAD.
+        audioStateLock.lock()
+        outputBuffersInFlight += 1
+        audioStateLock.unlock()
         Task { @MainActor in
             self.outputAudioLevel = rms
-            self.outputPlayer.scheduleBuffer(pcmBuffer, at: nil, options: [], completionHandler: nil)
+            self.outputPlayer.scheduleBuffer(
+                pcmBuffer,
+                at: nil,
+                options: [],
+                completionCallbackType: .dataPlayedBack
+            ) { [weak self] _ in
+                guard let self else { return }
+                self.handleOutputBufferCompleted()
+            }
+        }
+    }
+
+    /// Called from the audio thread when an output buffer finishes
+    /// playing through the speakers. Decrements the in-flight counter
+    /// and, if both `response.done` has arrived AND no buffers remain,
+    /// re-opens the mic gate after a small grace period for any
+    /// acoustic echo tail.
+    private func handleOutputBufferCompleted() {
+        audioStateLock.lock()
+        outputBuffersInFlight = max(0, outputBuffersInFlight - 1)
+        let shouldReopenMic = responseDoneReceived && outputBuffersInFlight == 0
+        audioStateLock.unlock()
+        if shouldReopenMic {
+            // Buffer-completion path = natural response end (response.done
+            // already fired and last buffer just finished). PTT will
+            // auto-end session.
+            scheduleMicReopenAfterGrace(naturalCompletion: true)
+        }
+    }
+
+    /// v15p2 hotfix (2026-05-02): bumped from 250ms → 500ms. Speaker
+    /// tail can outlast the player.completionCallback by ~100-300ms
+    /// due to OS audio output buffering. Longer grace prevents server
+    /// VAD from triggering on echo.
+    private static let micReopenGraceSeconds: Double = 0.5
+
+    /// Schedule the mic to re-open after a grace period for echo tail.
+    ///
+    /// - Parameter naturalCompletion: true if `response.done` fired
+    ///   normally (not cancelled). When true AND in PTT mode, we
+    ///   also end the session (no warm window). When false (Esc
+    ///   cancellation), we never end the session — user wants to
+    ///   keep talking.
+    private func scheduleMicReopenAfterGrace(naturalCompletion: Bool) {
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.micReopenGraceSeconds * 1_000_000_000))
+            guard let self else { return }
+            self.audioStateLock.lock()
+            // Re-check conditions in case a new response started
+            // during the grace period.
+            let stillSafe = self.responseDoneReceived && self.outputBuffersInFlight == 0
+            let isContinuous = self.isContinuousListening
+            if stillSafe {
+                self.isModelSpeaking = false
+                self.inputAudioBuffer.removeAll(keepingCapacity: true)
+            }
+            self.audioStateLock.unlock()
+            guard stillSafe else { return }
+
+            Self.appendDiag("mic reopened after playback drain + grace")
+
+            // PTT mode + natural completion → end session. No warm
+            // window. Cancellation paths pass naturalCompletion=false
+            // so the user can keep talking after they Esc-interrupted.
+            if naturalCompletion && !isContinuous {
+                Self.appendDiag("PTT mode — ending session after response complete (no warm window)")
+                self.endSession()
+            }
         }
     }
 
@@ -697,6 +1589,16 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
 
     private func scheduleWarmSessionAutoClose() {
         cancelWarmSessionAutoClose()
+        // v15p2 (2026-05-02): when hands-free is engaged, don't
+        // schedule the warm-session timeout. The user explicitly asked
+        // for an open mic; auto-closing would frustrate them mid-tutorial.
+        let isHandsFree: Bool = {
+            audioStateLock.lock(); defer { audioStateLock.unlock() }
+            return isContinuousListening
+        }()
+        if isHandsFree {
+            return
+        }
         warmSessionAutoCloseTask = Task { [weak self] in
             let seconds = Self.warmSessionTimeoutSeconds
             try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
@@ -744,6 +1646,12 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         audioStateLock.lock()
         inputAudioBuffer.removeAll()
         isHotkeyHeld = false
+        // v15p2: each new session starts in PTT mode; Marin can
+        // toggle hands-free on again if she's tutoring.
+        isContinuousListening = false
+        isModelSpeaking = false
+        responseDoneReceived = false
+        outputBuffersInFlight = 0
         audioStateLock.unlock()
 
         Task { @MainActor in

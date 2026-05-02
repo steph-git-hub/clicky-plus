@@ -568,7 +568,21 @@ final class CompanionManager: ObservableObject {
     private var voiceToTextTransitionCancellable: AnyCancellable?
     private var captureToInboxTransitionCancellable: AnyCancellable?
     private var realtimeTransitionCancellable: AnyCancellable?
+    private var realtimeHandsFreeToggleCancellable: AnyCancellable?
     private var polishHotkeyTransitionCancellable: AnyCancellable?
+
+    /// v15p2 (2026-05-02): hands-free Realtime toggle state, persisted
+    /// across launches. UserDefaults source of truth so the flag
+    /// outlives sessions and Mac restarts. Toggled by Fn+Cmd+Opt.
+    @Published var isRealtimeHandsFreeEnabled: Bool = UserDefaults.standard
+        .bool(forKey: "clicky.realtimeHandsFreeEnabled") {
+        didSet {
+            UserDefaults.standard.set(
+                isRealtimeHandsFreeEnabled,
+                forKey: "clicky.realtimeHandsFreeEnabled"
+            )
+        }
+    }
 
     /// Realtime conversation manager (v15p2, OpenAI Realtime API).
     /// Lazily created on first hotkey press so its setup cost doesn't
@@ -1270,6 +1284,16 @@ final class CompanionManager: ObservableObject {
                 self?.handleRealtimeTransition(transition)
             }
 
+        // v15p2 (2026-05-02): hotkey swap — Fn+Shift+Opt now toggles
+        // Base voice-mode instead of Realtime hands-free. Realtime
+        // hands-free moved to double-tap Option (above).
+        realtimeHandsFreeToggleCancellable = globalPushToTalkShortcutMonitor
+            .realtimeHandsFreeToggleTransitionPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] transition in
+                self?.handleFnShiftOptForBaseVoiceMode(transition)
+            }
+
         polishHotkeyTransitionCancellable = globalPushToTalkShortcutMonitor
             .polishHotkeyTransitionPublisher
             .receive(on: DispatchQueue.main)
@@ -1293,11 +1317,14 @@ final class CompanionManager: ObservableObject {
             .sink { [weak self] in
                 self?.handleTypingDoubleTapEngage()
             }
+        // v15p2 (2026-05-02): hotkey swap — Option double-tap now
+        // engages Realtime hands-free instead of Base voice-mode.
+        // Base voice-mode moved to Fn+Shift+Opt (handled below).
         optionDoubleTapCancellable = globalPushToTalkShortcutMonitor
             .optionDoubleTapPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in
-                self?.handleVoiceModeDoubleTapEngage()
+                self?.handleOptionDoubleTapForRealtimeHandsFree()
             }
         controlSingleTapCancellable = globalPushToTalkShortcutMonitor
             .controlSingleTapPublisher
@@ -1311,11 +1338,13 @@ final class CompanionManager: ObservableObject {
             .sink { [weak self] in
                 self?.handleTypingSingleTapDisengage()
             }
+        // v15p2 (2026-05-02): single-tap Option mirrors the swap —
+        // disengages Realtime hands-free instead of Base voice-mode.
         optionSingleTapCancellable = globalPushToTalkShortcutMonitor
             .optionSingleTapPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] in
-                self?.handleVoiceModeSingleTapDisengage()
+                self?.handleOptionSingleTapForRealtimeHandsFree()
             }
         escapeKeyCancellable = globalPushToTalkShortcutMonitor
             .escapeKeyPublisher
@@ -2344,13 +2373,20 @@ final class CompanionManager: ObservableObject {
             disengageVoiceModeToggle()
         }
 
-        // v15p2 (2026-05-02): Realtime emergency stop. If Marin is
-        // mid-response, send response.cancel + drain playback so she
-        // shuts up immediately. Then end the session so the user can
-        // re-engage cleanly with Fn+Opt for a fresh turn.
+        // v15p2 (2026-05-02): Realtime emergency stop, smart-split.
+        //   • If Marin is currently speaking → interrupt only.
+        //     Cancel her response + drain playback. Session stays
+        //     alive so the user can speak again immediately. This is
+        //     the "wait, stop talking" gesture.
+        //   • If session is alive but quiet → end session (full kill).
+        //     This is the "we're done here" gesture.
         if let realtimeManager, realtimeManager.state.isActive {
-            realtimeManager.cancelCurrentResponse()
-            realtimeManager.endSession()
+            if realtimeManager.isModelCurrentlySpeaking() {
+                realtimeManager.cancelCurrentResponse()
+                // Don't end session — user wants to keep talking.
+            } else {
+                realtimeManager.endSession()
+            }
         }
 
         // Force voiceState to idle if it's in any active state. The orb
@@ -2413,6 +2449,71 @@ final class CompanionManager: ObservableObject {
         // ends dictation, disarms click-to-capture, ships frames+transcript
         // to Claude.
         handleShortcutTransition(.released)
+    }
+
+    // MARK: - v15p2 (2026-05-02) — hotkey-swap handlers
+    //
+    // After the swap, the Option-tap publishers route to Realtime
+    // hands-free, and Fn+Shift+Opt routes to Base voice-mode. Three
+    // new handlers below; they delegate to the existing
+    // engage/disengage primitives.
+
+    /// Double-tap Option → engage Realtime hands-free (was Base voice-
+    /// mode pre-swap). Same effect as Fn+Cmd+Opt before this swap, just
+    /// with easier ergonomics.
+    private func handleOptionDoubleTapForRealtimeHandsFree() {
+        guard !buddyDictationManager.isDictationInProgress else { return }
+        guard !showOnboardingVideo else { return }
+        // If already on, double-tap is a no-op (single-tap disengages).
+        // If off, engage.
+        if !isRealtimeHandsFreeEnabled {
+            isRealtimeHandsFreeEnabled = true
+            currentResponseTask?.cancel()
+            ttsClient.stopPlayback()
+            transientHideTask?.cancel()
+            transientHideTask = nil
+            if !isClickyCursorEnabled && !isOverlayVisible {
+                overlayWindowManager.hasShownOverlayBefore = true
+                overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+                isOverlayVisible = true
+            }
+            isRealtimeModeActive = true
+            if realtimeManager == nil {
+                realtimeManager = RealtimeConversationManager()
+                bindRealtimeManagerState()
+            }
+            realtimeManager?.engageContinuousListening()
+            print("🎙️ Realtime hands-free → ENGAGED (double-tap Opt)")
+        }
+    }
+
+    /// Single-tap Option → disengage Realtime hands-free.
+    private func handleOptionSingleTapForRealtimeHandsFree() {
+        guard isRealtimeHandsFreeEnabled else { return }
+        isRealtimeHandsFreeEnabled = false
+        if let manager = realtimeManager, manager.state.isActive {
+            manager.disengageContinuousListening()
+            manager.endSession()
+        }
+        print("🎙️ Realtime hands-free → DISENGAGED (single-tap Opt)")
+        scheduleTransientHideIfNeeded()
+    }
+
+    /// Fn+Shift+Opt single-tap → toggle Base voice-mode (was Realtime
+    /// hands-free pre-swap).
+    private func handleFnShiftOptForBaseVoiceMode(
+        _ transition: BuddyPushToTalkShortcut.ShortcutTransition
+    ) {
+        guard transition == .pressed else { return }
+        guard !buddyDictationManager.isDictationInProgress else { return }
+        guard !showOnboardingVideo else { return }
+        if isVoiceModeToggleLocked {
+            print("🔒 Base voice-mode toggle: disengaging (Fn+Shift+Opt)")
+            disengageVoiceModeToggle()
+        } else {
+            print("🔒 Base voice-mode toggle: engaging (Fn+Shift+Opt)")
+            handleVoiceModeDoubleTapEngage()
+        }
     }
 
     // MARK: - VoiceState Watchdog (v11p)
@@ -2617,6 +2718,69 @@ final class CompanionManager: ObservableObject {
                     self.scheduleTransientHideIfNeeded()
                 }
             }
+    }
+
+    /// v15p2 (2026-05-02): handle Fn+Cmd+Opt toggle press.
+    ///
+    /// Behavior:
+    ///   • Toggles the persisted isRealtimeHandsFreeEnabled flag.
+    ///   • If a Realtime session is currently active, push the new
+    ///     state to the running manager (engages or disengages
+    ///     server-VAD continuous listening live).
+    ///   • If no session is active and the toggle is being turned ON,
+    ///     start a session immediately so hands-free engages right
+    ///     away rather than waiting for the next Fn+Opt press.
+    ///   • If session active in hands-free mode and toggle goes OFF,
+    ///     end the session (it was probably a tutoring session — user
+    ///     toggling off means "we're done").
+    private func handleRealtimeHandsFreeToggleTransition(
+        _ transition: BuddyPushToTalkShortcut.ShortcutTransition
+    ) {
+        guard transition == .pressed else { return }
+        guard !buddyDictationManager.isDictationInProgress else { return }
+        guard !showOnboardingVideo else { return }
+
+        // Flip the persisted flag.
+        isRealtimeHandsFreeEnabled.toggle()
+        let nowEnabled = isRealtimeHandsFreeEnabled
+        print("🎙️ Realtime hands-free toggle → \(nowEnabled ? "ON" : "OFF")")
+
+        // Bring the overlay forward briefly so the indicator state
+        // change is visible.
+        transientHideTask?.cancel()
+        transientHideTask = nil
+        if !isClickyCursorEnabled && !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+
+        // Apply to live state if there's an active session OR start one.
+        if nowEnabled {
+            // Cancel anything competing for the audio device.
+            currentResponseTask?.cancel()
+            ttsClient.stopPlayback()
+
+            if realtimeManager == nil {
+                realtimeManager = RealtimeConversationManager()
+                bindRealtimeManagerState()
+            }
+            // Set magenta indicator immediately.
+            isRealtimeModeActive = true
+            // Start the session in continuous mode (or upgrade existing
+            // session to continuous mode).
+            realtimeManager?.engageContinuousListening()
+        } else {
+            // Toggle going OFF.
+            if let manager = realtimeManager, manager.state.isActive {
+                manager.disengageContinuousListening()
+                // Also end the session — turning hands-free off is
+                // typically "we're done with the tutorial".
+                manager.endSession()
+            }
+        }
+
+        scheduleTransientHideIfNeeded()
     }
 
     private func handlePolishHotkeyTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {

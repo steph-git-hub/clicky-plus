@@ -20,6 +20,9 @@ enum BuddyPushToTalkShortcut {
         case shiftControl
         case controlOptionSpace
         case shiftControlSpace
+        /// v15p2 (2026-05-02): Fn+Opt held — new home for Base PTT
+        /// after the Realtime↔Base hotkey swap.
+        case optionFunction
 
         var displayText: String {
             switch self {
@@ -33,6 +36,8 @@ enum BuddyPushToTalkShortcut {
                 return "ctrl + option + space"
             case .shiftControlSpace:
                 return "shift + control + space"
+            case .optionFunction:
+                return "fn + option"
             }
         }
 
@@ -48,6 +53,8 @@ enum BuddyPushToTalkShortcut {
                 return ["ctrl", "option", "space"]
             case .shiftControlSpace:
                 return ["shift", "control", "space"]
+            case .optionFunction:
+                return ["fn", "option"]
             }
         }
 
@@ -59,6 +66,8 @@ enum BuddyPushToTalkShortcut {
                 return [.control, .option]
             case .shiftControl:
                 return [.shift, .control]
+            case .optionFunction:
+                return [.option, .function]
             case .controlOptionSpace, .shiftControlSpace:
                 return nil
             }
@@ -71,6 +80,8 @@ enum BuddyPushToTalkShortcut {
             case .controlOption:
                 return nil
             case .shiftControl:
+                return nil
+            case .optionFunction:
                 return nil
             case .controlOptionSpace:
                 return [.control, .option]
@@ -92,7 +103,11 @@ enum BuddyPushToTalkShortcut {
         case keyUp
     }
 
-    static let currentShortcutOption: ShortcutOption = .controlOption
+    // v15p2 (2026-05-02): swapped from .controlOption (Ctrl+Opt) to
+    // .optionFunction (Fn+Opt). Realtime PTT moved to Ctrl+Opt; Base
+    // PTT moves here. Easier hotkeys go to Realtime, which is the
+    // mode Steph actually uses now.
+    static let currentShortcutOption: ShortcutOption = .optionFunction
     static let pushToTalkKeyCode: UInt16 = 49 // Space
     static let pushToTalkDisplayText = currentShortcutOption.displayText
     static let pushToTalkTooltipText = "push to talk (\(pushToTalkDisplayText))"
@@ -163,10 +178,25 @@ enum BuddyPushToTalkShortcut {
         if let modifierOnlyFlags = currentShortcutOption.modifierOnlyFlags {
             guard shortcutEventType == .flagsChanged else { return .none }
 
-            // Normal (voice-only) mode is mutually exclusive with burst mode.
-            // If Fn is also held, treat as burst mode — don't fire normal here.
-            let isShortcutCurrentlyPressed = modifierFlags.contains(modifierOnlyFlags)
-                && !modifierFlags.contains(.function)
+            // v15p2 (2026-05-02): mutual-exclusivity logic depends on
+            // which option we're using. Old behavior: forbid .function
+            // (so we don't double-fire with burst). New for .optionFunction:
+            // we REQUIRE .function, so the forbidden flags shift to
+            // shift/command/control to keep us mutually exclusive with
+            // VTT (fn+ctrl), capture (fn+shift), typing (cmd+fn), and
+            // the new Realtime PTT (ctrl+opt).
+            let hasRequired = modifierFlags.isSuperset(of: modifierOnlyFlags)
+            let hasForbidden: Bool
+            switch currentShortcutOption {
+            case .optionFunction:
+                hasForbidden = modifierFlags.contains(.shift)
+                    || modifierFlags.contains(.control)
+                    || modifierFlags.contains(.command)
+            default:
+                // Original behavior for legacy chords: Fn is forbidden.
+                hasForbidden = modifierFlags.contains(.function)
+            }
+            let isShortcutCurrentlyPressed = hasRequired && !hasForbidden
 
             if isShortcutCurrentlyPressed && !wasShortcutPreviouslyPressed {
                 return .pressed
@@ -433,7 +463,11 @@ enum BuddyPushToTalkShortcut {
     //   - Burst (fn+shift+opt)         → excluded by `.shift` forbidden
     //   - Typing (cmd+fn)              → excluded by `.command` forbidden
 
-    static let realtimeModifierFlags: NSEvent.ModifierFlags = [.option, .function]
+    // v15p2 (2026-05-02): swapped from Fn+Opt → Ctrl+Opt. The previous
+    // chord required reaching for the Fn key which is awkward; Ctrl+Opt
+    // is the legacy Base PTT chord that's much easier to hold.
+    // Base PTT moves to Fn+Opt as part of the same swap.
+    static let realtimeModifierFlags: NSEvent.ModifierFlags = [.control, .option]
 
     static func realtimeTransition(
         eventType: CGEventType,
@@ -454,15 +488,77 @@ enum BuddyPushToTalkShortcut {
         wasRealtimePreviouslyPressed: Bool
     ) -> ShortcutTransition {
         let hasRequired = modifierFlags.isSuperset(of: realtimeModifierFlags)
+        // Ctrl+Opt is the chord. Forbidden: shift/command/function so
+        // we don't double-fire with VTT (fn+ctrl), capture-to-inbox
+        // (fn+shift), typing (cmd+fn), or Base PTT (fn+opt).
         let hasForbidden = modifierFlags.contains(.shift)
             || modifierFlags.contains(.command)
-            || modifierFlags.contains(.control)
+            || modifierFlags.contains(.function)
         let isRealtimeCurrentlyPressed = hasRequired && !hasForbidden
 
         if isRealtimeCurrentlyPressed && !wasRealtimePreviouslyPressed {
             return .pressed
         }
         if !isRealtimeCurrentlyPressed && wasRealtimePreviouslyPressed {
+            return .released
+        }
+        return .none
+    }
+
+    // MARK: - Realtime hands-free toggle (Fn + Shift + Opt)
+    //
+    // v15p2 (2026-05-02): direct toggle hotkey for hands-free Realtime
+    // tutor mode. Single tap → flip hands-free state. When ON, next
+    // Fn+Opt session starts in continuous-listening mode (server VAD
+    // turn detection, no key needed between turns). When OFF, default
+    // PTT semantics. State persists across cold-starts.
+    //
+    // Chord: Fn+Shift+Opt — reuses the old burst-mode chord (burst
+    // was disabled in v13t). The burst detector still fires on this
+    // chord but its handler is a no-op behind isBurstModeEnabled, so
+    // the two coexist harmlessly.
+    //
+    // Mutually exclusive with every other ACTIVE hotkey:
+    //   - VTT (fn+ctrl)                → excluded by `.control` forbidden
+    //   - Capture-to-inbox (fn+shift)  → excluded by `.option` (capture's
+    //                                    forbidden flags include .option)
+    //   - Typing (cmd+fn)              → excluded by `.command` forbidden
+    //                                    on capture/realtime; typing
+    //                                    itself forbids .shift+.option
+    //   - Realtime (fn+opt)            → excluded by `.shift` (Realtime's
+    //                                    forbidden flags)
+
+    static let realtimeHandsFreeToggleModifierFlags: NSEvent.ModifierFlags = [.shift, .option, .function]
+
+    static func realtimeHandsFreeToggleTransition(
+        eventType: CGEventType,
+        modifierFlagsRawValue: UInt64,
+        wasPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        guard eventType == .flagsChanged else { return .none }
+        let flags = NSEvent.ModifierFlags(rawValue: UInt(modifierFlagsRawValue))
+            .intersection(.deviceIndependentFlagsMask)
+        return realtimeHandsFreeToggleTransition(
+            modifierFlags: flags,
+            wasPreviouslyPressed: wasPreviouslyPressed
+        )
+    }
+
+    private static func realtimeHandsFreeToggleTransition(
+        modifierFlags: NSEvent.ModifierFlags,
+        wasPreviouslyPressed: Bool
+    ) -> ShortcutTransition {
+        let hasRequired = modifierFlags.isSuperset(of: realtimeHandsFreeToggleModifierFlags)
+        // Forbidden: anything OUTSIDE Fn+Shift+Opt. We require exactly
+        // those three modifiers (not more, not fewer).
+        let hasForbidden = modifierFlags.contains(.command)
+            || modifierFlags.contains(.control)
+        let isPressed = hasRequired && !hasForbidden
+
+        if isPressed && !wasPreviouslyPressed {
+            return .pressed
+        }
+        if !isPressed && wasPreviouslyPressed {
             return .released
         }
         return .none

@@ -70,6 +70,10 @@ export default {
       if (url.pathname === "/realtime-session") {
         return await handleRealtimeSession(request, env);
       }
+
+      if (url.pathname === "/find-ui-element") {
+        return await handleFindUIElement(request, env);
+      }
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
       return new Response(
@@ -251,8 +255,21 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
     "VISION: At the start of each turn you receive a screenshot of Steph's currently-active screen (the one with his cursor). Use it as ground truth when answering visual questions ('what's on my screen', 'what app am I in', 'what does this say'). Describe ONLY what's actually visible in the image — never invent UI elements, text, or details that aren't there. If the image doesn't contain what was asked about (e.g. he asks about an email but his calendar is open), say 'I don't see that on your active screen' rather than guessing.",
     "Keep responses tight and conversational — usually 1–2 short sentences unless the question genuinely needs more.",
     "Never read out asterisks, bullet markers, or formatting characters.",
-    "If asked something you can't do without tools, say so briefly.",
+    "TOOLS: You have functions you can call when they help answer accurately (e.g. get_current_time for time questions). Call tools silently — don't announce 'let me check' or 'one moment'; just call and answer naturally with the result.",
+    "RESEARCH TOOLS (list_scheduled_tasks, list_skills, list_plugins, search_obsidian, read_obsidian_note, search_clicky_codebase, read_clicky_roadmap): use these ONLY for questions about Steph's specific setup, files, scheduled tasks, plugins, code, or notes. Do NOT use them for general-knowledge questions — for those, answer from your training. Don't preemptively look things up; only call when his question genuinely requires reading his actual files. Examples: 'do I have a scheduled task for X' → call list_scheduled_tasks. 'what's in my note about Y' → search_obsidian then maybe read_obsidian_note. 'what's a CSV file' → answer from training, no tool call. Keep tool use focused.",
+    "RESUME AFTER INTERRUPTION: If you got cut off mid-response and the user then says 'continue' / 'go on' / 'pick up where you left off' / 'keep going' / 'finish that' — DO NOT restart your previous answer from the beginning. Look at your last message in the conversation history, identify exactly where it stopped, and continue from there as if uninterrupted. Don't summarize what you already said; just resume.",
     "Match Steph's energy: he's direct and casual; mirror that, don't over-formalize.",
+    // v15p2 Option 3 (2026-05-02): tutor-mode guidance baked into the
+    // base persona. Triggers naturally when Steph asks for help
+    // navigating an unfamiliar app — no separate hotkey needed.
+    "TUTOR MODE: When Steph asks for help using an app he doesn't know — phrases like 'walk me through', 'how do I', 'show me how to', 'teach me', 'I'm trying to figure out' — switch into a step-by-step tutoring style:",
+    "  • HANDS-FREE: at the START of a multi-step tutorial, call set_listening_mode(continuous: true) so Steph doesn't have to press Fn+Opt between every step. He just talks naturally and you auto-respond when he stops. When the tutorial ends OR he says 'we're done' / 'stop' / 'okay thanks' / 'turn off hands-free', call set_listening_mode(continuous: false) to switch back to push-to-talk. Don't engage hands-free for one-off questions.",
+    "  • Plan ONE step at a time. Don't dump the whole multi-step plan at once. Give the immediate next step, then wait for him to say 'done' / 'next' / 'got it' before moving on.",
+    "  • For each step, locate the target element with rich verbal landmarks rather than vague directions. Bad: 'click the button.' Good: 'click the orange plus icon in the upper-left of the sidebar, just above where it says My Sources.' Include color, shape, position relative to other elements, and any visible text label.",
+    "  • Sanity-check by looking at the actual screenshot before guiding him — if you can't see the element you're about to describe, say so and ask him to scroll or switch screens rather than making it up.",
+    "  • If he says 'I can't find it' or sounds stuck, re-describe with different landmarks (e.g. start over with color and shape instead of position). Don't repeat the same description.",
+    "  • Confirmation pattern: after each step ends, briefly verify the next state ('great, you should now see X') before giving the next instruction.",
+    "  • Keep each individual response short (1-2 sentences for the step + 1 short verification line). The user is acting on each step, so brevity is more important than completeness.",
   ].join(" ");
 
   const composedInstructions = personalFacts.length > 0
@@ -276,6 +293,146 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
     input_audio_transcription: overrides.input_audio_transcription ?? {
       model: "whisper-1",
     },
+    // v15p2 Chunk 1 (2026-05-02): function-calling foundation.
+    // The model can call these tools mid-conversation. Mac client
+    // executes them locally and sends the result back via
+    // conversation.item.create with function_call_output, then a
+    // response.create lets the model continue speaking with the
+    // result in context.
+    //
+    // Initial tool: get_current_time. Trivial — proves the wiring
+    // before we add real-work tools (highlight_element,
+    // wait_for_user_action) in Chunk 2+3.
+    // v15p2 Option 3 (2026-05-02): highlight_element disabled.
+    // Vanilla Sonnet vision wasn't accurate enough at pixel grounding
+    // for the tool to be reliable, and the round-trip latency was 5+s.
+    // Tutor mode is now voice-only — Marin describes locations
+    // verbally instead of trying to draw on the screen. The tool
+    // definition stays in the Swift dispatcher for when we wire up
+    // Claude Computer Use mode (Option 1) later.
+    tools: overrides.tools ?? [
+      {
+        type: "function",
+        name: "get_current_time",
+        description: "Returns the current date and time on Steph's Mac. Useful when he asks what time it is, what day it is, or anything time-related.",
+        parameters: {
+          type: "object",
+          properties: {},
+          required: [],
+        },
+      },
+      {
+        type: "function",
+        name: "set_listening_mode",
+        description:
+          "Switches between push-to-talk (default) and hands-free continuous listening. Call with continuous=true when starting a multi-step tutorial so Steph can walk through steps without pressing keys between turns — you'll auto-respond when he stops talking. Call with continuous=false when the tutorial ends or he says 'we're done' / 'stop' / 'turn off hands-free'. Don't toggle this for short single-question exchanges.",
+        parameters: {
+          type: "object",
+          properties: {
+            continuous: {
+              type: "boolean",
+              description: "true = hands-free continuous listening (no key press needed). false = back to push-to-talk.",
+            },
+          },
+          required: ["continuous"],
+        },
+      },
+      // ── Research tools (v15p2, 2026-05-02) ─────────────────
+      // For questions about Steph's specific setup. NOT for general
+      // knowledge — answer those from your training without calling
+      // a tool.
+      {
+        type: "function",
+        name: "list_scheduled_tasks",
+        description: "List Steph's scheduled tasks (the recurring jobs in ~/Documents/Claude/Scheduled). Use when he asks if he has a scheduled task for something, what tasks run when, etc. Returns task names + descriptions.",
+        parameters: { type: "object", properties: {}, required: [] },
+      },
+      {
+        type: "function",
+        name: "list_skills",
+        description: "List the skills installed across Steph's plugins. Use when he asks what skills he has, whether a skill exists for X, what a particular skill does. Returns name + description + plugin_id for each.",
+        parameters: { type: "object", properties: {}, required: [] },
+      },
+      {
+        type: "function",
+        name: "list_plugins",
+        description: "List the plugins installed in Steph's Cowork session. Use when he asks what plugins he has installed, what each does. Returns name + description + plugin_id.",
+        parameters: { type: "object", properties: {}, required: [] },
+      },
+      {
+        type: "function",
+        name: "search_obsidian",
+        description: "Full-text search across Steph's Obsidian vault. Use when he asks if he wrote anything about X, where his notes on Y are, what he captured about Z. Returns top 15 matching notes with title, path, and a snippet around the first match.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Search term. Plain text — no regex, no boolean operators. Case-insensitive.",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        type: "function",
+        name: "read_obsidian_note",
+        description: "Read the full content of a specific Obsidian note. Use after search_obsidian when Steph wants details from a particular note. Path is relative to the vault root (e.g. 'Projects/Clicky Plus - Roadmap.md'). Truncates at 8000 chars.",
+        parameters: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              description: "Path relative to the Obsidian vault root.",
+            },
+          },
+          required: ["path"],
+        },
+      },
+      {
+        type: "function",
+        name: "search_clicky_codebase",
+        description: "Search the clicky-plus repo source code. Use when Steph asks where in the code something is, whether a certain function exists, where a config lives. Returns top 15 matching lines with file path, line number, and snippet.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Search term. Plain text — case-insensitive substring match across .swift/.ts/.md/.json files.",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        type: "function",
+        name: "read_clicky_roadmap",
+        description: "Read the Clicky+ roadmap doc from Obsidian. Use when Steph asks what's planned for Clicky, what's been shipped, what's next, what was the rationale for X. Returns the curated roadmap content.",
+        parameters: { type: "object", properties: {}, required: [] },
+      },
+      {
+        type: "function",
+        name: "list_memory_files",
+        description: "List the reference notes in Steph's Claude Memory directory (Obsidian/Claude Memory/). These are deeper-context files: About Me, Working Principles, AI & Data Initiatives, etc. Use when Steph asks 'what reference notes do I have' or before pulling a specific one. Returns names + sizes.",
+        parameters: { type: "object", properties: {}, required: [] },
+      },
+      {
+        type: "function",
+        name: "read_memory_file",
+        description: "Read a specific memory file from the Claude Memory directory. The most useful one is About Me.md (Steph's full long-form context — about him, his role, family, business, working style — too large to auto-inject). Also useful: Working Principles, AI & Data Initiatives, Career Growth & AI Partnership. Truncates at 12000 chars. Use when Steph asks for deeper context that's not in the auto-injected Clicky Profile / Facts.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: {
+              type: "string",
+              description: "Filename, with or without .md suffix. E.g. 'About Me' or 'About Me.md'.",
+            },
+          },
+          required: ["name"],
+        },
+      },
+    ],
+    tool_choice: overrides.tool_choice ?? "auto",
   };
 
   const response = await fetch(
@@ -303,6 +460,151 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
 
   const data = await response.text();
   return new Response(data, {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/**
+ * /find-ui-element — vision-based UI element locator.
+ *
+ * Used as a fallback by Realtime mode's `highlight_element` tool when
+ * AX (Accessibility) can't find or confidently identify the element
+ * Marin wants to point at. Common case: web apps (Gmail, Cowork) and
+ * Electron apps where AX trees are sparse or only expose the chrome
+ * (browser tabs, menu bar) but not the actual page content.
+ *
+ * Input: screenshot + natural-language description.
+ * Output: JSON { found: bool, bbox_pixels: {x,y,w,h}, confidence, reasoning }
+ * The bbox is in the screenshot's pixel space; the Mac client scales
+ * it back to screen points using the screenshot/screen size ratio.
+ *
+ * Model: Sonnet 4.5 with vision. Coordinate accuracy isn't perfect
+ * (Sonnet wasn't specifically trained for grounding) but it's good
+ * enough for highlighting purposes — a box centered on the right
+ * area is functional even if it's not pixel-perfect.
+ */
+async function handleFindUIElement(request: Request, env: Env): Promise<Response> {
+  let payload: {
+    description?: string;
+    imageBase64?: string;
+    imageWidth?: number;
+    imageHeight?: number;
+  };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+
+  const description = (payload.description ?? "").trim();
+  const imageBase64 = (payload.imageBase64 ?? "").trim();
+  const imageWidth = payload.imageWidth ?? 0;
+  const imageHeight = payload.imageHeight ?? 0;
+
+  if (description.length === 0) {
+    return jsonError("Missing 'description'", 400);
+  }
+  if (imageBase64.length === 0) {
+    return jsonError("Missing 'imageBase64'", 400);
+  }
+  if (imageWidth <= 0 || imageHeight <= 0) {
+    return jsonError("Missing or invalid imageWidth/imageHeight", 400);
+  }
+
+  const systemPrompt = [
+    "You are a UI grounding assistant. Given a screenshot and a description of a UI element, return its bounding box in the image.",
+    "Return ONLY a JSON object — no prose, no markdown, no code fences.",
+    "Schema: {\"found\": boolean, \"bbox_pixels\": {\"x\": number, \"y\": number, \"w\": number, \"h\": number}, \"confidence\": number (0..1), \"reasoning\": string (1 short sentence)}",
+    "Coordinates are pixels in the image. Origin (0,0) is top-left, x increases right, y increases down.",
+    "If you cannot find the element, set found=false, bbox_pixels to zeros, confidence to 0, and explain in reasoning.",
+    "Be precise: the bbox should tightly enclose the element, not the entire region around it. Don't return giant boxes that cover most of the screen.",
+    "If multiple candidates match, pick the one most likely intended given the description and prefer SMALLER, more specific elements over containers.",
+  ].join(" ");
+
+  const userPrompt = [
+    `Find the UI element matching: "${description}"`,
+    `The image is ${imageWidth}×${imageHeight} pixels. Origin top-left.`,
+    "Return ONLY the JSON object specified in your instructions.",
+  ].join("\n");
+
+  const anthropicBody = {
+    model: "claude-sonnet-4-5",
+    max_tokens: 400,
+    system: systemPrompt,
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/jpeg",
+              data: imageBase64,
+            },
+          },
+          {
+            type: "text",
+            text: userPrompt,
+          },
+        ],
+      },
+    ],
+  };
+
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(anthropicBody),
+  });
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/find-ui-element] Anthropic error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, {
+      status: response.status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  const responseJSON = await response.json() as { content?: Array<{ type: string; text?: string }> };
+  const textBlocks = (responseJSON.content ?? [])
+    .filter((b) => b.type === "text" && typeof b.text === "string")
+    .map((b) => b.text as string);
+  const rawText = textBlocks.join("");
+
+  // Strip any leading/trailing whitespace + ``` fences if Sonnet
+  // wrapped the JSON despite our instructions.
+  let cleaned = rawText.trim();
+  if (cleaned.startsWith("```")) {
+    cleaned = cleaned.replace(/^```(?:json)?\s*/m, "").replace(/```\s*$/m, "").trim();
+  }
+
+  // Validate the JSON — if Sonnet returned something we can't parse,
+  // surface that as found=false so the Mac client can fall back
+  // gracefully instead of crashing.
+  let parsed: any;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch {
+    return new Response(JSON.stringify({
+      found: false,
+      bbox_pixels: { x: 0, y: 0, w: 0, h: 0 },
+      confidence: 0,
+      reasoning: "Worker could not parse model response as JSON.",
+      raw: rawText.slice(0, 500),
+    }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  return new Response(JSON.stringify(parsed), {
     status: 200,
     headers: { "content-type": "application/json" },
   });
