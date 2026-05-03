@@ -589,6 +589,38 @@ final class CompanionManager: ObservableObject {
     /// hit app boot.
     private var realtimeManager: RealtimeConversationManager?
     private var realtimeManagerStateCancellable: AnyCancellable?
+
+    /// v15p2 (2026-05-03): Marin's input audio level mirrored into
+    /// CompanionManager so indicators can be voice-reactive while
+    /// she's listening. Replaces the pink-flat-line bug.
+    @Published private(set) var realtimeInputAudioLevel: CGFloat = 0
+    private var realtimeInputAudioLevelCancellable: AnyCancellable?
+
+    /// v15p2 (2026-05-03): Marin's session state, exposed so the
+    /// indicator can pick `.listening` mode (audio-reactive halo)
+    /// vs `.idle` (solid line) vs `.processing` (heartbeat pulse).
+    /// The legacy `voiceState` tracks buddyDictationManager and is
+    /// always `.idle` during Marin sessions.
+    @Published private(set) var realtimeSessionState: RealtimeSessionState = .idle
+
+    /// v15p2 (2026-05-03): timestamp of last Esc handled for Realtime
+    /// double-tap detection (force-end on second press within 1.5s).
+    private var lastEscapeKeyForRealtime: Date?
+
+    /// v15p2 (2026-05-03): refcount of other-mode chords currently
+    /// held while a Marin session is active. When this goes from 0→1
+    /// we suspend Marin (mute mic, cancel response, stop TTS). When
+    /// it goes from 1→0 we resume. Tracked separately per mode-class
+    /// so a release of one mode doesn't accidentally clear the count
+    /// while another is still held.
+    private var otherModeChordsHeld: Set<String> = []
+
+    /// v15p2 (2026-05-03): mirror of `!otherModeChordsHeld.isEmpty`,
+    /// published so OverlayWindow can let the other-mode tint win
+    /// over magenta while Marin is suspended. Without this, the
+    /// cursor stays magenta during VTT/Typing/etc. and Steph loses
+    /// the color cue that he's hitting the right hotkey.
+    @Published private(set) var isRealtimeSuspendedByOtherMode: Bool = false
     /// Subscriptions for double-tap engage / single-tap disengage toggles
     /// (v11f + v11g): Ctrl/Cmd alone double-tap LOCKS VTT/typing on,
     /// single-tap or Esc UNLOCKS. Held continuously while CompanionManager lives.
@@ -1370,9 +1402,57 @@ final class CompanionManager: ObservableObject {
             }
     }
 
+    // MARK: - Suspend-Marin-during-other-modes (v15p2, 2026-05-03)
+    //
+    // Steph wanted to be able to use VTT / Typing / Polish / Capture
+    // / Burst / Base PTT WITHOUT Marin fighting him — without this,
+    // her mic captures his dictation as if it were for her, her
+    // VAD triggers a response, her TTS plays through speakers and
+    // is captured back as input. Mess.
+    //
+    // Strategy: refcount other-mode chords currently held. When the
+    // count goes 0→1, suspend Marin (mute mic, cancel response,
+    // stop TTS). When the count goes 1→0, resume. The WebSocket
+    // stays open through the suspend.
+    //
+    // Each mode contributes a distinct key to the refcount set so
+    // releases of one mode don't clear the count while another is
+    // still held.
+
+    /// Mark an other-mode chord as currently pressed. Suspends Marin
+    /// on the 0→1 transition.
+    private func markOtherModePressed(_ modeKey: String) {
+        let wasEmpty = otherModeChordsHeld.isEmpty
+        otherModeChordsHeld.insert(modeKey)
+        let marinAlive = realtimeManager != nil
+        RealtimeConversationManager.appendDiag(
+            "markOtherModePressed mode=\(modeKey) wasEmpty=\(wasEmpty) marinAlive=\(marinAlive) heldCount=\(otherModeChordsHeld.count)"
+        )
+        if wasEmpty {
+            realtimeManager?.suspendForOtherMode()
+            isRealtimeSuspendedByOtherMode = true
+        }
+    }
+
+    /// Mark an other-mode chord as released. Resumes Marin on the
+    /// 1→0 transition (when ALL other-mode chords have released).
+    private func markOtherModeReleased(_ modeKey: String) {
+        otherModeChordsHeld.remove(modeKey)
+        let marinAlive = realtimeManager != nil
+        RealtimeConversationManager.appendDiag(
+            "markOtherModeReleased mode=\(modeKey) nowEmpty=\(otherModeChordsHeld.isEmpty) marinAlive=\(marinAlive)"
+        )
+        if otherModeChordsHeld.isEmpty {
+            realtimeManager?.resumeFromOtherMode()
+            isRealtimeSuspendedByOtherMode = false
+        }
+    }
+
     private func handleShortcutTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
+            // v15p2 (2026-05-03): suspend Marin if she's running.
+            markOtherModePressed("basePTT")
             guard !buddyDictationManager.isDictationInProgress else { return }
             // Don't register push-to-talk while the onboarding video is playing
             guard !showOnboardingVideo else { return }
@@ -1444,6 +1524,8 @@ final class CompanionManager: ObservableObject {
                 )
             }
         case .released:
+            // v15p2 (2026-05-03): release Marin suspension for this mode.
+            markOtherModeReleased("basePTT")
             // Cancel the pending start task in case the user released the shortcut
             // before the async startPushToTalk had a chance to begin recording.
             // Without this, a quick press-and-release drops the release event and
@@ -2057,6 +2139,8 @@ final class CompanionManager: ObservableObject {
     private func handleTypingTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
+            // v15p2 (2026-05-03): suspend Marin if she's running.
+            markOtherModePressed("typing")
             guard !buddyDictationManager.isDictationInProgress else { return }
             guard !showOnboardingVideo else { return }
 
@@ -2140,6 +2224,8 @@ final class CompanionManager: ObservableObject {
             }
 
         case .released:
+            // v15p2 (2026-05-03): release Marin suspension for typing.
+            markOtherModeReleased("typing")
             ClickyAnalytics.trackPushToTalkReleased()
             isTypingModeActive = false
             pendingTypingShortcutStartTask?.cancel()
@@ -2167,6 +2253,8 @@ final class CompanionManager: ObservableObject {
     private func handleVoiceToTextTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
+            // v15p2 (2026-05-03): suspend Marin if she's running.
+            markOtherModePressed("vtt")
             guard !buddyDictationManager.isDictationInProgress else { return }
             guard !showOnboardingVideo else { return }
 
@@ -2246,6 +2334,8 @@ final class CompanionManager: ObservableObject {
             }
 
         case .released:
+            // v15p2 (2026-05-03): release Marin suspension for VTT.
+            markOtherModeReleased("vtt")
             ClickyAnalytics.trackPushToTalkReleased()
             // v15k diagnostic: record release timestamp so we can measure
             // end-to-end VTT latency (release → text appears).
@@ -2380,8 +2470,21 @@ final class CompanionManager: ObservableObject {
         //     the "wait, stop talking" gesture.
         //   • If session is alive but quiet → end session (full kill).
         //     This is the "we're done here" gesture.
+        // v15p2 hotfix (2026-05-03): if Esc is pressed twice within
+        // 1.5s, ALWAYS end the session regardless of speaking state.
+        // Without this, isModelSpeaking can stay stale (set true on
+        // response start, only cleared after grace timer) so two Esc
+        // hits in quick succession both saw isModelSpeaking=true and
+        // only cancelled. Now the second press force-kills.
+        let now = Date()
+        let isDoubleTap = lastEscapeKeyForRealtime.map {
+            now.timeIntervalSince($0) < 1.5
+        } ?? false
+        lastEscapeKeyForRealtime = now
         if let realtimeManager, realtimeManager.state.isActive {
-            if realtimeManager.isModelCurrentlySpeaking() {
+            if isDoubleTap {
+                realtimeManager.endSession()
+            } else if realtimeManager.isModelCurrentlySpeaking() {
                 realtimeManager.cancelCurrentResponse()
                 // Don't end session — user wants to keep talking.
             } else {
@@ -2464,27 +2567,35 @@ final class CompanionManager: ObservableObject {
     private func handleOptionDoubleTapForRealtimeHandsFree() {
         guard !buddyDictationManager.isDictationInProgress else { return }
         guard !showOnboardingVideo else { return }
-        // If already on, double-tap is a no-op (single-tap disengages).
-        // If off, engage.
-        if !isRealtimeHandsFreeEnabled {
-            isRealtimeHandsFreeEnabled = true
-            currentResponseTask?.cancel()
-            ttsClient.stopPlayback()
-            transientHideTask?.cancel()
-            transientHideTask = nil
-            if !isClickyCursorEnabled && !isOverlayVisible {
-                overlayWindowManager.hasShownOverlayBefore = true
-                overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
-                isOverlayVisible = true
-            }
-            isRealtimeModeActive = true
-            if realtimeManager == nil {
-                realtimeManager = RealtimeConversationManager()
-                bindRealtimeManagerState()
-            }
-            realtimeManager?.engageContinuousListening()
-            print("🎙️ Realtime hands-free → ENGAGED (double-tap Opt)")
+        // v15p2 hotfix (2026-05-03): only no-op if BOTH the persisted
+        // flag is on AND a session is actually running. Previous logic
+        // only checked the flag, which got out of sync when sessions
+        // ended for other reasons (Esc, error, race) — leaving Steph
+        // unable to re-engage without first toggling something else.
+        let actuallyActive = realtimeManager?.state.isActive ?? false
+        if isRealtimeHandsFreeEnabled && actuallyActive {
+            return
         }
+        // Otherwise force-engage — even if the persisted flag was
+        // already true, the session clearly isn't running, so we need
+        // to start one.
+        isRealtimeHandsFreeEnabled = true
+        currentResponseTask?.cancel()
+        ttsClient.stopPlayback()
+        transientHideTask?.cancel()
+        transientHideTask = nil
+        if !isClickyCursorEnabled && !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+        isRealtimeModeActive = true
+        if realtimeManager == nil {
+            realtimeManager = RealtimeConversationManager()
+            bindRealtimeManagerState()
+        }
+        realtimeManager?.engageContinuousListening()
+        print("🎙️ Realtime hands-free → ENGAGED (double-tap Opt)")
     }
 
     /// Single-tap Option → disengage Realtime hands-free.
@@ -2582,6 +2693,8 @@ final class CompanionManager: ObservableObject {
     private func handleCaptureToInboxTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
+            // v15p2 (2026-05-03): suspend Marin if she's running.
+            markOtherModePressed("captureToInbox")
             guard !buddyDictationManager.isDictationInProgress else { return }
             guard !showOnboardingVideo else { return }
 
@@ -2622,6 +2735,8 @@ final class CompanionManager: ObservableObject {
             }
 
         case .released:
+            // v15p2 (2026-05-03): release Marin suspension for capture-to-inbox.
+            markOtherModeReleased("captureToInbox")
             ClickyAnalytics.trackPushToTalkReleased()
             isCaptureToInboxModeActive = false
             pendingCaptureToInboxShortcutStartTask?.cancel()
@@ -2714,9 +2829,21 @@ final class CompanionManager: ObservableObject {
             .sink { [weak self] state in
                 guard let self else { return }
                 self.isRealtimeModeActive = state.isActive
+                self.realtimeSessionState = state
                 if !state.isActive {
                     self.scheduleTransientHideIfNeeded()
                 }
+            }
+        // v15p2 (2026-05-03): bind Marin's mic input level into the
+        // shared currentAudioPowerLevel so the indicator pulses with
+        // voice while she's listening (was flat-line before — the
+        // legacy buddyDictationManager level is 0 when Marin owns
+        // the mic). RMS is 0…1; we scale to CGFloat directly.
+        realtimeInputAudioLevelCancellable = manager.$inputAudioLevel
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] rms in
+                guard let self else { return }
+                self.realtimeInputAudioLevel = CGFloat(rms)
             }
     }
 
@@ -2786,6 +2913,8 @@ final class CompanionManager: ObservableObject {
     private func handlePolishHotkeyTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
+            // v15p2 (2026-05-03): suspend Marin if she's running.
+            markOtherModePressed("polish")
             // Don't fire if any other capture is in progress — polish is a
             // pure write path and shouldn't overlap with active dictation.
             guard !buddyDictationManager.isDictationInProgress else { return }
@@ -2810,6 +2939,8 @@ final class CompanionManager: ObservableObject {
             }
 
         case .released:
+            // v15p2 (2026-05-03): release Marin suspension for polish.
+            markOtherModeReleased("polish")
             let polishHotkeyHeldDuration = polishHotkeyPressedAt
                 .map { Date().timeIntervalSince($0) } ?? 0
 

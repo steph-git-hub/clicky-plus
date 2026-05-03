@@ -32,6 +32,27 @@ interface Env {
   /// The real key never leaves the Worker. Stored via
   /// `npx wrangler secret put OPENAI_API_KEY`.
   OPENAI_API_KEY: string;
+  /// Google OAuth credentials for the Gmail connector (v15p2,
+  /// 2026-05-02). Marin's research tools call /gmail/search and
+  /// /gmail/read-thread, which exchange the refresh token for a
+  /// short-lived access token (~1hr) on each call and use it
+  /// against the Gmail API. Refresh token is the persistent
+  /// credential — never leaves the Worker.
+  GOOGLE_OAUTH_CLIENT_ID: string;
+  GOOGLE_OAUTH_CLIENT_SECRET: string;
+  GMAIL_REFRESH_TOKEN: string;
+  /// Calendar connector (v15p2, 2026-05-02). Separate refresh token
+  /// scoped to calendar.readonly so the Gmail credential isn't
+  /// touched. Same OAuth client and same Worker-side token-exchange
+  /// pattern as Gmail — see `getCalendarAccessToken` below.
+  CALENDAR_REFRESH_TOKEN: string;
+  /// Slack connector (v15p2, 2026-05-03). User OAuth token (xoxp-)
+  /// from a custom Slack App in Steph's Kombo Ventures workspace.
+  /// Scopes: search:read, channels:history, groups:history,
+  /// im:history, mpim:history, users:read, channels:read,
+  /// groups:read. Read-only — Marin can search and quote, never
+  /// post.
+  SLACK_USER_TOKEN: string;
 }
 
 export default {
@@ -73,6 +94,38 @@ export default {
 
       if (url.pathname === "/find-ui-element") {
         return await handleFindUIElement(request, env);
+      }
+
+      if (url.pathname === "/gmail/search") {
+        return await handleGmailSearch(request, env);
+      }
+
+      if (url.pathname === "/gmail/read-thread") {
+        return await handleGmailReadThread(request, env);
+      }
+
+      if (url.pathname === "/calendar/list-events") {
+        return await handleCalendarListEvents(request, env);
+      }
+
+      if (url.pathname === "/calendar/find-next") {
+        return await handleCalendarFindNext(request, env);
+      }
+
+      if (url.pathname === "/slack/search") {
+        return await handleSlackSearch(request, env);
+      }
+
+      if (url.pathname === "/slack/read-thread") {
+        return await handleSlackReadThread(request, env);
+      }
+
+      if (url.pathname === "/slack/unread-inbox") {
+        return await handleSlackUnreadInbox(request, env);
+      }
+
+      if (url.pathname === "/slack/post-message") {
+        return await handleSlackPostMessage(request, env);
       }
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
@@ -256,8 +309,9 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
     "Keep responses tight and conversational — usually 1–2 short sentences unless the question genuinely needs more.",
     "Never read out asterisks, bullet markers, or formatting characters.",
     "TOOLS: You have functions you can call when they help answer accurately (e.g. get_current_time for time questions). Call tools silently — don't announce 'let me check' or 'one moment'; just call and answer naturally with the result.",
-    "RESEARCH TOOLS (list_scheduled_tasks, list_skills, list_plugins, search_obsidian, read_obsidian_note, search_clicky_codebase, read_clicky_roadmap): use these ONLY for questions about Steph's specific setup, files, scheduled tasks, plugins, code, or notes. Do NOT use them for general-knowledge questions — for those, answer from your training. Don't preemptively look things up; only call when his question genuinely requires reading his actual files. Examples: 'do I have a scheduled task for X' → call list_scheduled_tasks. 'what's in my note about Y' → search_obsidian then maybe read_obsidian_note. 'what's a CSV file' → answer from training, no tool call. Keep tool use focused.",
+    "RESEARCH TOOLS (list_scheduled_tasks, list_skills, list_plugins, search_obsidian, read_obsidian_note, search_clicky_codebase, read_clicky_roadmap, list_memory_files, read_memory_file, search_gmail, read_email_thread, list_calendar_events, find_next_event, search_slack, read_slack_thread, list_unread_slack, compose_slack_message, read_clipboard, write_clipboard, append_to_bridge): use these ONLY for questions about Steph's specific setup, files, scheduled tasks, plugins, code, notes, emails, calendar, clipboard, or the Cowork Claude bridge. Do NOT use them for general-knowledge questions — for those, answer from your training. Don't preemptively look things up; only call when his question genuinely requires reading his actual data. Examples: 'do I have a scheduled task for X' → list_scheduled_tasks. 'what's in my note about Y' → search_obsidian → maybe read_obsidian_note. 'did I get an email from Lukas today' → search_gmail with query 'from:lukas newer_than:1d'. 'what's on my calendar today' → list_calendar_events with time_range 'today'. 'what's my next meeting' → find_next_event. 'read what I copied' or 'what's on my clipboard' or 'follow the instructions I just copied' → read_clipboard, then act on the contents. 'leave a message for Claude' / 'tell Claude in Cowork that...' / 'write that down for Claude' → append_to_bridge. 'what did Claude say in the bridge' or 'check the bridge' → read_obsidian_note with path 'Bridges/Claude-Marin Channel.md'. 'what's a CSV file' → answer from training, no tool call. Keep tool use focused. For email, default to summarizing search results conversationally — only call read_email_thread if Steph wants the body of a specific message. For calendar, summarize times in a natural way ('Tuesday at 3pm', not '2026-05-05T15:00:00-04:00') and don't read attendee emails unless asked. For clipboard: if it contains instructions or context, follow / act on them as if Steph just spoke them; if it contains data, summarize; if it looks like credentials or secrets, do NOT read them back — acknowledge type and ask what to do. For the bridge: only persist things worth persisting (handoffs, follow-ups, decisions, findings) — not routine conversation. Steph reads the bridge too, so write like a colleague's notes.",
     "RESUME AFTER INTERRUPTION: If you got cut off mid-response and the user then says 'continue' / 'go on' / 'pick up where you left off' / 'keep going' / 'finish that' — DO NOT restart your previous answer from the beginning. Look at your last message in the conversation history, identify exactly where it stopped, and continue from there as if uninterrupted. Don't summarize what you already said; just resume.",
+    "RESUME ACROSS SESSIONS: At the start of any session, your conversation history may include replayed turns from prior Marin sessions (these come through automatically — you don't need to call a tool for them). If Steph says 'continue' / 'where were we' / 'pick that back up' / 'resume what we were doing' / 'keep going on that' and the prior context isn't clear from your replayed history alone, ALSO read the bridge file at `Bridges/Claude-Marin Channel.md` via `read_obsidian_note(path: 'Bridges/Claude-Marin Channel.md')` — Cowork Claude often leaves cross-session handoffs there (in-progress walkthroughs, follow-ups, hotkey references). Read the most recent thread that matches what Steph is asking about and resume from there. Don't read the bridge for routine new questions — only when he's clearly referencing prior work.",
     "Match Steph's energy: he's direct and casual; mirror that, don't over-formalize.",
     // v15p2 Option 3 (2026-05-02): tutor-mode guidance baked into the
     // base persona. Triggers naturally when Steph asks for help
@@ -429,6 +483,236 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
             },
           },
           required: ["name"],
+        },
+      },
+      // ── Gmail (v15p2, 2026-05-02) ───────────────────────────
+      // Read-only access via OAuth refresh token stored in Worker
+      // secrets. Marin can search and summarize, but never send,
+      // archive, label, or modify anything.
+      {
+        type: "function",
+        name: "search_gmail",
+        description: "Search Steph's Gmail. Use when he asks about emails — 'did I get anything from X', 'any new emails from the team', 'what about the email from Lukas yesterday', 'any unread emails today'. Returns up to 10-15 matching threads with sender, subject, date, and snippet. Read-only — cannot send, archive, or modify. After getting results, if Steph wants the full content of a specific thread, call read_email_thread with that thread_id.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Gmail search query, same syntax as the Gmail search bar. Examples: 'from:lukas newer_than:7d' (recent from Lukas), 'is:unread newer_than:1d' (unread since yesterday), 'subject:Q4 budget' (subject contains), 'has:attachment from:janelle' (with attachments from Janelle). Combine with AND/OR (uppercase). Quote phrases.",
+            },
+            max_results: {
+              type: "number",
+              description: "How many threads to return (1–15). Default 10.",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        type: "function",
+        name: "read_email_thread",
+        description: "Read the full content of a specific Gmail thread by ID. Use after search_gmail when Steph wants details from a particular email. Returns each message in the thread with from/to/date/subject/body. Body is truncated at 4000 chars per message.",
+        parameters: {
+          type: "object",
+          properties: {
+            thread_id: {
+              type: "string",
+              description: "The thread_id returned by search_gmail.",
+            },
+          },
+          required: ["thread_id"],
+        },
+      },
+      // ── Calendar (v15p2, 2026-05-02) ────────────────────────
+      // Read-only access to Steph's primary Google Calendar via
+      // its own refresh token (separate from Gmail). Marin can
+      // see what's coming up but cannot create / edit / delete.
+      {
+        type: "function",
+        name: "list_calendar_events",
+        description: "List events on Steph's primary Google Calendar in a given time window. Use when he asks 'what's on my calendar', 'what do I have today', 'am I free Tuesday afternoon', 'what's coming up this week', 'do I have anything with Lukas this week'. Returns events with summary, start/end times, location, attendees, and Meet link. Read-only — cannot create or modify events. For a single 'what's next' answer, prefer find_next_event.",
+        parameters: {
+          type: "object",
+          properties: {
+            time_range: {
+              type: "string",
+              description: "Time window. Allowed: 'today', 'tomorrow', 'this_week', 'next_week', 'next_24_hours', 'next_7_days'. Defaults to 'next_7_days' if omitted or unrecognized.",
+            },
+            query: {
+              type: "string",
+              description: "Optional free-text filter on event title / description / attendees. Skip unless Steph asked about a specific person, project, or topic.",
+            },
+            max_results: {
+              type: "number",
+              description: "Max events to return (1–25). Default 15.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        type: "function",
+        name: "find_next_event",
+        description: "Return Steph's very next upcoming calendar event (any time in the future). Use when he asks 'what's next', 'what's my next meeting', 'when's my next call'. Faster and more focused than list_calendar_events for that specific question.",
+        parameters: {
+          type: "object",
+          properties: {},
+          required: [],
+        },
+      },
+      // ── Slack (v15p2, 2026-05-03) ───────────────────────────
+      // Read-only access to Steph's Kombo Ventures workspace via
+      // a User OAuth token. Marin can search messages and read
+      // threads; she cannot post.
+      {
+        type: "function",
+        name: "search_slack",
+        description: "Search messages across Steph's Slack workspace (all channels, DMs, group DMs he has access to). Use when he asks 'did Lukas message me about X', 'what was decided in the launch channel yesterday', 'find that Slack message about Q4 budget'. Returns up to 10–20 matching messages with sender, channel, timestamp, snippet, and permalink. Read-only — cannot post or edit. IMPORTANT LIMITATIONS: (1) This is SEARCH, not an unread-inbox API. There is NO way to filter by 'is:unread' — that operator silently returns 0 matches. If Steph asks 'any unread messages' or 'what did I miss', tell him you can search recent messages but can't directly see unread state, and ask if he wants you to search a specific person/channel/timeframe. (2) Date operators ONLY accept absolute dates (`after:2026-04-26`) or named relative (`after:yesterday`, `after:Monday`). DO NOT use duration shorthand like `7d`, `1w`, `last_week` — those silently return 0 matches. For 'last week' use `after:2026-04-26` (compute the actual date from current date). (3) `from:` REQUIRES the `@` prefix: `from:@Lukas` works, `from:Lukas` returns 0. Use the person's Slack display name with `@`. Capitalization matches the user's display name. After getting results, if Steph wants the full thread, call `read_slack_thread` with that message's channel_id and ts.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Slack search query. Verified-working examples: 'from:@Lukas after:2026-04-26' (messages from Lukas in the last week), 'in:#launches after:yesterday' (today and yesterday in #launches), 'has:link from:@Janelle' (Janelle's messages with links), '\"Q4 budget\" after:2026-04-01' (phrase search since April 1). Operators: `from:@DisplayName`, `in:#channel`, `after:YYYY-MM-DD` or `after:yesterday`, `before:YYYY-MM-DD`, `has:link`, `has:pin`, `has:reaction`. Quote phrases with double quotes.",
+            },
+            max_results: {
+              type: "number",
+              description: "How many messages to return (1–20). Default 10.",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        type: "function",
+        name: "list_unread_slack",
+        description: "Return Steph's HIGH-SIGNAL unread Slack messages — DMs, group DMs, and channels he's starred/favorited. Use when he asks 'any unread messages', 'what did I miss', 'check my Slack inbox', 'any new DMs', 'anything important I haven't seen'. Public channel firehose is EXCLUDED by default — Steph doesn't want every announcement, just the things he's deliberately opted into via star. Returns each conversation with unread messages (sender + text + timestamp). When summarizing verbally, lead with totals ('you have 4 unreads — 2 DMs, 1 group DM, 1 in a starred channel'), then highlight DMs first, then group DMs, then starred channels. To override the default and include public/private channels too, pass `types: 'im,mpim,public_channel,private_channel'`.",
+        parameters: {
+          type: "object",
+          properties: {
+            types: {
+              type: "string",
+              description: "Comma-separated conversation types to include from users.conversations. Allowed: 'im' (DMs), 'mpim' (group DMs), 'public_channel', 'private_channel'. Default: 'im,mpim'. Note: starred channels are added separately via include_favorites regardless of this filter.",
+            },
+            include_favorites: {
+              type: "boolean",
+              description: "Whether to include channels Steph has starred / favorited in Slack. Default true. Set false to skip starred channels and only use the `types` filter.",
+            },
+            max_channels: {
+              type: "number",
+              description: "Cap on probed conversations (1-20). Default 20. Worker has a hard cap at 20 to stay within Cloudflare's per-invocation subrequest budget.",
+            },
+            messages_per_channel: {
+              type: "number",
+              description: "Max unread messages per channel (1-20). Default 5.",
+            },
+          },
+          required: [],
+        },
+      },
+      {
+        type: "function",
+        name: "compose_slack_message",
+        description: "Compose and send a Slack message AS Steph (chat:write scope). HARD-BLOCK SAFETY: this tool will NEVER auto-send. The flow is two-call: (1) FIRST call WITHOUT `confirmed`, the tool returns a DRAFT response with the channel name and message. You MUST verbally read it back to Steph in the form 'I'd post to #channel: \"message\". Say send it to confirm.' Wait for explicit affirmative (\"yes\", \"send\", \"send it\", \"go ahead\", \"do it\"). (2) SECOND call WITH `confirmed: true` actually posts the message. If Steph asks to edit the draft, call again WITHOUT confirmed:true with the updated text — never carry confirmation across edits. If he says no / cancel / nevermind, do NOT call again with confirmed:true. Use this when Steph asks 'send a Slack message to X', 'reply to that DM with...', 'tell the team in #channel that...'. For posting in a thread, pass the parent message's ts as thread_ts.",
+        parameters: {
+          type: "object",
+          properties: {
+            channel_id: {
+              type: "string",
+              description: "The channel_id to post to (e.g. 'C04XYZ...' or 'D02ABC...'). Get this from search_slack or list_unread_slack results.",
+            },
+            message: {
+              type: "string",
+              description: "The message body to post. Plain text. Slack mrkdwn supported (asterisks for bold, backticks for code). Don't include @mentions of users by name unless Steph explicitly said to — Slack mentions need <@USERID> format which is fragile.",
+            },
+            thread_ts: {
+              type: "string",
+              description: "Optional. If posting as a reply in a thread, the parent message's ts (timestamp). Otherwise omit for a top-level message.",
+            },
+            confirmed: {
+              type: "boolean",
+              description: "MUST be omitted or false on first call. Only set to true AFTER Steph has verbally confirmed the read-back. The tool will NOT send unless this is true.",
+            },
+          },
+          required: ["channel_id", "message"],
+        },
+      },
+      {
+        type: "function",
+        name: "read_slack_thread",
+        description: "Read the full reply thread for a specific Slack message. Use after `search_slack` when Steph wants the surrounding conversation. Returns each reply with sender + timestamp + text.",
+        parameters: {
+          type: "object",
+          properties: {
+            channel_id: {
+              type: "string",
+              description: "The channel_id from a search_slack match (e.g. 'C04XYZ...').",
+            },
+            thread_ts: {
+              type: "string",
+              description: "The parent message timestamp (the `ts` field from a search_slack match).",
+            },
+            max_replies: {
+              type: "number",
+              description: "How many replies to fetch (1–50). Default 20.",
+            },
+          },
+          required: ["channel_id", "thread_ts"],
+        },
+      },
+      // ── Bridge (v15p2, 2026-05-03) ───────────────────────────
+      // Persistent shared channel with Cowork Claude. The bridge
+      // file lives at `Bridges/Claude-Marin Channel.md` in Steph's
+      // Obsidian vault. Marin reads via `read_obsidian_note` (path:
+      // `Bridges/Claude-Marin Channel.md`) and writes via
+      // `append_to_bridge` below.
+      {
+        type: "function",
+        name: "append_to_bridge",
+        description: "Append a message to the Claude ↔ Marin shared bridge file in Steph's Obsidian vault. Use this when (a) Steph asks you to leave a message for Cowork Claude, (b) you want to persist context for the next session, (c) you're handing off a piece of work / a finding / a question for Cowork Claude to pick up later, or (d) Steph wants the conversation logged so he can review it. Each entry is auto-stamped with timestamp + 'Marin → Claude' header. To READ what Cowork Claude has said, call `read_obsidian_note` with path 'Bridges/Claude-Marin Channel.md' — the bridge is just an Obsidian note. Don't use this for routine conversation answers — use it when something is worth persisting. Don't dump giant content here either; for big chunks, suggest Steph paste into Cowork directly.",
+        parameters: {
+          type: "object",
+          properties: {
+            message: {
+              type: "string",
+              description: "The message body to append. Plain markdown OK. Keep it concise and write like a colleague taking notes, not like a system log. Steph reads this file too.",
+            },
+            thread_id: {
+              type: "string",
+              description: "Optional short identifier (e.g. 'slack-connector-debug', 'q4-budget-review') to group multi-turn exchanges. Reuse the same id when continuing a prior thread. Skip if it's a one-off.",
+            },
+          },
+          required: ["message"],
+        },
+      },
+      // ── Clipboard (v15p2, 2026-05-02) ────────────────────────
+      // Lets Steph (or another assistant — looking at you, Claude
+      // in Cowork) push arbitrary context to Marin via the
+      // pasteboard. Steph copies a chunk of text, says "read my
+      // clipboard," Marin pulls it and acts on it.
+      {
+        type: "function",
+        name: "read_clipboard",
+        description: "Read the current contents of Steph's macOS clipboard (NSPasteboard). Use when he says 'read my clipboard', 'what did I just copy', 'check the clipboard', 'what's on my clipboard', 'follow the instructions I just copied', or refers to text he's just copied (often from another AI assistant or chat). Returns the current string on the clipboard. PRIVACY: clipboards often contain sensitive data (API keys, passwords, OAuth tokens, credit-card numbers). If the clipboard content clearly looks like a credential — long random strings, things prefixed with sk-, GOCSPX-, ya29., 1//, pk_, github_pat_, AKIA, Bearer, etc. — DO NOT read it back verbatim. Acknowledge what type of credential it appears to be and ask Steph what he wants you to do with it. Otherwise treat the contents like a normal user instruction or chunk of context: summarize, act on it, or follow whatever directions are inside.",
+        parameters: {
+          type: "object",
+          properties: {},
+          required: [],
+        },
+      },
+      {
+        type: "function",
+        name: "write_clipboard",
+        description: "Write a string to Steph's macOS clipboard (NSPasteboard). Use when (a) Steph asks you to put something on his clipboard so he can paste it elsewhere — typical phrasing: 'put that on my clipboard', 'copy that for me', 'set my clipboard to X', 'make that copyable'; (b) you've produced a chunk of content (a draft email body, a meeting summary, a list of names, a search result excerpt) that's easier for Steph to paste into Cowork Claude or another app than to recite. AFTER writing, briefly tell Steph it's on his clipboard and how he should use it (e.g. 'I put the draft on your clipboard — paste it into Cowork to share with Claude'). Don't write credentials, secrets, or anything sensitive — for those, ask first. Don't write huge content (>10K chars) — for big content, suggest Steph paste directly between apps instead.",
+        parameters: {
+          type: "object",
+          properties: {
+            content: {
+              type: "string",
+              description: "The string to place on the clipboard. Plain text. Will replace whatever's currently on the clipboard.",
+            },
+          },
+          required: ["content"],
         },
       },
     ],
@@ -608,6 +892,987 @@ async function handleFindUIElement(request: Request, env: Env): Promise<Response
     status: 200,
     headers: { "content-type": "application/json" },
   });
+}
+
+// ── Gmail connector (v15p2, 2026-05-02) ──────────────────────────
+//
+// Marin's research tools `search_gmail` and `read_email_thread` call
+// these two routes. The Worker exchanges the long-lived refresh
+// token for a short-lived access token on each request (~150ms
+// overhead) and uses it to hit the Gmail REST API. The access
+// token never leaves this Worker, the refresh token never leaves
+// Cloudflare's secret store.
+//
+// Scope: gmail.readonly. Marin can search + read but not send,
+// archive, label, delete, or modify in any way.
+
+/// Exchange the persisted refresh token for a fresh access token.
+/// Google access tokens are short-lived (~1 hour) so we mint a new
+/// one per request. Could add KV-backed caching for hot paths but
+/// the overhead is small enough to not bother for now.
+async function getGmailAccessToken(env: Env): Promise<string> {
+  const params = new URLSearchParams({
+    client_id: env.GOOGLE_OAUTH_CLIENT_ID,
+    client_secret: env.GOOGLE_OAUTH_CLIENT_SECRET,
+    refresh_token: env.GMAIL_REFRESH_TOKEN,
+    grant_type: "refresh_token",
+  });
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+  if (!tokenResponse.ok) {
+    const errorBody = await tokenResponse.text();
+    throw new Error(`Google token exchange failed (${tokenResponse.status}): ${errorBody}`);
+  }
+  const tokenJSON = await tokenResponse.json() as { access_token?: string };
+  if (!tokenJSON.access_token) {
+    throw new Error("Google token response missing access_token");
+  }
+  return tokenJSON.access_token;
+}
+
+/// /gmail/search — search Gmail and return up to N matching threads
+/// with sender, subject, date, and a snippet for each.
+async function handleGmailSearch(request: Request, env: Env): Promise<Response> {
+  let payload: { query?: string; max_results?: number };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+  const query = (payload.query ?? "").trim();
+  const maxResults = Math.max(1, Math.min(15, payload.max_results ?? 10));
+  if (query.length === 0) {
+    return jsonError("Missing 'query'", 400);
+  }
+
+  let accessToken: string;
+  try {
+    accessToken = await getGmailAccessToken(env);
+  } catch (err) {
+    console.error(`[/gmail/search] token exchange failed: ${err}`);
+    return jsonError(`Gmail auth failed: ${err}`, 500);
+  }
+
+  // Step 1: list matching threads (returns thread IDs only).
+  const listURL = new URL("https://gmail.googleapis.com/gmail/v1/users/me/threads");
+  listURL.searchParams.set("q", query);
+  listURL.searchParams.set("maxResults", String(maxResults));
+  const listResponse = await fetch(listURL.toString(), {
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  if (!listResponse.ok) {
+    const errorBody = await listResponse.text();
+    console.error(`[/gmail/search] list error ${listResponse.status}: ${errorBody}`);
+    return new Response(errorBody, { status: listResponse.status });
+  }
+  const listJSON = await listResponse.json() as { threads?: Array<{ id: string }> };
+  const threadIds = (listJSON.threads ?? []).map((t) => t.id);
+
+  if (threadIds.length === 0) {
+    return new Response(JSON.stringify({ threads: [], count: 0 }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  // Step 2: fetch metadata for each thread (parallel for speed).
+  // We use format=metadata so we get headers (From, Subject, Date)
+  // and snippet without pulling full message bodies — much smaller
+  // payload, faster. Bodies come from /gmail/read-thread later.
+  const detailPromises = threadIds.map(async (id) => {
+    const detailURL = new URL(
+      `https://gmail.googleapis.com/gmail/v1/users/me/threads/${id}`
+    );
+    detailURL.searchParams.set("format", "metadata");
+    detailURL.searchParams.append(
+      "metadataHeaders",
+      "From"
+    );
+    detailURL.searchParams.append("metadataHeaders", "Subject");
+    detailURL.searchParams.append("metadataHeaders", "Date");
+    const r = await fetch(detailURL.toString(), {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    if (!r.ok) return null;
+    const j = await r.json() as {
+      id: string;
+      historyId?: string;
+      messages?: Array<{
+        id: string;
+        snippet?: string;
+        payload?: { headers?: Array<{ name: string; value: string }> };
+      }>;
+    };
+    const messages = j.messages ?? [];
+    if (messages.length === 0) return null;
+    // The latest message in the thread is the most useful summary.
+    const latest = messages[messages.length - 1];
+    const headers = latest.payload?.headers ?? [];
+    const headerLookup = (name: string) =>
+      headers.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value ?? "";
+    return {
+      thread_id: j.id,
+      from: headerLookup("From"),
+      subject: headerLookup("Subject"),
+      date: headerLookup("Date"),
+      snippet: latest.snippet ?? "",
+      message_count: messages.length,
+    };
+  });
+
+  const details = (await Promise.all(detailPromises)).filter((d) => d !== null);
+  return new Response(
+    JSON.stringify({ threads: details, count: details.length }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+/// /gmail/read-thread — read a full thread by ID, return messages
+/// with sender, date, and decoded body text.
+async function handleGmailReadThread(request: Request, env: Env): Promise<Response> {
+  let payload: { thread_id?: string };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+  const threadId = (payload.thread_id ?? "").trim();
+  if (threadId.length === 0) {
+    return jsonError("Missing 'thread_id'", 400);
+  }
+
+  let accessToken: string;
+  try {
+    accessToken = await getGmailAccessToken(env);
+  } catch (err) {
+    return jsonError(`Gmail auth failed: ${err}`, 500);
+  }
+
+  const url = new URL(
+    `https://gmail.googleapis.com/gmail/v1/users/me/threads/${threadId}`
+  );
+  url.searchParams.set("format", "full");
+  const r = await fetch(url.toString(), {
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  if (!r.ok) {
+    const errorBody = await r.text();
+    return new Response(errorBody, { status: r.status });
+  }
+  const j = await r.json() as {
+    id: string;
+    messages?: Array<{
+      id: string;
+      snippet?: string;
+      payload?: {
+        headers?: Array<{ name: string; value: string }>;
+        body?: { data?: string };
+        parts?: Array<{ mimeType?: string; body?: { data?: string }; parts?: any[] }>;
+      };
+    }>;
+  };
+
+  const messages = (j.messages ?? []).map((msg) => {
+    const headers = msg.payload?.headers ?? [];
+    const headerLookup = (name: string) =>
+      headers.find((h) => h.name.toLowerCase() === name.toLowerCase())?.value ?? "";
+    const body = extractTextBody(msg.payload);
+    return {
+      from: headerLookup("From"),
+      to: headerLookup("To"),
+      date: headerLookup("Date"),
+      subject: headerLookup("Subject"),
+      snippet: msg.snippet ?? "",
+      body: body.length > 4000 ? body.slice(0, 4000) + "\n[truncated]" : body,
+    };
+  });
+
+  return new Response(
+    JSON.stringify({ thread_id: j.id, messages, count: messages.length }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+/// Walk a Gmail message payload tree and return the best plain-text
+/// body we can find. Falls back to HTML stripped of tags if no
+/// text/plain part exists. Decodes from base64url Gmail style.
+function extractTextBody(payload: any): string {
+  if (!payload) return "";
+  // Direct body on the payload itself.
+  if (payload.body?.data && (!payload.parts || payload.parts.length === 0)) {
+    return decodeGmailBase64(payload.body.data);
+  }
+  // Walk parts, prefer text/plain.
+  const parts: any[] = payload.parts ?? [];
+  // First pass: text/plain.
+  for (const part of parts) {
+    if (part.mimeType === "text/plain" && part.body?.data) {
+      return decodeGmailBase64(part.body.data);
+    }
+    // Multipart can nest.
+    if (part.parts) {
+      const nested = extractTextBody(part);
+      if (nested) return nested;
+    }
+  }
+  // Second pass: text/html with tag strip.
+  for (const part of parts) {
+    if (part.mimeType === "text/html" && part.body?.data) {
+      const html = decodeGmailBase64(part.body.data);
+      return html
+        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+        .replace(/<[^>]+>/g, " ")
+        .replace(/&nbsp;/g, " ")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, "\"")
+        .replace(/\s+/g, " ")
+        .trim();
+    }
+  }
+  return "";
+}
+
+function decodeGmailBase64(data: string): string {
+  // Gmail uses URL-safe base64 with no padding.
+  const standardized = data.replace(/-/g, "+").replace(/_/g, "/");
+  // atob returns a Latin-1 string; we then decode UTF-8 manually.
+  const binaryString = atob(standardized + "==".slice(0, (4 - standardized.length % 4) % 4));
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+/// ─────────────────────────────────────────────────────────────────
+/// Calendar connector (v15p2, 2026-05-02)
+///
+/// Read-only Google Calendar access. Mirrors the Gmail pattern:
+/// CALENDAR_REFRESH_TOKEN is exchanged for a short-lived access
+/// token on each request and used against the Calendar v3 API.
+/// Steph's primary calendar only — the assistant doesn't need to
+/// poke around in shared calendars yet.
+/// ─────────────────────────────────────────────────────────────────
+
+async function getCalendarAccessToken(env: Env): Promise<string> {
+  const params = new URLSearchParams({
+    client_id: env.GOOGLE_OAUTH_CLIENT_ID,
+    client_secret: env.GOOGLE_OAUTH_CLIENT_SECRET,
+    refresh_token: env.CALENDAR_REFRESH_TOKEN,
+    grant_type: "refresh_token",
+  });
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+  if (!tokenResponse.ok) {
+    const errorBody = await tokenResponse.text();
+    throw new Error(`Calendar token exchange failed (${tokenResponse.status}): ${errorBody}`);
+  }
+  const tokenJSON = await tokenResponse.json() as { access_token?: string };
+  if (!tokenJSON.access_token) {
+    throw new Error("Calendar token response missing access_token");
+  }
+  return tokenJSON.access_token;
+}
+
+/// Resolve a free-form time_range string (e.g. "today",
+/// "this_week", "next_7_days") into ISO 8601 timeMin/timeMax bounds.
+/// Anything unrecognized falls back to "next_7_days" so Marin
+/// gets a useful answer rather than a 400.
+function resolveCalendarRange(rangeRaw: string): { timeMin: string; timeMax: string; label: string } {
+  const range = (rangeRaw || "").trim().toLowerCase().replace(/\s+/g, "_");
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+  const endOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+  switch (range) {
+    case "today": {
+      return { timeMin: now.toISOString(), timeMax: endOfToday.toISOString(), label: "today" };
+    }
+    case "tomorrow": {
+      const start = new Date(startOfToday); start.setDate(start.getDate() + 1);
+      const end = new Date(endOfToday); end.setDate(end.getDate() + 1);
+      return { timeMin: start.toISOString(), timeMax: end.toISOString(), label: "tomorrow" };
+    }
+    case "this_week": {
+      // Sun..Sat — match Google Calendar default.
+      const dow = startOfToday.getDay();
+      const start = new Date(startOfToday); start.setDate(start.getDate() - dow);
+      const end = new Date(start); end.setDate(end.getDate() + 7); end.setMilliseconds(-1);
+      return { timeMin: now.toISOString(), timeMax: end.toISOString(), label: "this_week" };
+    }
+    case "next_week": {
+      const dow = startOfToday.getDay();
+      const start = new Date(startOfToday); start.setDate(start.getDate() - dow + 7);
+      const end = new Date(start); end.setDate(end.getDate() + 7); end.setMilliseconds(-1);
+      return { timeMin: start.toISOString(), timeMax: end.toISOString(), label: "next_week" };
+    }
+    case "next_24_hours":
+    case "24_hours": {
+      const end = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+      return { timeMin: now.toISOString(), timeMax: end.toISOString(), label: "next_24_hours" };
+    }
+    case "next_7_days":
+    case "7_days":
+    default: {
+      const end = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+      return { timeMin: now.toISOString(), timeMax: end.toISOString(), label: "next_7_days" };
+    }
+  }
+}
+
+/// /calendar/list-events — list events on Steph's primary calendar
+/// in the requested window. Returns concise event records: summary,
+/// start, end, location, attendees, hangout link.
+async function handleCalendarListEvents(request: Request, env: Env): Promise<Response> {
+  let payload: { time_range?: string; max_results?: number; query?: string };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+  const maxResults = Math.max(1, Math.min(25, payload.max_results ?? 15));
+  const { timeMin, timeMax, label } = resolveCalendarRange(payload.time_range ?? "next_7_days");
+  const query = (payload.query ?? "").trim();
+
+  let accessToken: string;
+  try {
+    accessToken = await getCalendarAccessToken(env);
+  } catch (err) {
+    console.error(`[/calendar/list-events] token exchange failed: ${err}`);
+    return jsonError(`Calendar auth failed: ${err}`, 500);
+  }
+
+  const url = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
+  url.searchParams.set("timeMin", timeMin);
+  url.searchParams.set("timeMax", timeMax);
+  url.searchParams.set("maxResults", String(maxResults));
+  url.searchParams.set("singleEvents", "true");
+  url.searchParams.set("orderBy", "startTime");
+  if (query.length > 0) {
+    url.searchParams.set("q", query);
+  }
+
+  const response = await fetch(url.toString(), {
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/calendar/list-events] error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, { status: response.status });
+  }
+  const j = await response.json() as {
+    items?: Array<{
+      id: string;
+      summary?: string;
+      description?: string;
+      location?: string;
+      status?: string;
+      start?: { dateTime?: string; date?: string; timeZone?: string };
+      end?: { dateTime?: string; date?: string; timeZone?: string };
+      attendees?: Array<{ email?: string; displayName?: string; responseStatus?: string }>;
+      hangoutLink?: string;
+      htmlLink?: string;
+      organizer?: { email?: string; displayName?: string };
+    }>;
+  };
+
+  const events = (j.items ?? []).map(summarizeCalendarEvent);
+  return new Response(
+    JSON.stringify({ time_range: label, events, count: events.length }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+/// /calendar/find-next — find the very next upcoming event on the
+/// primary calendar (any time in the future). Convenience wrapper
+/// over list-events with maxResults=1.
+async function handleCalendarFindNext(_request: Request, env: Env): Promise<Response> {
+  let accessToken: string;
+  try {
+    accessToken = await getCalendarAccessToken(env);
+  } catch (err) {
+    console.error(`[/calendar/find-next] token exchange failed: ${err}`);
+    return jsonError(`Calendar auth failed: ${err}`, 500);
+  }
+
+  const url = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
+  url.searchParams.set("timeMin", new Date().toISOString());
+  url.searchParams.set("maxResults", "1");
+  url.searchParams.set("singleEvents", "true");
+  url.searchParams.set("orderBy", "startTime");
+
+  const response = await fetch(url.toString(), {
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/calendar/find-next] error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, { status: response.status });
+  }
+  const j = await response.json() as { items?: Array<any> };
+  const items = j.items ?? [];
+  if (items.length === 0) {
+    return new Response(
+      JSON.stringify({ event: null, message: "No upcoming events on primary calendar" }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+  return new Response(
+    JSON.stringify({ event: summarizeCalendarEvent(items[0]) }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+function summarizeCalendarEvent(ev: any): Record<string, unknown> {
+  const start = ev.start?.dateTime ?? ev.start?.date ?? "";
+  const end = ev.end?.dateTime ?? ev.end?.date ?? "";
+  const allDay = !ev.start?.dateTime && !!ev.start?.date;
+  const attendees = (ev.attendees ?? [])
+    .filter((a: any) => a.email && !a.email.endsWith(".calendar.google.com"))
+    .map((a: any) => ({
+      email: a.email,
+      name: a.displayName ?? "",
+      status: a.responseStatus ?? "",
+    }));
+  return {
+    id: ev.id,
+    summary: ev.summary ?? "(no title)",
+    description: ev.description
+      ? (ev.description.length > 600 ? ev.description.slice(0, 600) + "…" : ev.description)
+      : "",
+    location: ev.location ?? "",
+    start,
+    end,
+    all_day: allDay,
+    timezone: ev.start?.timeZone ?? "",
+    status: ev.status ?? "",
+    attendees,
+    organizer: ev.organizer?.email ?? "",
+    hangout_link: ev.hangoutLink ?? "",
+    html_link: ev.htmlLink ?? "",
+  };
+}
+
+/// ─────────────────────────────────────────────────────────────────
+/// Slack connector (v15p2, 2026-05-03)
+///
+/// User-token-scoped read access to Steph's Kombo Ventures Slack.
+/// Scopes: search:read, channels:history, groups:history,
+/// im:history, mpim:history, users:read, channels:read,
+/// groups:read. Marin can search messages and read threads;
+/// posting/editing is intentionally out of scope.
+///
+/// We resolve channel IDs and user IDs to human names where useful
+/// — the raw API returns IDs like U07ABC and C04XYZ which Marin
+/// can't usefully read aloud. We cache user/channel name lookups
+/// per-request (single-pass, no KV) to avoid hammering the Slack
+/// API on multi-hit searches.
+/// ─────────────────────────────────────────────────────────────────
+
+interface SlackNameCache {
+  users: Map<string, string>;
+  channels: Map<string, string>;
+}
+
+async function resolveSlackUserName(
+  userId: string,
+  cache: SlackNameCache,
+  env: Env
+): Promise<string> {
+  if (!userId) return "";
+  const cached = cache.users.get(userId);
+  if (cached !== undefined) return cached;
+  try {
+    const r = await fetch(
+      `https://slack.com/api/users.info?user=${encodeURIComponent(userId)}`,
+      { headers: { authorization: `Bearer ${env.SLACK_USER_TOKEN}` } }
+    );
+    const j = await r.json() as { ok?: boolean; user?: { real_name?: string; name?: string; profile?: { display_name?: string; real_name?: string } } };
+    const name = j.user?.profile?.display_name
+      || j.user?.profile?.real_name
+      || j.user?.real_name
+      || j.user?.name
+      || userId;
+    cache.users.set(userId, name);
+    return name;
+  } catch {
+    cache.users.set(userId, userId);
+    return userId;
+  }
+}
+
+async function resolveSlackChannelName(
+  channelId: string,
+  cache: SlackNameCache,
+  env: Env
+): Promise<string> {
+  if (!channelId) return "";
+  const cached = cache.channels.get(channelId);
+  if (cached !== undefined) return cached;
+  try {
+    const r = await fetch(
+      `https://slack.com/api/conversations.info?channel=${encodeURIComponent(channelId)}`,
+      { headers: { authorization: `Bearer ${env.SLACK_USER_TOKEN}` } }
+    );
+    const j = await r.json() as {
+      ok?: boolean;
+      channel?: { name?: string; is_im?: boolean; is_mpim?: boolean; user?: string };
+    };
+    let name = j.channel?.name ?? channelId;
+    if (j.channel?.is_im && j.channel.user) {
+      // DM — represent as @username
+      const userName = await resolveSlackUserName(j.channel.user, cache, env);
+      name = `DM:${userName}`;
+    } else if (j.channel?.is_mpim) {
+      name = `group-DM:${j.channel.name ?? channelId}`;
+    } else if (j.channel?.name) {
+      name = `#${j.channel.name}`;
+    }
+    cache.channels.set(channelId, name);
+    return name;
+  } catch {
+    cache.channels.set(channelId, channelId);
+    return channelId;
+  }
+}
+
+/// /slack/search — search messages with the search.messages API and
+/// return a compact list of matches with sender, channel, timestamp,
+/// and snippet text. Channel and user IDs are resolved to names.
+async function handleSlackSearch(request: Request, env: Env): Promise<Response> {
+  let payload: { query?: string; max_results?: number };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+  const query = (payload.query ?? "").trim();
+  const maxResults = Math.max(1, Math.min(20, payload.max_results ?? 10));
+  if (query.length === 0) {
+    return jsonError("Missing 'query'", 400);
+  }
+
+  const url = new URL("https://slack.com/api/search.messages");
+  url.searchParams.set("query", query);
+  url.searchParams.set("count", String(maxResults));
+  url.searchParams.set("sort", "timestamp");
+  url.searchParams.set("sort_dir", "desc");
+
+  const response = await fetch(url.toString(), {
+    headers: { authorization: `Bearer ${env.SLACK_USER_TOKEN}` },
+  });
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/slack/search] error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, { status: response.status });
+  }
+  const j = await response.json() as {
+    ok?: boolean;
+    error?: string;
+    messages?: {
+      total?: number;
+      matches?: Array<{
+        ts?: string;
+        user?: string;
+        username?: string;
+        text?: string;
+        permalink?: string;
+        channel?: { id?: string; name?: string };
+      }>;
+    };
+  };
+  if (!j.ok) {
+    return jsonError(`Slack API error: ${j.error ?? "unknown"}`, 502);
+  }
+
+  const cache: SlackNameCache = { users: new Map(), channels: new Map() };
+  const matches = j.messages?.matches ?? [];
+  const summarized = await Promise.all(matches.map(async (m) => {
+    const channelDisplay = m.channel?.id
+      ? (m.channel.name ? `#${m.channel.name}` : await resolveSlackChannelName(m.channel.id, cache, env))
+      : "";
+    const senderDisplay = m.username
+      || (m.user ? await resolveSlackUserName(m.user, cache, env) : "");
+    return {
+      ts: m.ts ?? "",
+      timestamp_human: m.ts ? new Date(parseFloat(m.ts) * 1000).toISOString() : "",
+      sender: senderDisplay,
+      channel: channelDisplay,
+      channel_id: m.channel?.id ?? "",
+      text: m.text ?? "",
+      permalink: m.permalink ?? "",
+    };
+  }));
+
+  return new Response(
+    JSON.stringify({
+      query,
+      total: j.messages?.total ?? matches.length,
+      matches: summarized,
+      count: summarized.length,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+/// /slack/read-thread — read full replies for a given parent message.
+/// Inputs: channel_id + thread_ts (the parent message timestamp).
+/// Returns each reply with sender + timestamp + text.
+async function handleSlackReadThread(request: Request, env: Env): Promise<Response> {
+  let payload: { channel_id?: string; thread_ts?: string; max_replies?: number };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+  const channelId = (payload.channel_id ?? "").trim();
+  const threadTs = (payload.thread_ts ?? "").trim();
+  const maxReplies = Math.max(1, Math.min(50, payload.max_replies ?? 20));
+  if (!channelId || !threadTs) {
+    return jsonError("Missing 'channel_id' or 'thread_ts'", 400);
+  }
+
+  const url = new URL("https://slack.com/api/conversations.replies");
+  url.searchParams.set("channel", channelId);
+  url.searchParams.set("ts", threadTs);
+  url.searchParams.set("limit", String(maxReplies));
+
+  const response = await fetch(url.toString(), {
+    headers: { authorization: `Bearer ${env.SLACK_USER_TOKEN}` },
+  });
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/slack/read-thread] error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, { status: response.status });
+  }
+  const j = await response.json() as {
+    ok?: boolean;
+    error?: string;
+    messages?: Array<{ ts?: string; user?: string; text?: string }>;
+  };
+  if (!j.ok) {
+    return jsonError(`Slack API error: ${j.error ?? "unknown"}`, 502);
+  }
+
+  const cache: SlackNameCache = { users: new Map(), channels: new Map() };
+  const channelName = await resolveSlackChannelName(channelId, cache, env);
+  const messages = await Promise.all((j.messages ?? []).map(async (m) => ({
+    ts: m.ts ?? "",
+    timestamp_human: m.ts ? new Date(parseFloat(m.ts) * 1000).toISOString() : "",
+    sender: m.user ? await resolveSlackUserName(m.user, cache, env) : "",
+    text: m.text ?? "",
+  })));
+
+  return new Response(
+    JSON.stringify({
+      channel: channelName,
+      channel_id: channelId,
+      thread_ts: threadTs,
+      messages,
+      count: messages.length,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+/// /slack/unread-inbox — return Steph's actual unread inbox.
+///
+/// Uses three Slack API calls per channel: list conversations,
+/// fetch info (for `last_read`), fetch history (oldest=last_read).
+/// We focus on DMs + group DMs + channels he's a member of, since
+/// "unread" only meaningfully applies there.
+///
+/// Performance: ~30-100 channels per workspace, parallelized.
+/// Slack tier-3 rate limit (50/min) is plenty for a per-call
+/// inbox fetch, even if multiple channels need history pulls.
+async function handleSlackUnreadInbox(request: Request, env: Env): Promise<Response> {
+  let payload: {
+    types?: string;          // CSV of: im,mpim,public_channel,private_channel
+    max_channels?: number;   // cap on probed/returned channels (default 20)
+    messages_per_channel?: number; // cap per channel (default 5)
+    include_favorites?: boolean; // include starred/favorited channels (default true)
+  };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    payload = {};
+  }
+  // v15p2 (2026-05-03): default to high-signal conversations only —
+  // DMs, group DMs, and channels Steph has explicitly starred /
+  // favorited in Slack. Public-channel firehose excluded by
+  // default — too noisy. Pass `types` explicitly to override.
+  const types = (payload.types ?? "im,mpim").trim();
+  const includeFavorites = payload.include_favorites !== false; // default true
+  // Subrequest math: 1 (list) + 1 (stars.list) + N (info) + min(N,unread)*1 (history)
+  // + ~10 name resolutions. Cap N at 20 so worst-case is
+  // 1 + 1 + 20 + 20 + 10 ≈ 52, within Cloudflare's 50-per-invocation
+  // budget. Tight but works.
+  const maxChannels = Math.max(1, Math.min(20, payload.max_channels ?? 20));
+  const messagesPerChannel = Math.max(1, Math.min(20, payload.messages_per_channel ?? 5));
+
+  // Step 1 — list conversations of requested types.
+  const listURL = new URL("https://slack.com/api/users.conversations");
+  listURL.searchParams.set("types", types);
+  listURL.searchParams.set("exclude_archived", "true");
+  listURL.searchParams.set("limit", String(Math.min(maxChannels, 100)));
+  const listResp = await fetch(listURL.toString(), {
+    headers: { authorization: `Bearer ${env.SLACK_USER_TOKEN}` },
+  });
+  if (!listResp.ok) {
+    const err = await listResp.text();
+    return new Response(err, { status: listResp.status });
+  }
+  const listJson = await listResp.json() as {
+    ok?: boolean;
+    error?: string;
+    channels?: Array<{ id: string; name?: string; is_im?: boolean; is_mpim?: boolean; user?: string }>;
+  };
+  if (!listJson.ok) {
+    return jsonError(`Slack list error: ${listJson.error ?? "unknown"}`, 502);
+  }
+  const recentChannels = listJson.channels ?? [];
+
+  // Step 1.5 — pull starred / favorited items from stars.list.
+  // Slack's UI calls these "favorites" now but the API is still
+  // stars.list. Item types we care about: 'channel' (public
+  // channels), 'group' (private channels), 'im' (DMs starred
+  // individually), 'mpim' (group DMs starred individually). We
+  // skip 'message' and 'file' types — those star specific
+  // content, not whole conversations.
+  let starredIds: string[] = [];
+  if (includeFavorites) {
+    const starsURL = new URL("https://slack.com/api/stars.list");
+    starsURL.searchParams.set("limit", "200");
+    const starsResp = await fetch(starsURL.toString(), {
+      headers: { authorization: `Bearer ${env.SLACK_USER_TOKEN}` },
+    });
+    if (starsResp.ok) {
+      const starsJson = await starsResp.json() as {
+        ok?: boolean;
+        items?: Array<{ type?: string; channel?: string }>;
+      };
+      if (starsJson.ok) {
+        const conversationStarTypes = new Set(["channel", "group", "im", "mpim"]);
+        starredIds = (starsJson.items ?? [])
+          .filter((it) => it.type && it.channel && conversationStarTypes.has(it.type))
+          .map((it) => it.channel as string);
+      }
+    }
+    // Silent failure here is fine — falls back to types-only list.
+  }
+
+  // Build the final probed list, PRIORITIZING starred items.
+  // Without prioritization, Steph's starred DMs could be silently
+  // dropped behind unstarred recent DMs that happened to come
+  // first from users.conversations. Order: stars first (uniqued),
+  // then fill remaining slots from the recent-conversations list.
+  const seen = new Set<string>();
+  const orderedIds: string[] = [];
+  for (const id of starredIds) {
+    if (!seen.has(id)) {
+      seen.add(id);
+      orderedIds.push(id);
+    }
+  }
+  for (const ch of recentChannels) {
+    if (orderedIds.length >= maxChannels) break;
+    if (!seen.has(ch.id)) {
+      seen.add(ch.id);
+      orderedIds.push(ch.id);
+    }
+  }
+  const channels = orderedIds.slice(0, maxChannels).map((id) => ({ id }));
+
+  // Step 2 — fetch each channel's info to read `last_read`. In
+  // parallel.
+  const cache: SlackNameCache = { users: new Map(), channels: new Map() };
+  const inboxRaw = await Promise.all(channels.map(async (ch) => {
+    const infoURL = new URL("https://slack.com/api/conversations.info");
+    infoURL.searchParams.set("channel", ch.id);
+    const infoResp = await fetch(infoURL.toString(), {
+      headers: { authorization: `Bearer ${env.SLACK_USER_TOKEN}` },
+    });
+    if (!infoResp.ok) return null;
+    const info = await infoResp.json() as {
+      ok?: boolean;
+      channel?: {
+        id: string;
+        name?: string;
+        last_read?: string;
+        unread_count_display?: number;
+        is_im?: boolean;
+        is_mpim?: boolean;
+        user?: string;
+      };
+    };
+    if (!info.ok || !info.channel) return null;
+    const lastRead = info.channel.last_read;
+    if (!lastRead || lastRead === "0") {
+      // Never read or unknown — skip rather than dump everything.
+      return null;
+    }
+
+    // Step 3 — fetch history with oldest=last_read. If empty, no
+    // unreads. The `oldest` param is exclusive on Slack's side, so
+    // anything after the last-read ts is genuine unread.
+    const histURL = new URL("https://slack.com/api/conversations.history");
+    histURL.searchParams.set("channel", ch.id);
+    histURL.searchParams.set("oldest", lastRead);
+    histURL.searchParams.set("limit", String(messagesPerChannel));
+    histURL.searchParams.set("inclusive", "false");
+    const histResp = await fetch(histURL.toString(), {
+      headers: { authorization: `Bearer ${env.SLACK_USER_TOKEN}` },
+    });
+    if (!histResp.ok) return null;
+    const hist = await histResp.json() as {
+      ok?: boolean;
+      messages?: Array<{ ts?: string; user?: string; text?: string; bot_id?: string; subtype?: string }>;
+      has_more?: boolean;
+    };
+    // Filter out administrative noise — channel join/leave/topic
+    // changes etc. that Slack counts as messages but aren't real
+    // content. Steph doesn't want Marin reading "ClickUp has
+    // joined the channel" as if it were an unread message.
+    const noiseSubtypes = new Set([
+      "channel_join", "channel_leave",
+      "channel_archive", "channel_unarchive",
+      "channel_topic", "channel_purpose", "channel_name",
+      "bot_add", "bot_remove",
+      "pinned_item", "unpinned_item",
+      "reminder_add",
+    ]);
+    const rawMessages = (hist.messages ?? []).filter((m) =>
+      !m.subtype || !noiseSubtypes.has(m.subtype)
+    );
+    if (rawMessages.length === 0) return null;
+
+    const messages = await Promise.all(rawMessages.map(async (m) => ({
+      ts: m.ts ?? "",
+      timestamp_human: m.ts ? new Date(parseFloat(m.ts) * 1000).toISOString() : "",
+      sender: m.user ? await resolveSlackUserName(m.user, cache, env) : (m.bot_id ? `bot:${m.bot_id}` : ""),
+      text: m.text ?? "",
+    })));
+    // Slack returns history newest-first; reverse so the inbox
+    // reads chronologically.
+    messages.reverse();
+
+    const channelDisplay = await resolveSlackChannelName(ch.id, cache, env);
+    return {
+      channel: channelDisplay,
+      channel_id: ch.id,
+      unread_count: info.channel.unread_count_display ?? messages.length,
+      has_more: hist.has_more === true,
+      messages,
+    };
+  }));
+
+  const inbox = inboxRaw.filter((x): x is NonNullable<typeof x> => x !== null);
+  // Sort: most recent activity first. Use the last message's ts
+  // per channel as the sort key; channels with newer activity bubble up.
+  inbox.sort((a, b) => {
+    const at = a.messages[a.messages.length - 1]?.ts ?? "0";
+    const bt = b.messages[b.messages.length - 1]?.ts ?? "0";
+    return parseFloat(bt) - parseFloat(at);
+  });
+  const trimmed = inbox.slice(0, maxChannels);
+  const totalUnread = trimmed.reduce((sum, c) => sum + c.unread_count, 0);
+
+  return new Response(
+    JSON.stringify({
+      total_unread: totalUnread,
+      channel_count: trimmed.length,
+      truncated: inbox.length > maxChannels,
+      inbox: trimmed,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+/// /slack/post-message — send a message as Steph. Hard-blocks
+/// auto-send: requires `confirmed: true`. If `confirmed` is missing
+/// or false, returns a "DRAFT" response with the proposed payload
+/// so Marin can read it back to Steph for verbal confirmation.
+/// Only when called a second time with `confirmed: true` does the
+/// actual `chat.postMessage` API call fire.
+async function handleSlackPostMessage(request: Request, env: Env): Promise<Response> {
+  let payload: { channel_id?: string; message?: string; thread_ts?: string; confirmed?: boolean };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+  const channelId = (payload.channel_id ?? "").trim();
+  const message = (payload.message ?? "").trim();
+  const threadTs = (payload.thread_ts ?? "").trim();
+  const confirmed = payload.confirmed === true;
+
+  if (!channelId || !message) {
+    return jsonError("Missing 'channel_id' or 'message'", 400);
+  }
+
+  // Resolve the channel name for the read-back so Marin can verbalize
+  // it ("post 'X' to #channel-name").
+  const cache: SlackNameCache = { users: new Map(), channels: new Map() };
+  const channelDisplay = await resolveSlackChannelName(channelId, cache, env);
+
+  if (!confirmed) {
+    return new Response(
+      JSON.stringify({
+        status: "draft",
+        action_required: "READ_BACK_AND_CONFIRM",
+        channel: channelDisplay,
+        channel_id: channelId,
+        message,
+        thread_ts: threadTs || null,
+        instructions_for_assistant: `DRAFT — read this back to Steph: "I'd post to ${channelDisplay}: '${message}'${threadTs ? " (as a reply in thread)" : ""}. Say 'send it' to confirm." DO NOT call this tool again with confirmed:true unless Steph explicitly confirms with 'yes', 'send', 'send it', 'go ahead', 'do it', or similar affirmative. If he asks you to change anything, call this tool again with the updated message and confirmed:false.`,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  // Confirmed path — actually post.
+  const formBody = new URLSearchParams();
+  formBody.set("channel", channelId);
+  formBody.set("text", message);
+  if (threadTs) formBody.set("thread_ts", threadTs);
+
+  const response = await fetch("https://slack.com/api/chat.postMessage", {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.SLACK_USER_TOKEN}`,
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: formBody.toString(),
+  });
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/slack/post-message] error ${response.status}: ${errorBody}`);
+    return new Response(errorBody, { status: response.status });
+  }
+  const j = await response.json() as { ok?: boolean; error?: string; ts?: string; channel?: string };
+  if (!j.ok) {
+    return jsonError(`Slack postMessage error: ${j.error ?? "unknown"}`, 502);
+  }
+
+  return new Response(
+    JSON.stringify({
+      status: "sent",
+      channel: channelDisplay,
+      channel_id: j.channel ?? channelId,
+      ts: j.ts ?? "",
+      message,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
 }
 
 async function handleTTS(request: Request, env: Env): Promise<Response> {

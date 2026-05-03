@@ -252,6 +252,22 @@ struct BlueCursorView: View {
     /// (audio-reactive thickness + opacity), and processing (faster
     /// heartbeat pulse) without falling back to the cursor waveform.
     private var lineModeForVoiceState: EdgeLineIndicator.LineMode {
+        // v15p2 (2026-05-03): when Marin owns the mic, derive line
+        // mode from HER session state. The legacy voiceState only
+        // tracks buddyDictationManager and stays .idle during Marin
+        // sessions, which made the indicator a solid pink line with
+        // no audio reactivity. This bridges the gap.
+        if companionManager.isRealtimeModeActive
+            && !companionManager.isRealtimeSuspendedByOtherMode {
+            switch companionManager.realtimeSessionState {
+            case .listening:
+                return .listening
+            case .responding:
+                return .processing
+            case .connecting, .idle, .errored:
+                return .idle
+            }
+        }
         switch companionManager.voiceState {
         case .listening:
             return .listening
@@ -260,6 +276,19 @@ struct BlueCursorView: View {
         case .idle, .responding:
             return .idle
         }
+    }
+
+    /// v15p2 (2026-05-03): pick the right audio source for the
+    /// indicator's voice-reactive amplitude. When Marin owns the
+    /// mic (Realtime active and not suspended-by-other-mode), use
+    /// her input RMS. Otherwise fall back to the legacy
+    /// buddyDictationManager level used by VTT/Typing/etc.
+    private var indicatorAudioPowerLevel: CGFloat {
+        if companionManager.isRealtimeModeActive
+            && !companionManager.isRealtimeSuspendedByOtherMode {
+            return companionManager.realtimeInputAudioLevel
+        }
+        return companionManager.currentAudioPowerLevel
     }
 
     /// v15g: which non-cursor styles fully replace the waveform/spinner.
@@ -277,10 +306,16 @@ struct BlueCursorView: View {
             || companionManager.isPolishHotkeyModifierCaptureModeActive {
             return DS.Colors.overlayCursorCyan
         }
-        // v15p2 (2026-05-02): Realtime mode (Fn+Opt) → magenta.
-        // Checked first because Realtime owns the audio device while
-        // active and cannot be co-active with anything else.
-        if companionManager.isRealtimeModeActive {
+        // v15p2 (2026-05-02): Realtime mode → magenta. Checked first
+        // when Marin owns the audio device.
+        // v15p2 hotfix (2026-05-03): when Marin is suspended-by-
+        // other-mode (Steph holding VTT/Typing/Polish/Capture while
+        // hands-free is active), the OTHER mode's tint should win
+        // so Steph gets visual confirmation he's hitting the right
+        // hotkey. The fallthrough below picks up that mode's color;
+        // magenta resumes once the other-mode chord releases.
+        if companionManager.isRealtimeModeActive
+            && !companionManager.isRealtimeSuspendedByOtherMode {
             return DS.Colors.overlayCursorMagenta
         }
         if companionManager.isCaptureToInboxModeActive {
@@ -519,7 +554,7 @@ struct BlueCursorView: View {
             CursorPresenceDot(
                 tint: indicatorTint,
                 mode: dotModeForVoiceState,
-                audioPowerLevel: companionManager.currentAudioPowerLevel
+                audioPowerLevel: indicatorAudioPowerLevel
             )
                 .opacity(
                     cursorIndicatorStyle == "cursorDot" && buddyIsVisibleOnThisScreen
@@ -546,7 +581,7 @@ struct BlueCursorView: View {
                 orientation: .bottom,
                 tint: indicatorTint,
                 mode: lineModeForVoiceState,
-                audioPowerLevel: companionManager.currentAudioPowerLevel
+                audioPowerLevel: indicatorAudioPowerLevel
             )
                 .opacity(
                     cursorIndicatorStyle == "bottomEdgeLine" && buddyIsVisibleOnThisScreen
@@ -564,7 +599,7 @@ struct BlueCursorView: View {
                 orientation: .right,
                 tint: indicatorTint,
                 mode: lineModeForVoiceState,
-                audioPowerLevel: companionManager.currentAudioPowerLevel
+                audioPowerLevel: indicatorAudioPowerLevel
             )
                 .opacity(
                     cursorIndicatorStyle == "sideStrip" && buddyIsVisibleOnThisScreen
@@ -585,7 +620,7 @@ struct BlueCursorView: View {
             // Order is defensive — the shortcut layer already prevents
             // these flags from overlapping.
             BlueCursorWaveformView(
-                audioPowerLevel: companionManager.currentAudioPowerLevel,
+                audioPowerLevel: indicatorAudioPowerLevel,
                 tint: currentCursorTint,
                 captureTrigger: companionManager.lastScreenshotCaptureAt
             )
@@ -680,8 +715,14 @@ struct BlueCursorView: View {
         // v15i: capture the active mode tint while in .listening so the
         // indicator can keep showing that color through .processing
         // (when the underlying mode flag has reset to false).
+        // v15p2 hotfix (2026-05-03): always update on .listening entry,
+        // including when the active tint is blue (Base PTT). Previously
+        // we only stored non-blue tints, which left the cached value
+        // stale across mode switches — Base PTT after VTT would inherit
+        // VTT's purple on the spinner. Mirroring the live tint each
+        // time we enter .listening keeps the spinner accurate.
         .onChange(of: companionManager.voiceState) { newState in
-            if newState == .listening && currentCursorTint != DS.Colors.overlayCursorBlue {
+            if newState == .listening {
                 rememberedActiveModeTint = currentCursorTint
             }
         }

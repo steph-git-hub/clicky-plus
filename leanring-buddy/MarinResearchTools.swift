@@ -47,6 +47,17 @@ enum MarinResearchTools {
         NSString("~/Library/Application Support/Claude/local-agent-mode-sessions").expandingTildeInPath
     }
 
+    /// v15p2 (2026-05-03): Bridge file for the Cowork Claude ↔ Marin
+    /// shared-channel pattern. Cowork writes via Obsidian MCP; Marin
+    /// writes via `append_to_bridge` (below). Both read on demand.
+    private static var bridgeFilePath: String {
+        NSString("~/Desktop/Claude Cowork/Obsidian/Steph Vault/Bridges/Claude-Marin Channel.md").expandingTildeInPath
+    }
+
+    private static var bridgeDir: String {
+        NSString("~/Desktop/Claude Cowork/Obsidian/Steph Vault/Bridges").expandingTildeInPath
+    }
+
     // MARK: - 1. list_scheduled_tasks
 
     static func listScheduledTasks() -> [String: Any] {
@@ -519,6 +530,88 @@ enum MarinResearchTools {
             "content": displayContent,
             "char_count": content.count,
             "truncated": truncated,
+        ]
+    }
+
+    // MARK: - append_to_bridge (v15p2, 2026-05-03)
+
+    /// Append a message to the Claude–Marin Bridge file. Auto-stamps a
+    /// timestamp + "Marin → Claude" header in the standard bridge
+    /// format. If the bridge directory or file doesn't exist yet, this
+    /// creates them with a header so first-write doesn't lose context.
+    ///
+    /// Restrict-by-design: this tool ONLY writes to the canonical
+    /// bridge path. We don't expose a generic `append_obsidian_note`
+    /// for v1 — keeps the surface small and removes the risk of Marin
+    /// being persuaded to write to arbitrary vault notes.
+    static func appendToBridge(message: String, threadId: String?) -> [String: Any] {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return ["status": "error", "reason": "Empty message — nothing to append"]
+        }
+
+        let fm = FileManager.default
+
+        // Ensure the Bridges directory exists.
+        if !fm.fileExists(atPath: bridgeDir) {
+            do {
+                try fm.createDirectory(atPath: bridgeDir, withIntermediateDirectories: true)
+            } catch {
+                return ["status": "error", "reason": "Could not create Bridges directory: \(error.localizedDescription)"]
+            }
+        }
+
+        // Format the entry header: "## YYYY-MM-DD HH:MM — Marin → Claude (thread: id)"
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        formatter.timeZone = TimeZone.current
+        let timestamp = formatter.string(from: Date())
+        let threadSuffix: String
+        if let raw = threadId?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty {
+            threadSuffix = " (thread: \(raw))"
+        } else {
+            threadSuffix = ""
+        }
+        let entry = "\n## \(timestamp) — Marin → Claude\(threadSuffix)\n\n\(trimmed)\n\n---\n"
+
+        guard let entryData = entry.data(using: .utf8) else {
+            return ["status": "error", "reason": "Could not encode message as UTF-8"]
+        }
+
+        // If the bridge file doesn't exist, seed it with the standard
+        // header. Otherwise append.
+        if fm.fileExists(atPath: bridgeFilePath) {
+            let url = URL(fileURLWithPath: bridgeFilePath)
+            do {
+                let handle = try FileHandle(forWritingTo: url)
+                defer { try? handle.close() }
+                try handle.seekToEnd()
+                try handle.write(contentsOf: entryData)
+            } catch {
+                return ["status": "error", "reason": "Append failed: \(error.localizedDescription)"]
+            }
+        } else {
+            let header = """
+            # Claude ↔ Marin Bridge
+
+            Shared message log between Cowork Claude and Marin (Clicky+ Realtime). Append-only — see prior entries for context.
+
+            ---
+            """
+            let full = header + "\n" + entry
+            do {
+                try full.write(toFile: bridgeFilePath, atomically: true, encoding: .utf8)
+            } catch {
+                return ["status": "error", "reason": "Initial bridge write failed: \(error.localizedDescription)"]
+            }
+        }
+
+        return [
+            "status": "ok",
+            "timestamp": timestamp,
+            "char_count": trimmed.count,
+            "thread_id": threadId ?? "",
+            "path": "Bridges/Claude-Marin Channel.md",
         ]
     }
 }

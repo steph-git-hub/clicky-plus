@@ -150,9 +150,42 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     private var maxInputLevelInCurrentPress: Float = 0
     private var pressStartedAt: Date?
 
+    /// v15p2 (2026-05-03): suspend-during-other-modes. When Steph
+    /// holds a non-Marin chord (VTT/Typing/Polish/Capture/Burst/
+    /// Base PTT) while a Marin session is active, this gate goes
+    /// high — we mute mic input, cancel any in-flight response,
+    /// and stop TTS playback so the modes don't fight. Released
+    /// when ALL other-mode chords are released.
+    private var isSuspendedByOtherMode: Bool = false
+
     // Warm session auto-close (continuous conversation).
     private static let warmSessionTimeoutSeconds: TimeInterval = 120
     private var warmSessionAutoCloseTask: Task<Void, Never>?
+
+    /// v15p2 (2026-05-03): incremented on every startSession /
+    /// engageContinuousListening. Grace tasks (scheduleMicReopen-
+    /// AfterGrace) capture the value at schedule time and refuse to
+    /// fire their endSession if the generation has changed since —
+    /// prevents an old PTT session's pending teardown from killing
+    /// a freshly-engaged hands-free session.
+    private var sessionGeneration: UInt64 = 0
+
+    /// v15p2 (2026-05-03): set true when cancelCurrentResponse fires.
+    /// Audio chunks arriving from the server after cancel are dropped
+    /// instead of scheduled into the player — without this, Marin
+    /// keeps speaking for a few hundred ms after Esc because the
+    /// server takes time to honor response.cancel and the in-flight
+    /// chunks were still being scheduled. Cleared on response.created
+    /// for the next response.
+    private var responseWasCancelled: Bool = false
+
+    /// v15p2 (2026-05-03): hard timeout for PTT mode commits. After
+    /// commitInputAndRequestResponse fires, we expect response.done
+    /// within ~15s. If it doesn't arrive (e.g. server hung, silent
+    /// commit ignored, network blip), force-end the session so we
+    /// don't get a stuck zombie. Cancelled on response.done.
+    private static let pttResponseTimeoutSeconds: TimeInterval = 15
+    private var pttResponseTimeoutTask: Task<Void, Never>?
 
     // MARK: - Function calling state (v15p2 Chunk 1, 2026-05-02)
     //
@@ -229,43 +262,86 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         }
 
         Self.appendDiag("startSession requested (cold)")
+        // v15p2 (2026-05-03): bump session generation so any pending
+        // grace tasks from prior sessions can't end this one.
+        audioStateLock.lock()
+        sessionGeneration &+= 1
+        let myGeneration = sessionGeneration
+        audioStateLock.unlock()
         Task { @MainActor in
             self.state = .connecting
         }
 
         Task.detached { [weak self] in
             guard let self = self else { return }
+
+            // v15p2 hotfix (2026-05-03): generation guard — abort if
+            // the session was torn down before we finished startup.
+            // Race: short tap fires endSession() while we're still
+            // inside this Task. Without this check, the Task would
+            // continue past teardown and set state back to .listening,
+            // leaving a zombie session.
+            func aborted() -> Bool {
+                self.audioStateLock.lock()
+                defer { self.audioStateLock.unlock() }
+                return self.sessionGeneration != myGeneration
+            }
+
+            // v15p2 hotfix (2026-05-03): startup watchdog. If audio
+            // engine init hangs (CoreAudio can stall when a previous
+            // session's teardown hasn't fully settled), force-end so
+            // Steph isn't stuck looking at a pink indicator forever.
+            let watchdogTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 5_000_000_000) // 5s
+                guard let self else { return }
+                guard !Task.isCancelled else { return }
+                let stillStarting: Bool = {
+                    self.audioStateLock.lock(); defer { self.audioStateLock.unlock() }
+                    if self.sessionGeneration != myGeneration { return false }
+                    return self.state == .connecting
+                }()
+                if stillStarting {
+                    Self.appendDiag("startSession watchdog — audio init hung past 5s, force-ending stuck session")
+                    self.endSession()
+                }
+            }
+
             do {
-                // v15p2 hotfix (2026-05-02): start audio capture FIRST,
-                // before token mint + WebSocket open. The audio tap
-                // begins delivering buffers immediately and they
-                // accumulate in inputAudioBuffer (gated on isHotkeyHeld
-                // = true, which we set on press). Once the WebSocket
-                // is up, the accumulated audio gets force-flushed.
-                // Without this, the user's first ~500ms of speech was
-                // captured into nothing because the engine wasn't
-                // running yet.
                 try self.startAudioCapture()
+                if aborted() { return }
                 let token = try await self.fetchEphemeralToken()
+                if aborted() {
+                    Self.appendDiag("startSession aborted after token mint — generation changed")
+                    return
+                }
                 try await self.openWebSocket(token: token)
-                // Flush any audio captured during the WebSocket setup
-                // gap so it arrives at the server in the right order
-                // (audio first, then screenshot).
+                if aborted() {
+                    Self.appendDiag("startSession aborted after WebSocket open — generation changed; tearing down newly-opened socket")
+                    self.teardown()
+                    return
+                }
                 self.forceFlushAccumulatedAudio()
-                // P3: capture + send active-screen screenshot. Fire-
-                // and-forget — Realtime processes events in order so
-                // the image arrives ahead of the audio commit.
                 self.captureAndSendActiveScreenshot()
                 await MainActor.run {
-                    self.state = .listening
+                    if !aborted() {
+                        self.state = .listening
+                    }
+                }
+                if aborted() {
+                    Self.appendDiag("startSession aborted just before listening — tearing down")
+                    self.teardown()
+                    return
                 }
                 Self.appendDiag("session ready (state=listening)")
+                // Cancel the startup watchdog — we made it through.
+                watchdogTask.cancel()
             } catch {
                 Self.appendDiag("startSession failed: \(error.localizedDescription)")
                 await MainActor.run {
                     self.state = .errored(error.localizedDescription)
                 }
                 self.teardown()
+                watchdogTask.cancel()
             }
         }
     }
@@ -279,6 +355,33 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         let bytesSent = bytesSentInCurrentPress
         let maxLevel = maxInputLevelInCurrentPress
         audioStateLock.unlock()
+
+        // v15p2 (2026-05-03): treat very short / silent presses as
+        // misclicks. Without this, the server gets a near-empty or
+        // pure-silence commit, may not produce a response.done, and
+        // the session lingers forever. Three guards:
+        //   • too short: pressMs < 250 (clear misclick)
+        //   • too few bytes: bytesSent < 8000 (cold start race)
+        //   • no actual speech: maxLevel < 0.005 (held key but
+        //     never spoke — ambient noise floor is ~0.001-0.003,
+        //     real speech is 0.01+)
+        let pressTooShort = pressMs < 250 || bytesSent < 8000
+        let noActualSpeech = maxLevel < 0.005
+        if pressTooShort || noActualSpeech {
+            let reason: String
+            if pressTooShort && noActualSpeech {
+                reason = "too short and no speech"
+            } else if pressTooShort {
+                reason = "too short"
+            } else {
+                reason = "no speech detected (maxLevel=\(String(format: "%.4f", maxLevel)))"
+            }
+            Self.appendDiag(
+                "hotkey released — pressMs=\(pressMs) bytesSent=\(bytesSent) maxLevel=\(String(format: "%.4f", maxLevel)) → \(reason), ending session immediately (no commit)"
+            )
+            endSession()
+            return
+        }
 
         Self.appendDiag(
             "hotkey released — pressMs=\(pressMs) " +
@@ -296,6 +399,15 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             audioStateLock.lock(); defer { audioStateLock.unlock() }
             return state.isActive
         }()
+        // v15p2 (2026-05-03): bump generation BEFORE the active check
+        // so any in-flight startSession Task aborts even if state is
+        // still .connecting (not yet .listening). Without this, a
+        // short-tap PTT race where release fires during async startup
+        // would let the startSession chain complete past the abort
+        // checkpoints because generation hadn't changed.
+        audioStateLock.lock()
+        sessionGeneration &+= 1
+        audioStateLock.unlock()
         guard active else { return }
         Self.appendDiag("endSession requested")
         cancelWarmSessionAutoClose()
@@ -331,6 +443,9 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                 ],
             ])
             Self.appendDiag("engageContinuousListening: live toggle on existing session")
+            // v15p2 (2026-05-03): kick off bridge polling for the
+            // already-running session too.
+            startBridgePolling()
         } else {
             // Start cold. Same path as a normal startSession but the
             // gate flag is already set so as soon as the WebSocket
@@ -339,15 +454,31 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             // fire because we'll keep cancelling it via continuous
             // mode.
             Self.appendDiag("engageContinuousListening: starting fresh session in continuous mode")
+            // v15p2 (2026-05-03): bump session generation so any
+            // pending grace tasks from prior sessions can't end this
+            // one. Fixes "engage right after another mode kills the
+            // new session" bug.
+            audioStateLock.lock()
+            sessionGeneration &+= 1
+            let myGeneration = sessionGeneration
+            audioStateLock.unlock()
             Task { @MainActor in
                 self.state = .connecting
             }
             Task.detached { [weak self] in
                 guard let self else { return }
+                func aborted() -> Bool {
+                    self.audioStateLock.lock()
+                    defer { self.audioStateLock.unlock() }
+                    return self.sessionGeneration != myGeneration
+                }
                 do {
                     try self.startAudioCapture()
+                    if aborted() { return }
                     let token = try await self.fetchEphemeralToken()
+                    if aborted() { return }
                     try await self.openWebSocket(token: token)
+                    if aborted() { self.teardown(); return }
                     self.forceFlushAccumulatedAudio()
                     // Push hands-free turn_detection up-front so the
                     // server enters VAD mode from the start.
@@ -367,6 +498,9 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                         self.state = .listening
                     }
                     Self.appendDiag("engageContinuousListening: session ready")
+                    // v15p2 (2026-05-03): kick off bridge polling now
+                    // that the session is up.
+                    self.startBridgePolling()
                 } catch {
                     Self.appendDiag("engageContinuousListening failed: \(error.localizedDescription)")
                     await MainActor.run {
@@ -392,6 +526,9 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             sendJSON(["type": "input_audio_buffer.clear"])
             Self.appendDiag("disengageContinuousListening: back to PTT")
         }
+        // v15p2 (2026-05-03): stop bridge polling — we only want it
+        // running in continuous mode.
+        stopBridgePolling()
     }
 
     /// Returns true if Marin is currently generating or playing an
@@ -421,31 +558,134 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
 
         sendJSON(["type": "response.cancel"])
 
-        // Stop the player immediately (cuts audio) but keep the
-        // isModelSpeaking gate CLOSED so server VAD can't re-trigger
-        // off speaker tail. The grace will flip it false safely.
+        // v15p2 (2026-05-03): set the cancel gate FIRST, BEFORE
+        // anything else. This drops all audio chunks scheduled or
+        // arriving from this point forward.
+        audioStateLock.lock()
+        responseWasCancelled = true
+        responseDoneReceived = true
+        outputBuffersInFlight = 0
+        audioStateLock.unlock()
+
+        // Stop the player IMMEDIATELY without a MainActor hop —
+        // AVAudioPlayerNode.stop() is callable from any thread, and
+        // the dispatch hop was adding 10-50ms of audio leakage.
+        if outputPlayer.isPlaying {
+            outputPlayer.stop()
+        }
+        // Reset and re-prepare the player so the next response can
+        // play cleanly. reset() drops any scheduled buffers we
+        // hadn't yet stopped above.
+        outputPlayer.reset()
+        if outputEngine.isRunning {
+            outputPlayer.play()
+        }
+
         Task { @MainActor in
-            if self.outputPlayer.isPlaying {
-                self.outputPlayer.stop()
-            }
-            if self.outputEngine.isRunning {
-                self.outputPlayer.play()
-            }
             self.state = .listening
             self.liveAssistantTranscript = ""
             self.outputAudioLevel = 0
         }
 
-        audioStateLock.lock()
-        // isModelSpeaking stays TRUE; the grace timer below will
-        // flip it to false once any echo tail has died down.
-        responseDoneReceived = true
-        outputBuffersInFlight = 0
-        audioStateLock.unlock()
-
         // Schedule mic reopen after grace, but DO NOT end session
         // — user explicitly interrupted to speak again.
         scheduleMicReopenAfterGrace(naturalCompletion: false)
+    }
+
+    // MARK: - Suspend / resume (v15p2, 2026-05-03)
+
+    /// Suspend Marin while another voice mode (VTT, Typing, Polish,
+    /// Capture, Burst, Base PTT) is active. Mutes mic input, cancels
+    /// any in-flight response, stops TTS playback queue. The
+    /// WebSocket stays open — we're pausing, not ending.
+    ///
+    /// Idempotent: safe to call multiple times. CompanionManager
+    /// refcounts other-mode chords so this method only fires on
+    /// 0→1 transitions.
+    func suspendForOtherMode() {
+        let alreadyActive: Bool = {
+            audioStateLock.lock(); defer { audioStateLock.unlock() }
+            return state.isActive
+        }()
+        guard alreadyActive else { return }
+
+        let wasAlreadySuspended: Bool = {
+            audioStateLock.lock(); defer { audioStateLock.unlock() }
+            let was = isSuspendedByOtherMode
+            isSuspendedByOtherMode = true
+            // Drop any buffered audio so we don't ship Steph's
+            // dictation-intended speech to OpenAI as if it were
+            // for Marin.
+            inputAudioBuffer.removeAll(keepingCapacity: true)
+            return was
+        }()
+        if wasAlreadySuspended { return }
+
+        Self.appendDiag("suspendForOtherMode — pausing Marin (other-mode chord pressed)")
+
+        // If a response is in flight, cancel it cleanly — same
+        // path as Esc-during-speech.
+        let modelSpeaking: Bool = {
+            audioStateLock.lock(); defer { audioStateLock.unlock() }
+            return isModelSpeaking
+        }()
+        if modelSpeaking {
+            sendJSON(["type": "response.cancel"])
+        }
+
+        // Stop TTS playback so it doesn't bleed into Steph's other
+        // mode (e.g. VTT capturing Marin's voice as input).
+        Task { @MainActor in
+            if self.outputPlayer.isPlaying {
+                self.outputPlayer.stop()
+            }
+            if self.outputEngine.isRunning {
+                // Keep engine running so we can resume cleanly,
+                // just stop the player.
+                self.outputPlayer.play()
+            }
+        }
+    }
+
+    /// Resume Marin after all other-mode chords have been released.
+    /// Idempotent: safe to call when not suspended (no-op).
+    func resumeFromOtherMode() {
+        let active: Bool = {
+            audioStateLock.lock(); defer { audioStateLock.unlock() }
+            return state.isActive
+        }()
+        guard active else { return }
+
+        let wasSuspended: Bool = {
+            audioStateLock.lock(); defer { audioStateLock.unlock() }
+            let was = isSuspendedByOtherMode
+            isSuspendedByOtherMode = false
+            // Reset response state so we don't confuse the
+            // listening gate. cancelCurrentResponse already set
+            // these but in case suspend was called without a live
+            // response, normalize them now.
+            responseDoneReceived = false
+            outputBuffersInFlight = 0
+            // Clear any audio that snuck in via tap during the
+            // suspend window — should be empty already since the
+            // shouldStreamAudio gate was closed, but defensive.
+            inputAudioBuffer.removeAll(keepingCapacity: true)
+            return was
+        }()
+        if !wasSuspended { return }
+
+        Self.appendDiag("resumeFromOtherMode — Marin back to listening")
+
+        Task { @MainActor in
+            // Make sure isModelSpeaking is false so the audio gate
+            // re-opens. (cancelCurrentResponse may have left it true
+            // pending the grace timer — but if we suspended while
+            // she was speaking, by now she's done.)
+            self.isModelSpeaking = false
+            self.state = .listening
+            self.liveAssistantTranscript = ""
+            self.outputAudioLevel = 0
+        }
     }
 
     // MARK: - Token mint
@@ -534,7 +774,13 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         }
 
         switch type {
-        case "session.created", "session.updated":
+        case "session.created":
+            Self.appendDiag(type)
+            // v15p2 (2026-05-03): replay recent turns so Marin
+            // remembers what we were just talking about. Cold
+            // sessions otherwise start amnesiac.
+            replayHistoryToServer()
+        case "session.updated":
             Self.appendDiag(type)
 
         case "response.created":
@@ -544,6 +790,10 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             audioStateLock.lock()
             isModelSpeaking = true
             responseDoneReceived = false
+            // v15p2 (2026-05-03): reset the cancel gate so this new
+            // response's audio chunks aren't dropped by the previous
+            // cancel.
+            responseWasCancelled = false
             // Don't reset outputBuffersInFlight — buffers from a prior
             // response (rare) shouldn't be forgotten. They'll drain on
             // their own.
@@ -667,6 +917,9 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             audioStateLock.unlock()
 
         case "response.done":
+            // v15p2 (2026-05-03): cancel the PTT response timeout —
+            // response arrived in time.
+            cancelPTTResponseTimeout()
             writeRealtimeTurnToTranscriptLog()
             // v15p2 hotfix2 (2026-05-02): mark response as done. Mic
             // does NOT reopen yet — wait for the playback queue to
@@ -722,6 +975,21 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     // audioStateLock, @Published state goes through async Task @MainActor.
 
     private func startAudioCapture() throws {
+        // v15p2 hotfix (2026-05-03): defensive cleanup. If a prior
+        // session's teardown didn't fully settle (CoreAudio can be
+        // slow to release the mic), starting a new session can
+        // hang at inputEngine.start(). Force-stop the engines and
+        // remove any lingering tap before re-configuring. removeTap
+        // is a no-op if no tap is installed.
+        if inputEngine.isRunning {
+            inputEngine.inputNode.removeTap(onBus: 0)
+            inputEngine.stop()
+        } else {
+            // Even if not running, clear any half-installed tap from
+            // a prior aborted startup.
+            inputEngine.inputNode.removeTap(onBus: 0)
+        }
+
         // ── OUTPUT ENGINE ─ player → mainMixer → speakers ─────────
         if !outputEngine.attachedNodes.contains(outputPlayer) {
             outputEngine.attach(outputPlayer)
@@ -832,7 +1100,7 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         // pipeline — see comment above the inputNode setup. So we
         // mute during her speech to prevent feedback. Esc remains
         // the interrupt mechanism.
-        let shouldStreamAudio = (isHotkeyHeld || isContinuousListening) && !isModelSpeaking
+        let shouldStreamAudio = (isHotkeyHeld || isContinuousListening) && !isModelSpeaking && !isSuspendedByOtherMode
         let shouldFlush: Bool
         if shouldStreamAudio {
             inputAudioBuffer.append(bytes)
@@ -928,12 +1196,48 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         if !leftover.isEmpty {
             bytesSentInCurrentPress += leftover.count
         }
+        let isContinuous = isContinuousListening
         audioStateLock.unlock()
         if !leftover.isEmpty {
             sendAudioChunk(leftover)
         }
         sendJSON(["type": "input_audio_buffer.commit"])
         sendJSON(["type": "response.create"])
+        // v15p2 (2026-05-03): in PTT mode, schedule a hard timeout
+        // so a hung response can't leave the session stuck on. Doesn't
+        // apply in continuous mode — server VAD owns turn lifecycle there.
+        if !isContinuous {
+            schedulePTTResponseTimeout()
+        }
+    }
+
+    private func schedulePTTResponseTimeout() {
+        cancelPTTResponseTimeout()
+        let scheduledGen: UInt64 = {
+            audioStateLock.lock(); defer { audioStateLock.unlock() }
+            return sessionGeneration
+        }()
+        pttResponseTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64(Self.pttResponseTimeoutSeconds * 1_000_000_000)
+            )
+            guard let self else { return }
+            guard !Task.isCancelled else { return }
+            let currentGen: UInt64 = {
+                self.audioStateLock.lock(); defer { self.audioStateLock.unlock() }
+                return self.sessionGeneration
+            }()
+            guard currentGen == scheduledGen else { return }
+            Self.appendDiag(
+                "PTT response timeout — no response.done in \(Self.pttResponseTimeoutSeconds)s, force-ending stuck session"
+            )
+            self.endSession()
+        }
+    }
+
+    private func cancelPTTResponseTimeout() {
+        pttResponseTimeoutTask?.cancel()
+        pttResponseTimeoutTask = nil
     }
 
     // MARK: - Vision (active screen capture per press)
@@ -1092,6 +1396,287 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                 self?.sendFunctionCallResult(callId: callId, name: name, result: result)
             }
 
+        // ── Gmail (v15p2, 2026-05-02) ─────────────────────────
+        case "search_gmail":
+            let query = (args["query"] as? String) ?? ""
+            let maxResults = (args["max_results"] as? NSNumber)?.intValue ?? 10
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let result = try await self.callWorkerJSON(
+                        path: "/gmail/search",
+                        body: [
+                            "query": query,
+                            "max_results": maxResults,
+                        ]
+                    )
+                    self.sendFunctionCallResult(callId: callId, name: name, result: result)
+                } catch {
+                    self.sendFunctionCallResult(
+                        callId: callId,
+                        name: name,
+                        result: ["status": "error", "reason": error.localizedDescription]
+                    )
+                }
+            }
+
+        case "read_email_thread":
+            let threadId = (args["thread_id"] as? String) ?? ""
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let result = try await self.callWorkerJSON(
+                        path: "/gmail/read-thread",
+                        body: ["thread_id": threadId]
+                    )
+                    self.sendFunctionCallResult(callId: callId, name: name, result: result)
+                } catch {
+                    self.sendFunctionCallResult(
+                        callId: callId,
+                        name: name,
+                        result: ["status": "error", "reason": error.localizedDescription]
+                    )
+                }
+            }
+
+        // ── Calendar (v15p2, 2026-05-02) ──────────────────────
+        case "list_calendar_events":
+            let timeRange = (args["time_range"] as? String) ?? "next_7_days"
+            let query = (args["query"] as? String) ?? ""
+            let maxResults = (args["max_results"] as? NSNumber)?.intValue ?? 15
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    var body: [String: Any] = [
+                        "time_range": timeRange,
+                        "max_results": maxResults,
+                    ]
+                    if !query.isEmpty { body["query"] = query }
+                    let result = try await self.callWorkerJSON(
+                        path: "/calendar/list-events",
+                        body: body
+                    )
+                    self.sendFunctionCallResult(callId: callId, name: name, result: result)
+                } catch {
+                    self.sendFunctionCallResult(
+                        callId: callId,
+                        name: name,
+                        result: ["status": "error", "reason": error.localizedDescription]
+                    )
+                }
+            }
+
+        case "find_next_event":
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let result = try await self.callWorkerJSON(
+                        path: "/calendar/find-next",
+                        body: [:]
+                    )
+                    self.sendFunctionCallResult(callId: callId, name: name, result: result)
+                } catch {
+                    self.sendFunctionCallResult(
+                        callId: callId,
+                        name: name,
+                        result: ["status": "error", "reason": error.localizedDescription]
+                    )
+                }
+            }
+
+        // ── Slack (v15p2, 2026-05-03) ─────────────────────────
+        case "search_slack":
+            let query = (args["query"] as? String) ?? ""
+            let maxResults = (args["max_results"] as? NSNumber)?.intValue ?? 10
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let result = try await self.callWorkerJSON(
+                        path: "/slack/search",
+                        body: [
+                            "query": query,
+                            "max_results": maxResults,
+                        ]
+                    )
+                    self.sendFunctionCallResult(callId: callId, name: name, result: result)
+                } catch {
+                    self.sendFunctionCallResult(
+                        callId: callId,
+                        name: name,
+                        result: ["status": "error", "reason": error.localizedDescription]
+                    )
+                }
+            }
+
+        case "read_slack_thread":
+            let channelId = (args["channel_id"] as? String) ?? ""
+            let threadTs = (args["thread_ts"] as? String) ?? ""
+            let maxReplies = (args["max_replies"] as? NSNumber)?.intValue ?? 20
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let result = try await self.callWorkerJSON(
+                        path: "/slack/read-thread",
+                        body: [
+                            "channel_id": channelId,
+                            "thread_ts": threadTs,
+                            "max_replies": maxReplies,
+                        ]
+                    )
+                    self.sendFunctionCallResult(callId: callId, name: name, result: result)
+                } catch {
+                    self.sendFunctionCallResult(
+                        callId: callId,
+                        name: name,
+                        result: ["status": "error", "reason": error.localizedDescription]
+                    )
+                }
+            }
+
+        case "list_unread_slack":
+            var body: [String: Any] = [:]
+            if let types = args["types"] as? String, !types.isEmpty {
+                body["types"] = types
+            }
+            if let maxChannels = (args["max_channels"] as? NSNumber)?.intValue {
+                body["max_channels"] = maxChannels
+            }
+            if let mpc = (args["messages_per_channel"] as? NSNumber)?.intValue {
+                body["messages_per_channel"] = mpc
+            }
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let result = try await self.callWorkerJSON(
+                        path: "/slack/unread-inbox",
+                        body: body
+                    )
+                    self.sendFunctionCallResult(callId: callId, name: name, result: result)
+                } catch {
+                    self.sendFunctionCallResult(
+                        callId: callId,
+                        name: name,
+                        result: ["status": "error", "reason": error.localizedDescription]
+                    )
+                }
+            }
+
+        case "compose_slack_message":
+            let channelId = (args["channel_id"] as? String) ?? ""
+            let message = (args["message"] as? String) ?? ""
+            let threadTs = args["thread_ts"] as? String
+            let confirmed = (args["confirmed"] as? Bool) ?? false
+            var body: [String: Any] = [
+                "channel_id": channelId,
+                "message": message,
+                "confirmed": confirmed,
+            ]
+            if let threadTs, !threadTs.isEmpty {
+                body["thread_ts"] = threadTs
+            }
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let result = try await self.callWorkerJSON(
+                        path: "/slack/post-message",
+                        body: body
+                    )
+                    self.sendFunctionCallResult(callId: callId, name: name, result: result)
+                } catch {
+                    self.sendFunctionCallResult(
+                        callId: callId,
+                        name: name,
+                        result: ["status": "error", "reason": error.localizedDescription]
+                    )
+                }
+            }
+
+        // ── Bridge (v15p2, 2026-05-03) ────────────────────────
+        // Append a message to the Claude ↔ Marin bridge file.
+        // Local-only filesystem write via FileHandle. Reads use
+        // the existing read_obsidian_note tool with the bridge
+        // path — no separate read_bridge tool needed.
+        case "append_to_bridge":
+            let message = (args["message"] as? String) ?? ""
+            let threadId = args["thread_id"] as? String
+            Task { @MainActor [weak self] in
+                let result = MarinResearchTools.appendToBridge(message: message, threadId: threadId)
+                self?.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        // ── Clipboard write (v15p2, 2026-05-03) ───────────────
+        // Marin → Cowork direction. NSPasteboard write on
+        // MainActor. Replaces whatever's currently on the
+        // clipboard. 10K char cap to discourage Marin from using
+        // the clipboard as a bulk-data channel (use the bridge
+        // for that).
+        case "write_clipboard":
+            let content = (args["content"] as? String) ?? ""
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let trimmed = content
+                let result: [String: Any]
+                if trimmed.isEmpty {
+                    result = [
+                        "status": "error",
+                        "reason": "Empty content — nothing to write to clipboard",
+                    ]
+                } else if trimmed.count > 10_000 {
+                    result = [
+                        "status": "error",
+                        "reason": "Content too long (\(trimmed.count) chars). Limit is 10000. For larger payloads, use append_to_bridge or suggest Steph paste directly.",
+                    ]
+                } else {
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    let ok = pb.setString(trimmed, forType: .string)
+                    if ok {
+                        result = [
+                            "status": "ok",
+                            "char_count": trimmed.count,
+                        ]
+                    } else {
+                        result = [
+                            "status": "error",
+                            "reason": "NSPasteboard.setString returned false",
+                        ]
+                    }
+                }
+                self.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        // ── Clipboard read (v15p2, 2026-05-02) ────────────────
+        // Local-only — no Worker hop. Reads NSPasteboard.general
+        // on the MainActor and ships the string back. Truncated
+        // at 16K chars to keep Realtime turns sane.
+        case "read_clipboard":
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let pb = NSPasteboard.general
+                let raw = pb.string(forType: .string) ?? ""
+                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                let result: [String: Any]
+                if trimmed.isEmpty {
+                    result = [
+                        "status": "empty",
+                        "message": "Clipboard is empty or contains no text.",
+                    ]
+                } else {
+                    let maxChars = 16000
+                    let truncated = trimmed.count > maxChars
+                    let payload = truncated
+                        ? String(trimmed.prefix(maxChars)) + "\n\n[truncated — clipboard had \(trimmed.count) chars total]"
+                        : trimmed
+                    result = [
+                        "status": "ok",
+                        "char_count": trimmed.count,
+                        "truncated": truncated,
+                        "contents": payload,
+                    ]
+                }
+                self.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
         case "highlight_element":
             // Async because AX search + drawing happens on MainActor.
             // We hop to MainActor, do the work, then call back to send
@@ -1146,6 +1731,53 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     }
 
     // MARK: - Tool implementations
+
+    /// v15p2 (2026-05-02): generic POST helper for tool dispatchers
+    /// that need to talk to Worker routes (Gmail and future
+    /// connectors). POSTs JSON body, returns parsed JSON dict.
+    /// Throws on transport / HTTP errors so the caller can surface
+    /// to Marin via the function_call error pattern.
+    private func callWorkerJSON(path: String, body: [String: Any]) async throws -> [String: Any] {
+        // workerSessionURL points at /realtime-session. Build a sibling URL.
+        guard var components = URLComponents(url: workerSessionURL, resolvingAgainstBaseURL: false) else {
+            throw NSError(
+                domain: "ClickyRealtimeError",
+                code: -50,
+                userInfo: [NSLocalizedDescriptionKey: "Bad worker base URL"]
+            )
+        }
+        components.path = path
+        guard let url = components.url else {
+            throw NSError(
+                domain: "ClickyRealtimeError",
+                code: -51,
+                userInfo: [NSLocalizedDescriptionKey: "Could not build worker URL for \(path)"]
+            )
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.timeoutInterval = 15
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let bodyText = String(data: data, encoding: .utf8) ?? "<binary>"
+            throw NSError(
+                domain: "ClickyRealtimeError",
+                code: http.statusCode,
+                userInfo: [NSLocalizedDescriptionKey: "Worker \(path) returned \(http.statusCode): \(bodyText.prefix(300))"]
+            )
+        }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(
+                domain: "ClickyRealtimeError",
+                code: -52,
+                userInfo: [NSLocalizedDescriptionKey: "Could not parse JSON from \(path)"]
+            )
+        }
+        return json
+    }
 
     /// Returns true if the given app's AX tree is too sparse / noisy
     /// to use for element finding. These are mostly browsers (Chrome,
@@ -1482,14 +2114,18 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         }
 
         let rms = Self.computeRMS(of: pcmBuffer)
-        // Track this buffer as "in flight" so we know when playback
-        // truly finishes. Server's response.done fires when generation
-        // is complete, but the queue here may still have several
-        // chunks of audio left to play. Mic must stay muted until
-        // these all finish, otherwise speaker echo re-triggers VAD.
+        // v15p2 (2026-05-03): drop audio chunks if the user cancelled
+        // the response. The server takes time to honor response.cancel,
+        // so chunks keep arriving for a few hundred ms after Esc —
+        // without this gate, those chunks would still be scheduled
+        // into the player and Marin would keep talking briefly.
         audioStateLock.lock()
-        outputBuffersInFlight += 1
+        let wasCancelled = responseWasCancelled
+        if !wasCancelled {
+            outputBuffersInFlight += 1
+        }
         audioStateLock.unlock()
+        if wasCancelled { return }
         Task { @MainActor in
             self.outputAudioLevel = rms
             self.outputPlayer.scheduleBuffer(
@@ -1536,6 +2172,13 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     ///   cancellation), we never end the session — user wants to
     ///   keep talking.
     private func scheduleMicReopenAfterGrace(naturalCompletion: Bool) {
+        // v15p2 (2026-05-03): capture the session generation at
+        // schedule time. If a new session has started by the time
+        // this fires, do not end it — it's a different session.
+        let scheduledGeneration: UInt64 = {
+            audioStateLock.lock(); defer { audioStateLock.unlock() }
+            return sessionGeneration
+        }()
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Self.micReopenGraceSeconds * 1_000_000_000))
             guard let self else { return }
@@ -1544,12 +2187,20 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             // during the grace period.
             let stillSafe = self.responseDoneReceived && self.outputBuffersInFlight == 0
             let isContinuous = self.isContinuousListening
+            let currentGeneration = self.sessionGeneration
             if stillSafe {
                 self.isModelSpeaking = false
                 self.inputAudioBuffer.removeAll(keepingCapacity: true)
             }
             self.audioStateLock.unlock()
             guard stillSafe else { return }
+            // If a new session has started since we were scheduled,
+            // don't touch it. We only manage the session we were
+            // scheduled for.
+            guard currentGeneration == scheduledGeneration else {
+                Self.appendDiag("grace task skipped — session generation changed (\(scheduledGeneration) → \(currentGeneration))")
+                return
+            }
 
             Self.appendDiag("mic reopened after playback drain + grace")
 
@@ -1614,6 +2265,14 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         warmSessionAutoCloseTask?.cancel()
         warmSessionAutoCloseTask = nil
 
+        // v15p2 (2026-05-03): cancel the PTT response timeout so it
+        // doesn't fire after the session is already torn down.
+        cancelPTTResponseTimeout()
+
+        // v15p2 (2026-05-03): stop bridge polling so it doesn't outlive
+        // the session.
+        stopBridgePolling()
+
         receiveTask?.cancel()
         receiveTask = nil
 
@@ -1665,6 +2324,343 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Persistent conversation history (v15p2, 2026-05-03)
+    //
+    // Mirrors the Base PTT pattern (`conversation-history.json`)
+    // but for Realtime turns. Two reasons:
+    //   1. Continuity across cold session starts. PTT sessions die
+    //      after each response, hands-free can drop on Esc, app
+    //      restarts wipe live state — without persistence, every
+    //      new session starts amnesiac.
+    //   2. Cross-mode continuity later: same memory could feed
+    //      Base PTT, the Cowork bridge, etc.
+    //
+    // Storage: JSON array of {timestamp, user, assistant} entries
+    // at ~/Library/Application Support/com.stephenpierson.clickyplus/
+    // marin-conversation-history.json. Capped at 30 entries; turns
+    // older than 24h aren't replayed (kept on disk for archive).
+    //
+    // Replay: on `session.created`, send the recent turns as
+    // `conversation.item.create` events with role: user/assistant.
+    // No `response.create` follows — we just seed the conversation;
+    // Marin won't speak until Steph does.
+
+    private struct MarinHistoryEntry: Codable {
+        let timestamp: Date
+        let user: String
+        let assistant: String
+    }
+
+    private static let maxHistoryTurnsToKeep = 30
+    private static let maxHistoryTurnsToReplay = 12
+    private static let maxHistoryAgeHoursForReplay: TimeInterval = 24
+
+    private static var historyFileURL: URL? {
+        let fm = FileManager.default
+        guard let appSupport = fm.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else { return nil }
+        let dir = appSupport.appendingPathComponent(
+            "com.stephenpierson.clickyplus", isDirectory: true
+        )
+        if !fm.fileExists(atPath: dir.path) {
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir.appendingPathComponent("marin-conversation-history.json")
+    }
+
+    private static func loadFullHistory() -> [MarinHistoryEntry] {
+        guard let url = historyFileURL,
+              let data = try? Data(contentsOf: url) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? decoder.decode([MarinHistoryEntry].self, from: data)) ?? []
+    }
+
+    private static func writeFullHistory(_ entries: [MarinHistoryEntry]) {
+        guard let url = historyFileURL else { return }
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(entries) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    /// Append a completed turn to disk. Trims to the last 30 turns.
+    /// Called from writeRealtimeTurnToTranscriptLog so it inherits
+    /// that path's MainActor isolation. File I/O is small and fast
+    /// enough to do inline.
+    private func appendTurnToHistory(user: String, assistant: String) {
+        let trimmedUser = user.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedAssistant = assistant.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedUser.isEmpty || !trimmedAssistant.isEmpty else { return }
+        var history = Self.loadFullHistory()
+        history.append(MarinHistoryEntry(
+            timestamp: Date(),
+            user: trimmedUser,
+            assistant: trimmedAssistant
+        ))
+        let cap = Self.maxHistoryTurnsToKeep
+        if history.count > cap {
+            history = Array(history.suffix(cap))
+        }
+        Self.writeFullHistory(history)
+    }
+
+    private func loadRecentHistoryForReplay() -> [MarinHistoryEntry] {
+        let history = Self.loadFullHistory()
+        let cutoff = Date().addingTimeInterval(-Self.maxHistoryAgeHoursForReplay * 3600)
+        let recent = history.filter { $0.timestamp > cutoff }
+        return Array(recent.suffix(Self.maxHistoryTurnsToReplay))
+    }
+
+    /// Send the recent turns into the new Realtime session as
+    /// conversation.item.create events. Called on session.created.
+    /// Does NOT send response.create — we just seed context.
+    private func replayHistoryToServer() {
+        let recent = loadRecentHistoryForReplay()
+        guard !recent.isEmpty else { return }
+        Self.appendDiag("replaying \(recent.count) prior turn(s) into Realtime session")
+        for entry in recent {
+            if !entry.user.isEmpty {
+                sendJSON([
+                    "type": "conversation.item.create",
+                    "item": [
+                        "type": "message",
+                        "role": "user",
+                        "content": [["type": "input_text", "text": entry.user]],
+                    ],
+                ])
+            }
+            if !entry.assistant.isEmpty {
+                sendJSON([
+                    "type": "conversation.item.create",
+                    "item": [
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [["type": "text", "text": entry.assistant]],
+                    ],
+                ])
+            }
+        }
+    }
+
+    // MARK: - Bridge polling (v15p2, 2026-05-03)
+    //
+    // Marin polls the Claude–Marin bridge file every 30s while in
+    // continuous-listening mode. New entries addressed to her (header
+    // contains "→ Marin") get injected as a user-role system note.
+    // Persona instructs her to mention them naturally on next turn —
+    // no auto-response, no interruption.
+    //
+    // Last-read timestamp persisted in UserDefaults so polling doesn't
+    // resurface old entries after restart. First-run init sets the
+    // marker to "now" so historical entries don't all flood at once.
+    //
+    // Polling stops when continuous mode disengages or the session ends.
+
+    private static let bridgePollingIntervalSeconds: TimeInterval = 30
+    private static let bridgeLastReadKey = "marin.bridge.last_read_timestamp"
+    private static let bridgeFilePath = NSString(
+        "~/Desktop/Claude Cowork/Obsidian/Steph Vault/Bridges/Claude-Marin Channel.md"
+    ).expandingTildeInPath
+
+    private var bridgePollingTask: Task<Void, Never>?
+
+    private struct BridgeEntry {
+        let timestamp: Date
+        let sender: String
+        let body: String
+    }
+
+    private func startBridgePolling() {
+        stopBridgePolling()
+        // Initialize lastRead marker on first run so we don't surface
+        // historical entries.
+        if UserDefaults.standard.string(forKey: Self.bridgeLastReadKey) == nil {
+            let formatter = ISO8601DateFormatter()
+            UserDefaults.standard.set(
+                formatter.string(from: Date()),
+                forKey: Self.bridgeLastReadKey
+            )
+            Self.appendDiag("bridge polling: first-run lastRead marker set to now")
+        }
+        bridgePollingTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(Self.bridgePollingIntervalSeconds * 1_000_000_000)
+                )
+                if Task.isCancelled { return }
+                self?.checkBridgeForNewEntries()
+            }
+        }
+        Self.appendDiag("bridge polling: started (interval \(Self.bridgePollingIntervalSeconds)s)")
+    }
+
+    private func stopBridgePolling() {
+        if bridgePollingTask != nil {
+            Self.appendDiag("bridge polling: stopped")
+        }
+        bridgePollingTask?.cancel()
+        bridgePollingTask = nil
+    }
+
+    private func checkBridgeForNewEntries() {
+        // Don't poll while suspended-by-other-mode — Steph's actively
+        // using a different mode, no point queueing notifications.
+        let suspended: Bool = {
+            audioStateLock.lock(); defer { audioStateLock.unlock() }
+            return isSuspendedByOtherMode
+        }()
+        if suspended { return }
+        // Don't poll if session went inactive between ticks.
+        let active: Bool = {
+            audioStateLock.lock(); defer { audioStateLock.unlock() }
+            return state.isActive
+        }()
+        if !active { return }
+
+        guard let content = try? String(
+            contentsOfFile: Self.bridgeFilePath,
+            encoding: .utf8
+        ) else {
+            // Bridge file may not exist yet — silent skip.
+            return
+        }
+
+        let formatter = ISO8601DateFormatter()
+        let lastRead = UserDefaults.standard
+            .string(forKey: Self.bridgeLastReadKey)
+            .flatMap { formatter.date(from: $0) }
+            ?? Date.distantPast
+
+        let newEntries = Self.parseBridgeForMarinEntries(content: content, after: lastRead)
+        if newEntries.isEmpty { return }
+
+        // Update last-read marker to the newest entry's timestamp so
+        // we don't reinject on the next tick.
+        if let newest = newEntries.map({ $0.timestamp }).max() {
+            UserDefaults.standard.set(
+                formatter.string(from: newest),
+                forKey: Self.bridgeLastReadKey
+            )
+        }
+
+        // Build a compact summary. Body trimmed to ~600 chars per entry
+        // so we don't blow context if Cowork posted a giant payload.
+        let summary = newEntries.map { entry -> String in
+            let truncated = entry.body.count > 600
+                ? String(entry.body.prefix(600)) + "…[truncated; full content in bridge file]"
+                : entry.body
+            let dateString = DateFormatter.localizedString(
+                from: entry.timestamp, dateStyle: .none, timeStyle: .short
+            )
+            return "[\(dateString) from \(entry.sender)]\n\(truncated)"
+        }.joined(separator: "\n\n---\n\n")
+
+        let entryWord = newEntries.count == 1 ? "entry" : "entries"
+        let systemNote = """
+        [BRIDGE UPDATE — internal notification, do not respond directly to this message]
+
+        Cowork Claude has left \(newEntries.count) new \(entryWord) for you in the bridge file (`Bridges/Claude-Marin Channel.md`):
+
+        \(summary)
+
+        ON STEPH'S NEXT TURN: briefly mention this to him in a natural way — e.g. "by the way, Cowork Claude just left a note in the bridge about X — want me to read it in full?" — and keep going with whatever he's asking. DO NOT interrupt his current train of thought, just weave the heads-up in. If he asks for the full content, you can either summarize what's above or call read_obsidian_note for the full file.
+        """
+
+        sendJSON([
+            "type": "conversation.item.create",
+            "item": [
+                "type": "message",
+                "role": "user",
+                "content": [["type": "input_text", "text": systemNote]],
+            ],
+        ])
+        Self.appendDiag("bridge polling: injected \(newEntries.count) new \(entryWord) as system note")
+    }
+
+    /// Parse the bridge file for entries with headers indicating
+    /// Cowork Claude → Marin (or any "→ Marin" recipient match).
+    /// Returns entries newer than `after`.
+    private static func parseBridgeForMarinEntries(content: String, after: Date) -> [BridgeEntry] {
+        // Header format: `## YYYY-MM-DD HH:MM — <Sender> → <Recipient>(...)`
+        // Body runs until the next `---` separator.
+        let lines = content.components(separatedBy: "\n")
+        var entries: [BridgeEntry] = []
+        var i = 0
+        let headerFormatter = DateFormatter()
+        headerFormatter.dateFormat = "yyyy-MM-dd HH:mm"
+        headerFormatter.timeZone = TimeZone.current
+
+        while i < lines.count {
+            let line = lines[i]
+            // Match header lines: `## YYYY-MM-DD HH:MM — Sender → Recipient`
+            if line.hasPrefix("## "),
+               let headerInfo = parseHeader(line, formatter: headerFormatter) {
+                let (timestamp, sender, recipient) = headerInfo
+                // Filter: must be newer than lastRead, recipient must
+                // include "Marin" (case-insensitive).
+                if timestamp > after,
+                   recipient.lowercased().contains("marin"),
+                   !sender.lowercased().contains("marin") {
+                    // Collect body until next `---` separator or EOF.
+                    var bodyLines: [String] = []
+                    i += 1
+                    while i < lines.count {
+                        let bodyLine = lines[i]
+                        if bodyLine.trimmingCharacters(in: .whitespaces) == "---" {
+                            break
+                        }
+                        bodyLines.append(bodyLine)
+                        i += 1
+                    }
+                    let body = bodyLines.joined(separator: "\n")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !body.isEmpty {
+                        entries.append(BridgeEntry(
+                            timestamp: timestamp,
+                            sender: sender,
+                            body: body
+                        ))
+                    }
+                }
+            }
+            i += 1
+        }
+        return entries
+    }
+
+    /// Parse a single header line of the form
+    /// `## YYYY-MM-DD HH:MM — Sender → Recipient (optional thread tag)`
+    /// Returns (timestamp, sender, recipient) on success.
+    private static func parseHeader(
+        _ line: String, formatter: DateFormatter
+    ) -> (Date, String, String)? {
+        // Strip leading `## ` (and optional extra hashes/whitespace).
+        let stripped = line.replacingOccurrences(
+            of: #"^#+\s*"#, with: "", options: .regularExpression
+        )
+        // Split on " — " (em dash with spaces).
+        let parts = stripped.components(separatedBy: " — ")
+        guard parts.count >= 2 else { return nil }
+        let datePart = parts[0].trimmingCharacters(in: .whitespaces)
+        let rest = parts[1...].joined(separator: " — ")
+        guard let timestamp = formatter.date(from: datePart) else { return nil }
+        // Split rest on " → "
+        guard let arrowRange = rest.range(of: " → ") else { return nil }
+        let sender = String(rest[..<arrowRange.lowerBound])
+            .trimmingCharacters(in: .whitespaces)
+        var recipient = String(rest[arrowRange.upperBound...])
+        // Strip trailing parenthetical thread tag if present.
+        if let parenStart = recipient.firstIndex(of: "(") {
+            recipient = String(recipient[..<parenStart])
+        }
+        recipient = recipient.trimmingCharacters(in: .whitespaces)
+        return (timestamp, sender, recipient)
+    }
+
     // MARK: - Transcript log
 
     private func writeRealtimeTurnToTranscriptLog() {
@@ -1691,6 +2687,9 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             )
             ClickyTranscriptLogger.shared.log(log)
             Self.appendDiag("turn logged: user=\(userTranscript.count) chars, assistant=\(assistantTranscript.count) chars")
+            // v15p2 (2026-05-03): persist the turn so cold session
+            // starts can replay context. Survives app restarts.
+            self.appendTurnToHistory(user: userTranscript, assistant: assistantTranscript)
         }
     }
 
