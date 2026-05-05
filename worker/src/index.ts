@@ -965,8 +965,7 @@ async function handleGmailSearch(request: Request, env: Env): Promise<Response> 
   });
   if (!listResponse.ok) {
     const errorBody = await listResponse.text();
-    console.error(`[/gmail/search] list error ${listResponse.status}: ${errorBody}`);
-    return new Response(errorBody, { status: listResponse.status });
+    return sanitizedUpstreamError("/gmail/search", listResponse.status, errorBody);
   }
   const listJSON = await listResponse.json() as { threads?: Array<{ id: string }> };
   const threadIds = (listJSON.threads ?? []).map((t) => t.id);
@@ -1060,7 +1059,7 @@ async function handleGmailReadThread(request: Request, env: Env): Promise<Respon
   });
   if (!r.ok) {
     const errorBody = await r.text();
-    return new Response(errorBody, { status: r.status });
+    return sanitizedUpstreamError("/gmail/read-thread", r.status, errorBody);
   }
   const j = await r.json() as {
     id: string;
@@ -1266,8 +1265,7 @@ async function handleCalendarListEvents(request: Request, env: Env): Promise<Res
   });
   if (!response.ok) {
     const errorBody = await response.text();
-    console.error(`[/calendar/list-events] error ${response.status}: ${errorBody}`);
-    return new Response(errorBody, { status: response.status });
+    return sanitizedUpstreamError("/calendar/list-events", response.status, errorBody);
   }
   const j = await response.json() as {
     items?: Array<{
@@ -1315,8 +1313,7 @@ async function handleCalendarFindNext(_request: Request, env: Env): Promise<Resp
   });
   if (!response.ok) {
     const errorBody = await response.text();
-    console.error(`[/calendar/find-next] error ${response.status}: ${errorBody}`);
-    return new Response(errorBody, { status: response.status });
+    return sanitizedUpstreamError("/calendar/find-next", response.status, errorBody);
   }
   const j = await response.json() as { items?: Array<any> };
   const items = j.items ?? [];
@@ -1472,8 +1469,7 @@ async function handleSlackSearch(request: Request, env: Env): Promise<Response> 
   });
   if (!response.ok) {
     const errorBody = await response.text();
-    console.error(`[/slack/search] error ${response.status}: ${errorBody}`);
-    return new Response(errorBody, { status: response.status });
+    return sanitizedUpstreamError("/slack/search", response.status, errorBody);
   }
   const j = await response.json() as {
     ok?: boolean;
@@ -1551,8 +1547,7 @@ async function handleSlackReadThread(request: Request, env: Env): Promise<Respon
   });
   if (!response.ok) {
     const errorBody = await response.text();
-    console.error(`[/slack/read-thread] error ${response.status}: ${errorBody}`);
-    return new Response(errorBody, { status: response.status });
+    return sanitizedUpstreamError("/slack/read-thread", response.status, errorBody);
   }
   const j = await response.json() as {
     ok?: boolean;
@@ -1629,7 +1624,7 @@ async function handleSlackUnreadInbox(request: Request, env: Env): Promise<Respo
   });
   if (!listResp.ok) {
     const err = await listResp.text();
-    return new Response(err, { status: listResp.status });
+    return sanitizedUpstreamError("/slack/unread-inbox", listResp.status, err);
   }
   const listJson = await listResp.json() as {
     ok?: boolean;
@@ -1855,8 +1850,7 @@ async function handleSlackPostMessage(request: Request, env: Env): Promise<Respo
   });
   if (!response.ok) {
     const errorBody = await response.text();
-    console.error(`[/slack/post-message] error ${response.status}: ${errorBody}`);
-    return new Response(errorBody, { status: response.status });
+    return sanitizedUpstreamError("/slack/post-message", response.status, errorBody);
   }
   const j = await response.json() as { ok?: boolean; error?: string; ts?: string; channel?: string };
   if (!j.ok) {
@@ -1973,6 +1967,13 @@ interface VoiceCommandRequestPayload {
   /// the tone/style of the surrounding content (e.g. casual Slack vs
   /// formal email vs technical doc). Base64-encoded JPEG.
   imageBase64?: string;
+  /// v15p2 (2026-05-04): polish intent. Currently the only special intent
+  /// is "format-response" — fired when Steph holds Polish and says
+  /// "format response". Switches the system prompt to one that
+  /// reformats his draft to structurally match what he's replying to
+  /// (using the screenshot). Default polish (no intent) keeps the
+  /// behavior described in styleGuidance above.
+  intent?: "format-response";
 }
 
 async function handleVoiceCommandPolish(
@@ -2072,23 +2073,75 @@ async function handleVoiceCommandPolish(
       `- PRESERVE sentence order, paragraph structure, formatting (line breaks, lists, indentation).\n` +
       `- DO NOT use em-dashes anywhere in the output. Use commas, periods, semicolons, or "and"/"but" instead. Steph dislikes em-dashes; never produce one.\n`;
 
-  const polishSystemPrompt =
+  // v15p2 (2026-05-04): "format response" intent — different system
+  // prompt that focuses on structural formatting to match what Steph
+  // is replying to in the screenshot. Bypasses styleGuidance entirely
+  // because we want a tight, screenshot-driven reformatter, not the
+  // usual polish ruleset.
+  const isFormatResponseIntent = payload.intent === "format-response";
+
+  const polishSystemPrompt = isFormatResponseIntent
+    ? `You polish text for Steph that he's about to send as a reply${targetAppDescription}. He's drafted a response and wants it (a) lightly polished AND (b) reformatted to structurally match what he's replying to. The screenshot shows the conversation/thread/document he's responding to.\n\n` +
+      `Your job has two parts — DO BOTH:\n` +
+      `\n` +
+      `1. STRUCTURAL MATCHING (primary):\n` +
+      `   - Match the structural format of what he's replying to: bullets vs prose, approximate length, list structure (numbered vs bulleted), paragraph count.\n` +
+      `   - If the thread above is a numbered list of questions, the BODY of his reply should be a numbered list answering each.\n` +
+      `   - If the thread above is bulleted, the body should be bulleted.\n` +
+      `   - If the thread above is prose paragraphs, the body should be prose paragraphs.\n` +
+      `\n` +
+      `2. LIGHT POLISH (always, even when no restructuring is needed) — STRICTLY MECHANICAL ONLY:\n` +
+      `   - Fix typos.\n` +
+      `   - Fix obvious grammar mistakes (subject-verb agreement, missing articles, broken tense).\n` +
+      `   - Fix punctuation (missing periods, capitalize sentence starts).\n` +
+      `   - Fix capitalization.\n` +
+      `   - Remove disfluencies (um, uh, like as filler, "you know" as filler) ONLY if clearly disfluent.\n` +
+      `   FORBIDDEN under "light polish":\n` +
+      `   - DO NOT "tighten loose phrasing" — Steph's phrasing stays as-is unless it's a literal grammar error.\n` +
+      `   - DO NOT drop modifiers, qualifiers, hedges, or descriptive phrases ("just", "really", "everyone", "with this exciting initiative", "I think", "Yeah", "kind of", etc.) — these are part of his voice.\n` +
+      `   - DO NOT shorten sentences for "concision."\n` +
+      `   - DO NOT rephrase ANY sentence. Every sentence in your output must be word-for-word the same as the input EXCEPT for the mechanical fixes listed above.\n` +
+      `   - The test: if you can substitute a word, drop a word, or rearrange a phrase WITHOUT introducing a new typo, grammar error, or punctuation issue — DO NOT make that change.\n` +
+      `\n` +
+      `CRITICAL — CONTENT PRESERVATION (HARDEST RULE):\n` +
+      `- DO NOT delete, drop, or remove ANY of his sentences. Every distinct thought he wrote must appear in your output.\n` +
+      `- Conversational openers ("Ok great", "Yeah", "Hey", "Thanks", "Sounds good", "Got it", "Sure", "thinking ahead", etc.) and closers ("Let me know", "Thoughts?", "WDYT?", "Talk soon", etc.) MUST be preserved as their own line/paragraph above or below the structured body. They are NOT part of the list — they sit alongside it.\n` +
+      `- If a sentence in his draft doesn't fit the structural pattern (e.g. a lead-in "Ok great thinking ahead" before a numbered body), keep it as a separate line ABOVE the list, not absorbed into the list.\n` +
+      `- Preserve his voice, tone, and register — don't adjust formality, don't make casual prose sound formal or vice versa.\n` +
+      `- The number of his actual ideas in your output MUST equal the number in his input. If you're tempted to merge two thoughts to fit a count or drop one because it doesn't fit a pattern, DON'T — keep them all.\n` +
+      `\n` +
+      `WORKED EXAMPLE:\n` +
+      `  His draft: "Ok great thinking ahead. yeah I think we should stagger by region. the help center should go first. marketing has the assets I checked yesterday"\n` +
+      `  Thread above: "Three things — first, ship strategy? second, help center timing? third, marketing assets?"\n` +
+      `  CORRECT output:\n` +
+      `    Ok great, thinking ahead.\n` +
+      `    1. Stagger by region.\n` +
+      `    2. The help center should go first.\n` +
+      `    3. Marketing has the assets — I checked yesterday.\n` +
+      `  WRONG output (drops the lead-in):\n` +
+      `    1. Stagger by region.\n` +
+      `    2. The help center should go first.\n` +
+      `    3. Marketing has the assets — I checked yesterday.\n` +
+      `\n` +
+      `RULES:\n` +
+      `- DO NOT use em-dashes anywhere in the output. Use commas, periods, semicolons, or "and"/"but" instead. Steph dislikes em-dashes; never produce one.\n` +
+      `- BULLET CHARACTER for unordered lists: ALWAYS "- " (hyphen + space). NEVER "• " — it doesn't render in markdown apps (Cowork, Slack, Obsidian, Notion, GitHub).\n` +
+      `\n` +
+      `If the screenshot does not clearly show what he is replying to (blank desktop, unrelated content), just do the light polish (Part 2) without restructuring.\n` +
+      `\n` +
+      `Return ONLY the reformatted text. No preamble, no quotes, no explanations, no markdown code fences.`
+    :
     `You revise text written by the user for the focused field${targetAppDescription}.\n\n` +
     `DEFAULT BEHAVIOR (no additional guidance from the user):\n` +
     styleGuidance +
     `- GRAMMATICAL CORRECTNESS IS NON-NEGOTIABLE. If you remove a connector word ("because", "since", "so", "however", "but", "and", "though", etc.) you MUST add proper punctuation (period, em-dash with spaces " — ", semicolon, or comma) to maintain a complete grammatical sentence. Never produce run-on fragments like "more sense the team has..." where two clauses are jammed together with no punctuation between them. If you're unsure whether removing a connector will create a fragment, KEEP the connector.\n` +
     `- WORD SPACING: every word MUST have a space (or appropriate punctuation + space) between it and the next word. Never concatenate two words ("sensethe", "andthen", "tomorrowi"). Never write an em-dash without spaces around it ("sense—the" is wrong; "sense — the" is right).\n\n` +
     `WHEN ADDITIONAL STYLE GUIDANCE IS PROVIDED (a "modifier"):\n` +
-    `- The user has explicitly asked for a change. Follow the guidance precisely — it overrides the default preservation rules.\n` +
-    `- Common modifier patterns and how to handle them:\n` +
-    `  * Tone or length shifts ("make it shorter", "more formal", "casual", "punchier") → adjust throughout, still preserving meaning\n` +
-    `  * Surgical deletions ("remove the sentence about Q4", "drop the part about pricing", "cut the second paragraph") → delete only what was specified, leave everything else as it was\n` +
-    `  * Find-and-replace ("change lukas to kevin", "replace Q3 with Q4") → make exactly that substitution, leave everything else unchanged\n` +
-    `  * Targeted edits ("add a closing line", "make the first sentence punchier") → make only the requested change\n` +
-    `  * Format shifts ("rewrite as a tweet", "as a slack message", "as bullet points") → restructure to match the requested format\n` +
-    `- For surgical edits, change ONLY what the user asked about. Do not also "polish" the rest unless the user said so.\n` +
-    `- For tone or length shifts, adjust throughout while preserving the underlying meaning and content.\n` +
-    `- If the modifier is ambiguous, make a reasonable interpretation. Don't ask clarifying questions — the output is being pasted immediately.\n\n` +
+    `- The user has explicitly asked for a change. Follow the guidance precisely.\n` +
+    `- For SURGICAL edits (find-and-replace, targeted additions/deletions, spelling fixes, "add quotes around X", "Lucas is spelled with a K"): make ONLY that change. Don't also tighten phrasing, don't reflow paragraphs, don't touch anything outside the targeted edit.\n` +
+    `- For STRUCTURAL edits (tone shifts "more formal" / "shorter" / "punchier", format shifts "as a tweet" / "as bullets"): restructure as requested.\n` +
+    `- Try to preserve paragraph breaks unless the modifier explicitly asks for a layout change ("one paragraph", "merge into").\n` +
+    `- If the modifier is ambiguous, make a reasonable interpretation — don't ask clarifying questions, the output pastes immediately.\n\n` +
     `PRE-INSERTED PUNCTUATION (preserve placement):\n` +
     `- This text may have come from voice dictation. A pre-processing step has already inserted commas, periods, paragraph breaks (double newlines), etc. wherever the user said spoken-punctuation cues like "comma" or "new paragraph".\n` +
     `- PRESERVE all existing newlines and paragraph breaks (\\n\\n). Do not flatten them, move them, or merge paragraphs. The user placed them deliberately — keep them.\n` +
@@ -2142,15 +2195,36 @@ async function handleVoiceCommandPolish(
   // Model selection (v11n): callers can override via `model` field.
   // Default is Sonnet for thorough polish-hotkey edits. VTT toggle passes
   // Haiku for fast dictation cleanup.
-  const polishModel = typeof payload.model === "string" && payload.model.trim().length > 0
-    ? payload.model.trim()
-    : "claude-sonnet-4-6";
+  // v15p2 (2026-05-04): "format-response" intent is image-input + quality
+  // sensitive. Force Sonnet regardless of caller override.
+  const polishModel = isFormatResponseIntent
+    ? "claude-sonnet-4-6"
+    : (typeof payload.model === "string" && payload.model.trim().length > 0
+        ? payload.model.trim()
+        : "claude-sonnet-4-6");
 
   // v12: optional vision input — pass focused-app screenshot so polish
   // can match destination tone/style. JPEG base64. Only used when caller
   // includes imageBase64 (currently VTT toggle path passes it).
+  // v15p2 hotfix (2026-05-04, QA #4): cap base64 image size to
+  // prevent OOM / Anthropic timeout from a malformed or malicious
+  // payload. Typical screenshot post-base64 is ~300-500KB; we cap
+  // at ~3MB which gives plenty of headroom for high-res screenshots
+  // while bounding worst case.
+  const maxImageBase64Bytes = 3_000_000;
+  const hasValidImage = typeof payload.imageBase64 === "string"
+    && payload.imageBase64.length > 0
+    && payload.imageBase64.length <= maxImageBase64Bytes;
+  if (
+    typeof payload.imageBase64 === "string"
+    && payload.imageBase64.length > maxImageBase64Bytes
+  ) {
+    console.error(
+      `[/voice-command polish] imageBase64 too large: ${payload.imageBase64.length} bytes (cap ${maxImageBase64Bytes}). Falling back to text-only polish.`
+    );
+  }
   const userMessageContent: Array<Record<string, unknown>> = [];
-  if (typeof payload.imageBase64 === "string" && payload.imageBase64.length > 0) {
+  if (hasValidImage) {
     userMessageContent.push({
       type: "image",
       source: {
@@ -2182,6 +2256,11 @@ async function handleVoiceCommandPolish(
     ],
   };
 
+  // v15p2 (2026-05-04): timing diagnostic. Measure Claude API latency
+  // and report it back so the Mac side can subtract from total
+  // round-trip to estimate net network. Returned alongside output.
+  const claudeStartedAt = Date.now();
+
   const anthropicResponse = await fetch(
     "https://api.anthropic.com/v1/messages",
     {
@@ -2210,15 +2289,16 @@ async function handleVoiceCommandPolish(
   const anthropicResponseJson = (await anthropicResponse.json()) as {
     content?: Array<{ type: string; text?: string }>;
   };
+  const claudeMs = Date.now() - claudeStartedAt;
   const polishedText = (anthropicResponseJson.content ?? [])
     .filter((block) => block.type === "text" && typeof block.text === "string")
     .map((block) => block.text as string)
     .join("");
 
-  return new Response(JSON.stringify({ output: polishedText }), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
+  return new Response(
+    JSON.stringify({ output: polishedText, claudeMs }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
 }
 
 /**
@@ -2345,6 +2425,51 @@ function jsonError(errorMessage: string, statusCode: number): Response {
     status: statusCode,
     headers: { "content-type": "application/json" },
   });
+}
+
+/// v15p2 hotfix (2026-05-04, QA #3): sanitize upstream API errors
+/// before returning them to the Mac client. Strips anything that
+/// looks like an OAuth token / API key / refresh token / bearer
+/// header that an upstream provider might leak in their error
+/// payload. Wraps in a JSON envelope so the client always gets a
+/// parseable response (was: raw text body, breaking client JSON
+/// parsing in addition to the leak risk).
+function sanitizedUpstreamError(
+  routeName: string,
+  upstreamStatus: number,
+  rawBody: string
+): Response {
+  // Token-shaped patterns to redact. Conservative — covers Google,
+  // Slack, OpenAI, Anthropic, GitHub, AWS, generic Bearer.
+  const tokenPatterns: RegExp[] = [
+    /sk-[A-Za-z0-9_-]{20,}/g,                  // OpenAI / Anthropic
+    /xox[baprs]-[A-Za-z0-9-]{10,}/g,           // Slack tokens
+    /ya29\.[A-Za-z0-9_-]{20,}/g,               // Google access tokens
+    /1\/\/[A-Za-z0-9_-]{20,}/g,                // Google refresh tokens
+    /GOCSPX-[A-Za-z0-9_-]{20,}/g,              // Google OAuth client secrets
+    /ghp_[A-Za-z0-9]{20,}/g,                   // GitHub PATs
+    /AKIA[0-9A-Z]{16}/g,                       // AWS access keys
+    /Bearer\s+[A-Za-z0-9._~+/=-]{20,}/gi,      // Bearer headers
+    /\b[A-Fa-f0-9]{40,}\b/g,                   // Long hex strings (often hashes/tokens)
+  ];
+  let sanitized = rawBody;
+  for (const pattern of tokenPatterns) {
+    sanitized = sanitized.replace(pattern, "[REDACTED]");
+  }
+  // Cap the body size to prevent log spam and reduce surface area
+  // for accidental data leaks.
+  if (sanitized.length > 800) {
+    sanitized = sanitized.slice(0, 800) + "…[truncated]";
+  }
+  console.error(`[${routeName}] upstream error ${upstreamStatus}: ${rawBody.slice(0, 500)}`);
+  return new Response(
+    JSON.stringify({
+      error: `Upstream error (${upstreamStatus})`,
+      route: routeName,
+      upstream_body: sanitized,
+    }),
+    { status: upstreamStatus, headers: { "content-type": "application/json" } }
+  );
 }
 
 async function handleGrokTTS(request: Request, env: Env): Promise<Response> {

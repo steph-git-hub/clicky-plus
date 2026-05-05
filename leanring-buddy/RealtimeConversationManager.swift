@@ -43,6 +43,15 @@ import AVFoundation
 import Combine
 import Foundation
 
+/// A completed Marin conversation turn — used by the panel's live
+/// log view. Identifiable so SwiftUI can render in a ForEach.
+struct RealtimeTurn: Identifiable, Equatable {
+    let id = UUID()
+    let timestamp: Date
+    let user: String
+    let assistant: String
+}
+
 /// Possible states of a Realtime conversation session.
 enum RealtimeSessionState: Equatable {
     case idle
@@ -77,6 +86,14 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     @Published private(set) var outputAudioLevel: Float = 0
     @Published private(set) var liveUserTranscript: String = ""
     @Published private(set) var liveAssistantTranscript: String = ""
+
+    /// v15p2 (2026-05-03): rolling log of completed turns in the
+    /// current session, surfaced in the panel as a scrollable
+    /// conversation view. Capped at 30 entries; cleared on cold
+    /// session start (so each session is its own conversation).
+    /// In-flight turn is shown separately via the live transcripts.
+    @Published private(set) var completedTurns: [RealtimeTurn] = []
+    static let maxCompletedTurnsInLog = 30
 
     // MARK: - Configuration
 
@@ -268,7 +285,11 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         sessionGeneration &+= 1
         let myGeneration = sessionGeneration
         audioStateLock.unlock()
+        // v15p2 (2026-05-03): clear panel log so each session is its
+        // own conversation. The persistent history feeds the model
+        // separately on session.created.
         Task { @MainActor in
+            self.completedTurns.removeAll()
             self.state = .connecting
         }
 
@@ -462,7 +483,9 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             sessionGeneration &+= 1
             let myGeneration = sessionGeneration
             audioStateLock.unlock()
+            // v15p2 (2026-05-03): clear panel log on fresh session.
             Task { @MainActor in
+                self.completedTurns.removeAll()
                 self.state = .connecting
             }
             Task.detached { [weak self] in
@@ -2273,6 +2296,16 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         // the session.
         stopBridgePolling()
 
+        // v15p2 hotfix (2026-05-04, QA #1): clear the cancellation
+        // gate so it doesn't carry over into the next session. If the
+        // user Esc'd to cancel a response and then ended the session
+        // before any new response.created arrived, this flag stayed
+        // true — the next session's first audio chunks would silently
+        // get dropped.
+        audioStateLock.lock()
+        responseWasCancelled = false
+        audioStateLock.unlock()
+
         receiveTask?.cancel()
         receiveTask = nil
 
@@ -2690,6 +2723,19 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             // v15p2 (2026-05-03): persist the turn so cold session
             // starts can replay context. Survives app restarts.
             self.appendTurnToHistory(user: userTranscript, assistant: assistantTranscript)
+            // v15p2 (2026-05-03): also append to the in-session
+            // completedTurns log surfaced in the panel. This is
+            // session-scoped — cleared on cold start.
+            let entry = RealtimeTurn(
+                timestamp: Date(),
+                user: userTranscript,
+                assistant: assistantTranscript
+            )
+            self.completedTurns.append(entry)
+            let cap = Self.maxCompletedTurnsInLog
+            if self.completedTurns.count > cap {
+                self.completedTurns = Array(self.completedTurns.suffix(cap))
+            }
         }
     }
 

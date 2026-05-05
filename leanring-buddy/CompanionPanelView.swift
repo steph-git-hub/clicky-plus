@@ -38,6 +38,18 @@ struct CompanionPanelView: View {
                 hotkeyReferenceSection
                     .padding(.horizontal, 16)
 
+                // v15p2 (2026-05-03): live transcripts panel — only
+                // shows when Marin is actively in a session. Helps
+                // catch mishears on proper nouns / technical terms
+                // before they bake into history.
+                if companionManager.isRealtimeModeActive {
+                    Spacer()
+                        .frame(height: 14)
+
+                    marinLiveTranscriptSection
+                        .padding(.horizontal, 16)
+                }
+
                 Spacer()
                     .frame(height: 14)
 
@@ -757,6 +769,146 @@ struct CompanionPanelView: View {
                 hotkeyRow(keys: ["⇧", "⌃"], label: "Polish (tap or hold)", color: DS.Colors.overlayCursorCyan)
             }
         }
+    }
+
+    // MARK: - Marin live transcripts (v15p2, 2026-05-03)
+    //
+    // Scrollable conversation log surfaced in the panel while Marin
+    // is in a session. Each completed turn is appended as a (You,
+    // Marin) pair; the in-flight turn streams live below them. Log
+    // resets on cold session start. Auto-scrolls to bottom as new
+    // text arrives so Steph never has to chase the cursor.
+    //
+    // Visible only when isRealtimeModeActive — when the session ends
+    // the section disappears so the panel doesn't bloat. When
+    // suspended by another mode, a "paused" tag appears in the
+    // header.
+
+    private var marinLiveTranscriptSection: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Text("Conversation")
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+                Spacer()
+                if companionManager.isRealtimeSuspendedByOtherMode {
+                    Text("paused")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(DS.Colors.borderSubtle.opacity(0.5))
+                        )
+                }
+            }
+            .padding(.bottom, 6)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(companionManager.realtimeCompletedTurns) { turn in
+                            if !turn.user.isEmpty {
+                                transcriptRow(
+                                    label: "You",
+                                    text: turn.user,
+                                    accent: DS.Colors.overlayCursorBlue
+                                )
+                            }
+                            if !turn.assistant.isEmpty {
+                                transcriptRow(
+                                    label: "Marin",
+                                    text: turn.assistant,
+                                    accent: DS.Colors.overlayCursorMagenta
+                                )
+                            }
+                        }
+                        // In-flight turn — only show rows that have
+                        // content yet, with a placeholder until the
+                        // first chars arrive.
+                        let liveUser = companionManager.realtimeUserTranscript
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        let liveAssistant = companionManager.realtimeAssistantTranscript
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !liveUser.isEmpty {
+                            transcriptRow(
+                                label: "You",
+                                text: liveUser,
+                                accent: DS.Colors.overlayCursorBlue
+                            )
+                        }
+                        if !liveAssistant.isEmpty {
+                            transcriptRow(
+                                label: "Marin",
+                                text: liveAssistant,
+                                accent: DS.Colors.overlayCursorMagenta
+                            )
+                        }
+                        // Idle placeholder when nothing's happening yet
+                        if companionManager.realtimeCompletedTurns.isEmpty
+                            && liveUser.isEmpty
+                            && liveAssistant.isEmpty {
+                            Text("Listening… speak to Marin and your conversation will appear here.")
+                                .font(.system(size: 11, weight: .regular).italic())
+                                .foregroundColor(DS.Colors.textSecondary)
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .fill(DS.Colors.borderSubtle.opacity(0.2))
+                                )
+                        }
+                        // Bottom anchor for auto-scroll.
+                        Color.clear
+                            .frame(height: 1)
+                            .id("transcript-bottom")
+                    }
+                }
+                .frame(maxHeight: 280)
+                .onChange(of: companionManager.realtimeAssistantTranscript) { _ in
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo("transcript-bottom", anchor: .bottom)
+                    }
+                }
+                .onChange(of: companionManager.realtimeUserTranscript) { _ in
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo("transcript-bottom", anchor: .bottom)
+                    }
+                }
+                .onChange(of: companionManager.realtimeCompletedTurns.count) { _ in
+                    withAnimation(.easeOut(duration: 0.15)) {
+                        proxy.scrollTo("transcript-bottom", anchor: .bottom)
+                    }
+                }
+            }
+        }
+    }
+
+    private func transcriptRow(
+        label: String,
+        text: String,
+        accent: Color
+    ) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text(label)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundColor(accent)
+                .frame(width: 42, alignment: .leading)
+                .padding(.top, 1)
+            Text(text)
+                .font(.system(size: 12, weight: .regular))
+                .foregroundColor(DS.Colors.textPrimary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(DS.Colors.borderSubtle.opacity(0.2))
+        )
     }
 
     // MARK: - Indicator Style Picker (v15b 2026-05-01)

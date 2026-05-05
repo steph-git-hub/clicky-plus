@@ -603,6 +603,20 @@ final class CompanionManager: ObservableObject {
     /// always `.idle` during Marin sessions.
     @Published private(set) var realtimeSessionState: RealtimeSessionState = .idle
 
+    /// v15p2 (2026-05-03): Marin's live transcripts mirrored for the
+    /// panel's transcript view. Both stream in real time as the
+    /// turn unfolds. Cleared at end of turn.
+    @Published private(set) var realtimeUserTranscript: String = ""
+    @Published private(set) var realtimeAssistantTranscript: String = ""
+    private var realtimeUserTranscriptCancellable: AnyCancellable?
+    private var realtimeAssistantTranscriptCancellable: AnyCancellable?
+
+    /// v15p2 (2026-05-03): rolling log of completed Marin turns in
+    /// the current session, mirrored from RealtimeConversationManager.
+    /// Cleared on cold session start.
+    @Published private(set) var realtimeCompletedTurns: [RealtimeTurn] = []
+    private var realtimeCompletedTurnsCancellable: AnyCancellable?
+
     /// v15p2 (2026-05-03): timestamp of last Esc handled for Realtime
     /// double-tap detection (force-end on second press within 1.5s).
     private var lastEscapeKeyForRealtime: Date?
@@ -687,6 +701,21 @@ final class CompanionManager: ObservableObject {
     /// threshold (during the first ~300ms of the hold).
     private var isPolishHotkeyDictatingForModifier: Bool = false
     private var polishHotkeyHoldEngageTask: Task<Void, Never>?
+    /// v15p2 hotfix (2026-05-04): set true after the tap-vs-hold
+    /// threshold elapses while the hotkey is still held. Used by
+    /// the release handler to decide between tap (instant polish)
+    /// and hold (use captured modifier) paths. Replaces the older
+    /// "did dictation engage" check, which forced a 300ms wait
+    /// before audio capture started and clipped the first word.
+    private var polishHotkeyHoldThresholdPassed: Bool = false
+    /// v15p2 hotfix (2026-05-04, QA #2): set true when the tap
+    /// release-path cancels the dictation. The submitDraftText
+    /// closure checks this and bails out — without it, the closure
+    /// could still fire (cancellation isn't synchronous through the
+    /// transcription pipeline) and apply the partial 50-150ms of
+    /// audio as a polish modifier in addition to the instant-polish
+    /// from the release path. Net effect on tap: polish ran twice.
+    private var polishHotkeyDictationWasCancelled: Bool = false
     private var pendingPolishHotkeyDictationTask: Task<Void, Never>?
 
     /// Screenshot burst mode state (Fn+Ctrl+Opt).
@@ -2845,6 +2874,23 @@ final class CompanionManager: ObservableObject {
                 guard let self else { return }
                 self.realtimeInputAudioLevel = CGFloat(rms)
             }
+        // v15p2 (2026-05-03): mirror live transcripts so the panel
+        // can show them in real time.
+        realtimeUserTranscriptCancellable = manager.$liveUserTranscript
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] transcript in
+                self?.realtimeUserTranscript = transcript
+            }
+        realtimeAssistantTranscriptCancellable = manager.$liveAssistantTranscript
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] transcript in
+                self?.realtimeAssistantTranscript = transcript
+            }
+        realtimeCompletedTurnsCancellable = manager.$completedTurns
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] turns in
+                self?.realtimeCompletedTurns = turns
+            }
     }
 
     /// v15p2 (2026-05-02): handle Fn+Cmd+Opt toggle press.
@@ -2924,18 +2970,30 @@ final class CompanionManager: ObservableObject {
 
             polishHotkeyPressedAt = Date()
             isPolishHotkeyHeld = true
+            polishHotkeyHoldThresholdPassed = false
+            // v15p2 hotfix (2026-05-04, QA #2): clear cancel flag so
+            // a stale value from a prior tap doesn't suppress the
+            // submit callback for this press.
+            polishHotkeyDictationWasCancelled = false
 
-            // Schedule the threshold check. If the user is still holding
-            // when this fires, we engage dictation for modifier capture.
-            // If they release first, the .released branch cancels this
-            // task and fires polish with no modifier instead.
+            // v15p2 hotfix (2026-05-04): start dictation IMMEDIATELY on
+            // press so the first word of the spoken modifier ("format"
+            // in "format response") doesn't get clipped during the 300ms
+            // tap-vs-hold threshold. If the user releases before the
+            // threshold (a tap), we cancel the dictation cleanly and
+            // run instant polish — net behavior identical to before
+            // for taps, but holds now capture the full utterance.
+            engagePolishHotkeyDictationForSpokenModifier()
+
+            // Threshold timer just flips a flag we read on release.
+            // The dictation is already running regardless.
             polishHotkeyHoldEngageTask?.cancel()
             polishHotkeyHoldEngageTask = Task { [weak self] in
                 let thresholdNanoseconds = UInt64(Self.polishHotkeyHoldThresholdSeconds * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: thresholdNanoseconds)
                 guard !Task.isCancelled, let self else { return }
                 guard self.isPolishHotkeyHeld else { return }
-                self.engagePolishHotkeyDictationForSpokenModifier()
+                self.polishHotkeyHoldThresholdPassed = true
             }
 
         case .released:
@@ -2949,28 +3007,44 @@ final class CompanionManager: ObservableObject {
             polishHotkeyHoldEngageTask?.cancel()
             polishHotkeyHoldEngageTask = nil
 
+            let wasHold = polishHotkeyHoldThresholdPassed
+            polishHotkeyHoldThresholdPassed = false
+
             if isPolishHotkeyDictatingForModifier {
-                // Hold case: dictation was engaged during the hold.
-                // Stop it; the submitDraftText callback will receive the
-                // final transcript and fire polish with it as modifier.
+                if wasHold {
+                    // Hold: stop dictation normally. submitDraftText
+                    // callback fires with the captured modifier and
+                    // executes polish.
+                    isPolishHotkeyDictatingForModifier = false
+                    isPolishHotkeyModifierCaptureModeActive = false
+                    pendingPolishHotkeyDictationTask?.cancel()
+                    pendingPolishHotkeyDictationTask = nil
+                    buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+                    ClickyAnalytics.trackPushToTalkReleased()
+                    return
+                }
+                // Tap: cancel the dictation and run instant polish.
+                // Set the cancel flag BEFORE calling cancel — the
+                // submit closure will see it and bail out, preventing
+                // a duplicate polish call on partial audio.
+                polishHotkeyDictationWasCancelled = true
                 isPolishHotkeyDictatingForModifier = false
                 isPolishHotkeyModifierCaptureModeActive = false
                 pendingPolishHotkeyDictationTask?.cancel()
                 pendingPolishHotkeyDictationTask = nil
-                buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
-                ClickyAnalytics.trackPushToTalkReleased()
+                buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
+                ClickyAnalytics.trackPushToTalkStarted()
+                executePolishCommandOnFocusedField(modifier: nil)
                 return
             }
 
-            // Tap case: released before the threshold. Fire polish with
-            // no modifier. This is the quick "clean this field" path.
+            // Fall-through: dictation never engaged (probably another
+            // mode was already active when press fired). Old tap-only
+            // behavior — fire instant polish if the press was short.
             if polishHotkeyHeldDuration < Self.polishHotkeyHoldThresholdSeconds {
                 ClickyAnalytics.trackPushToTalkStarted()
                 executePolishCommandOnFocusedField(modifier: nil)
             }
-            // Edge case: held past threshold but dictation never engaged
-            // (e.g. another mode was already active when threshold fired).
-            // Silent no-op — we don't want a surprise polish here.
 
         case .none:
             break
@@ -3013,6 +3087,18 @@ final class CompanionManager: ObservableObject {
                 updateDraftText: { _ in },
                 submitDraftText: { [weak self] finalSpokenModifierTranscript in
                     guard let self else { return }
+                    // v15p2 hotfix (2026-05-04, QA #2): the closure
+                    // captures `self` and can fire AFTER the user
+                    // released as a tap (which calls
+                    // cancelCurrentDictation). Without this guard,
+                    // the partial transcribed audio (~50-150ms) would
+                    // be applied as a polish modifier in addition to
+                    // the explicit instant-polish from the release
+                    // path — net result: polish ran twice on a tap.
+                    // Set by the tap-release path; cleared on press.
+                    if self.polishHotkeyDictationWasCancelled {
+                        return
+                    }
                     self.lastTranscript = finalSpokenModifierTranscript
                     ClickyAnalytics.trackUserMessageSent(transcript: finalSpokenModifierTranscript)
 
@@ -3050,6 +3136,17 @@ final class CompanionManager: ObservableObject {
         let fieldContent = FocusedElementContextProvider.captureFieldContentForPolish()
         let resolvedWorkerBaseURL = Self.workerBaseURL
 
+        // v15p2 (2026-05-04): "format response" voice modifier. Match
+        // ONLY at the start of the spoken modifier so phrases like
+        // "make this say format response" don't false-trigger. Anything
+        // after "format response" (e.g. "format response, make it
+        // shorter") becomes the trailing modifier hint.
+        let (isFormatResponseIntent, residualModifier) =
+            Self.detectFormatResponseIntent(spokenModifier: modifier)
+
+        // Phase-start timestamp for the latency diagnostic log.
+        let polishStartedAt = Date()
+
         pendingPolishCommandTask?.cancel()
         pendingPolishCommandTask = Task { [weak self] in
             defer {
@@ -3070,16 +3167,37 @@ final class CompanionManager: ObservableObject {
                 return
             }
 
+            // v15p2 (2026-05-04): capture screenshot for the format-
+            // response intent. Lifted from CompanionScreenCaptureUtility
+            // (same path Marin uses for vision). Runs before the Worker
+            // call so we can include it in the request.
+            let captureStartedAt = Date()
+            var screenshotJPEG: Data? = nil
+            if isFormatResponseIntent {
+                do {
+                    let capture = try await CompanionScreenCaptureUtility.captureActiveScreenAsJPEG()
+                    screenshotJPEG = capture.imageData
+                } catch {
+                    print("⚠️ Format-response screenshot failed (\(error)) — falling through to text-only polish")
+                }
+            }
+            let captureCompletedAt = Date()
+
             do {
-                let polishedText = try await Self.sendPolishCommandToWorker(
+                let networkStartedAt = Date()
+                let detailed = try await Self.sendPolishCommandToWorkerDetailed(
                     workerBaseURL: resolvedWorkerBaseURL,
                     fieldText: textToPolish,
-                    modifier: modifier,
+                    modifier: residualModifier,
                     appName: fieldContent?.appName,
                     role: fieldContent?.role,
                     windowTitle: fieldContent?.windowTitle,
-                    personalFacts: Self.loadCurrentObsidianMemoryContents()
+                    personalFacts: Self.loadCurrentObsidianMemoryContents(),
+                    contextImageJPEG: screenshotJPEG,
+                    intent: isFormatResponseIntent ? "format-response" : nil
                 )
+                let polishedText = detailed.output
+                let networkCompletedAt = Date()
 
                 guard !Task.isCancelled else { return }
 
@@ -3124,6 +3242,30 @@ final class CompanionManager: ObservableObject {
                     screenshotPaths: [],
                     polishStatus: "ok"
                 ))
+                // v15p2 (2026-05-04): timing diagnostic log — establishes
+                // baseline for default vs format-response so any future
+                // regression is detectable.
+                let pasteCompletedAt = Date()
+                let captureMs = Int(captureCompletedAt.timeIntervalSince(captureStartedAt) * 1000)
+                let networkMs = Int(networkCompletedAt.timeIntervalSince(networkStartedAt) * 1000)
+                let pasteMs = Int(pasteCompletedAt.timeIntervalSince(networkCompletedAt) * 1000)
+                let totalMs = Int(pasteCompletedAt.timeIntervalSince(polishStartedAt) * 1000)
+                let screenshotKB: Int = {
+                    guard let bytes = screenshotJPEG?.count else { return 0 }
+                    // Worker receives base64, ~4/3 of raw bytes.
+                    return (bytes * 4 / 3) / 1024
+                }()
+                Self.appendPolishTimingLog(
+                    intent: isFormatResponseIntent ? "format-response" : "default",
+                    captureMs: isFormatResponseIntent ? captureMs : 0,
+                    encodeMs: 0, // base64 encode time bundled in network for now
+                    networkMs: networkMs,
+                    claudeMs: detailed.claudeMs,
+                    pasteMs: pasteMs,
+                    totalMs: totalMs,
+                    fieldChars: textToPolish.count,
+                    screenshotKB: screenshotKB
+                )
             } catch is CancellationError {
                 // User triggered another action mid-flight — drop silently.
             } catch {
@@ -3364,6 +3506,14 @@ final class CompanionManager: ObservableObject {
     /// remember" textarea contents. Worker injects them into the polish
     /// system prompt alongside the static memory block so polish has
     /// the same identity + context awareness as PTT and typing mode.
+    /// v15p2 (2026-05-04): result type so callers can inspect server-
+    /// reported Claude latency for timing diagnostics. The String-only
+    /// shim below preserves the existing call sites.
+    struct PolishCommandResult {
+        let output: String
+        let claudeMs: Int
+    }
+
     private static func sendPolishCommandToWorker(
         workerBaseURL: String,
         fieldText: String,
@@ -3376,6 +3526,35 @@ final class CompanionManager: ObservableObject {
         polishStyle: String? = nil,
         contextImageJPEG: Data? = nil
     ) async throws -> String {
+        let detailed = try await sendPolishCommandToWorkerDetailed(
+            workerBaseURL: workerBaseURL,
+            fieldText: fieldText,
+            modifier: modifier,
+            appName: appName,
+            role: role,
+            windowTitle: windowTitle,
+            personalFacts: personalFacts,
+            modelOverride: modelOverride,
+            polishStyle: polishStyle,
+            contextImageJPEG: contextImageJPEG,
+            intent: nil
+        )
+        return detailed.output
+    }
+
+    private static func sendPolishCommandToWorkerDetailed(
+        workerBaseURL: String,
+        fieldText: String,
+        modifier: String?,
+        appName: String?,
+        role: String?,
+        windowTitle: String?,
+        personalFacts: String?,
+        modelOverride: String? = nil,
+        polishStyle: String? = nil,
+        contextImageJPEG: Data? = nil,
+        intent: String? = nil
+    ) async throws -> PolishCommandResult {
         guard let voiceCommandRouteURL = URL(string: "\(workerBaseURL)/voice-command") else {
             throw NSError(
                 domain: "ClickyVoiceCommandError",
@@ -3423,6 +3602,9 @@ final class CompanionManager: ObservableObject {
             // ~50-200KB per image after compression, ~70-280KB after base64.
             requestBody["imageBase64"] = contextImageJPEG.base64EncodedString()
         }
+        if let intent, !intent.isEmpty {
+            requestBody["intent"] = intent
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
 
         let (responseData, response) = try await URLSession.shared.data(for: request)
@@ -3445,7 +3627,206 @@ final class CompanionManager: ObservableObject {
             )
         }
 
-        return outputText
+        let claudeMs = (parsedResponse["claudeMs"] as? Int)
+            ?? (parsedResponse["claudeMs"] as? Double).map { Int($0) }
+            ?? 0
+        return PolishCommandResult(output: outputText, claudeMs: claudeMs)
+    }
+
+    // MARK: - Format-response intent detection (v15p2, 2026-05-04)
+
+    /// Match "format response" (and common transcription variants)
+    /// at the START of the spoken polish modifier. Returns
+    /// (matched, residual) — the residual is the text after the
+    /// matched phrase, stripped of leading separators, which
+    /// becomes the modifier hint passed to the Worker. So
+    /// "format response, make it shorter" → (true, "make it shorter").
+    ///
+    /// Mid-utterance occurrences ("make this say format response")
+    /// don't match — start-of-utterance only, same pattern as the
+    /// other voice command verbs.
+    ///
+    /// v15p2 hotfix (2026-05-04): broadened to handle "format the/
+    /// my/this response" and trailing punctuation (transcription
+    /// often slips an article or comma in).
+    static func detectFormatResponseIntent(spokenModifier: String?) -> (Bool, String?) {
+        guard let raw = spokenModifier?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return (false, spokenModifier)
+        }
+        // Normalize: lowercase, strip leading/trailing punctuation.
+        let punctuationToTrim = CharacterSet.punctuationCharacters
+            .union(.whitespacesAndNewlines)
+        let cleaned = raw.trimmingCharacters(in: punctuationToTrim)
+        let lower = cleaned.lowercased()
+        // Match patterns at start (longest first so "format the response"
+        // doesn't get matched as "format" leaving " the response" residual).
+        let candidatePhrases: [String] = [
+            "format the response",
+            "format my response",
+            "format this response",
+            "format that response",
+            "format response",
+            "format reply",
+            "format the reply",
+            "format my reply",
+            "format the message",
+            "match the format",
+            "match the formatting",
+            "match formatting",
+            "match format",
+        ]
+        var matchedPhrase: String? = nil
+        for phrase in candidatePhrases {
+            if lower.hasPrefix(phrase) {
+                matchedPhrase = phrase
+                break
+            }
+        }
+        // v15p2 hotfix2 (2026-05-04): the polish modifier dictation
+        // path has a cold-start audio race that often drops the first
+        // word ("format" gets clipped, just "response" makes it
+        // through). If the cleaned utterance is short and is exactly
+        // or ends with "response"/"reply"/"format", treat it as a
+        // truncated format-response trigger. The short-length guard
+        // (<=20 chars) keeps false positives from real responses
+        // containing those words. Also handle the leading-only case
+        // like "the response", "my response", "this response".
+        if matchedPhrase == nil && lower.count <= 20 {
+            let truncatedTriggers: [String] = [
+                "response",
+                "reply",
+                "the response",
+                "my response",
+                "this response",
+                "that response",
+                "format",
+                "format the",
+                "format my",
+                "format this",
+            ]
+            for tr in truncatedTriggers {
+                if lower == tr || lower.hasSuffix(" \(tr)") || lower == "\(tr)." {
+                    matchedPhrase = tr
+                    break
+                }
+            }
+        }
+        guard let phrase = matchedPhrase else {
+            // Diag: log what the user actually said so we can see why
+            // detection missed (and add patterns if they're real).
+            print("⚠️ Polish: 'format response' not detected in spoken modifier: \"\(cleaned)\"")
+            appendFormatResponseDetectionLog(
+                matched: false,
+                phrase: nil,
+                rawModifier: spokenModifier,
+                cleaned: cleaned
+            )
+            return (false, spokenModifier)
+        }
+        // Strip the matched phrase + any leading separators from the
+        // remaining text. The original `raw` may have had punctuation
+        // — work from `cleaned` to keep things simple.
+        let afterPhrase = String(cleaned.dropFirst(phrase.count))
+        var residual = afterPhrase.trimmingCharacters(in: .whitespacesAndNewlines)
+        let leadingSeparators: [String] = [",", ".", ":", ";", "—", "-", "and ", "then ", "also "]
+        var changed = true
+        while changed {
+            changed = false
+            for sep in leadingSeparators {
+                if residual.lowercased().hasPrefix(sep.lowercased()) {
+                    residual = String(residual.dropFirst(sep.count))
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    changed = true
+                }
+            }
+        }
+        print("✅ Polish: format-response intent detected — phrase=\"\(phrase)\" residual=\"\(residual)\"")
+        appendFormatResponseDetectionLog(
+            matched: true,
+            phrase: phrase,
+            rawModifier: spokenModifier,
+            cleaned: cleaned
+        )
+        return (true, residual.isEmpty ? nil : residual)
+    }
+
+    /// v15p2 (2026-05-04): write detection attempts to a file so we
+    /// can debug missed matches without having to read Console.app.
+    private static let formatResponseDetectionLogPath = "/tmp/clicky_format_response_detection.log"
+    private static func appendFormatResponseDetectionLog(
+        matched: Bool,
+        phrase: String?,
+        rawModifier: String?,
+        cleaned: String
+    ) {
+        let formatter = ISO8601DateFormatter()
+        let line = "\(formatter.string(from: Date()))\t\(matched ? "MATCHED" : "MISSED")\tphrase=\"\(phrase ?? "")\"\traw=\"\(rawModifier ?? "")\"\tcleaned=\"\(cleaned)\"\n"
+        guard let data = line.data(using: .utf8) else { return }
+        let url = URL(fileURLWithPath: formatResponseDetectionLogPath)
+        let fm = FileManager.default
+        if fm.fileExists(atPath: formatResponseDetectionLogPath) {
+            if let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            }
+        } else {
+            try? data.write(to: url)
+        }
+    }
+
+    // MARK: - Polish timing diagnostic log (v15p2, 2026-05-04)
+
+    private static let polishTimingLogPath = "/tmp/clicky_polish_timing.log"
+    private static let polishTimingLogQueue = DispatchQueue(
+        label: "com.stephenpierson.clickyplus.polish-timing-log"
+    )
+
+    /// Append a single line to the polish timing diagnostic log so we
+    /// can A/B default vs format-response latency distributions over
+    /// real usage. CSV-ish — one line per Polish invocation.
+    /// Format: `timestamp,intent,captureMs,encodeMs,networkMs,claudeMs,pasteMs,totalMs,fieldChars,screenshotKB`
+    private static func appendPolishTimingLog(
+        intent: String,
+        captureMs: Int,
+        encodeMs: Int,
+        networkMs: Int,
+        claudeMs: Int,
+        pasteMs: Int,
+        totalMs: Int,
+        fieldChars: Int,
+        screenshotKB: Int
+    ) {
+        polishTimingLogQueue.async {
+            let formatter = ISO8601DateFormatter()
+            let line = [
+                formatter.string(from: Date()),
+                intent,
+                String(captureMs),
+                String(encodeMs),
+                String(networkMs),
+                String(claudeMs),
+                String(pasteMs),
+                String(totalMs),
+                String(fieldChars),
+                String(screenshotKB),
+            ].joined(separator: ",") + "\n"
+            guard let data = line.data(using: .utf8) else { return }
+            let path = polishTimingLogPath
+            let url = URL(fileURLWithPath: path)
+            let fm = FileManager.default
+            if fm.fileExists(atPath: path) {
+                if let handle = try? FileHandle(forWritingTo: url) {
+                    defer { try? handle.close() }
+                    try? handle.seekToEnd()
+                    try? handle.write(contentsOf: data)
+                }
+            } else {
+                let header = "timestamp,intent,captureMs,encodeMs,networkMs,claudeMs,pasteMs,totalMs,fieldChars,screenshotKB\n".data(using: .utf8) ?? Data()
+                try? (header + data).write(to: url)
+            }
+        }
     }
 
     /// Appends the raw transcript to the user's Obsidian Idea Inbox.
