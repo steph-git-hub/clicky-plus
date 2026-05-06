@@ -2867,12 +2867,25 @@ final class CompanionManager: ObservableObject {
         // shared currentAudioPowerLevel so the indicator pulses with
         // voice while she's listening (was flat-line before — the
         // legacy buddyDictationManager level is 0 when Marin owns
-        // the mic). RMS is 0…1; we scale to CGFloat directly.
+        // the mic).
+        //
+        // v15p3 (2026-05-06): the original bridge passed raw RMS through
+        // unboosted, but legacy `updateAudioPowerLevel` in
+        // BuddyDictationManager applies `rms * 10.2` (clamped) PLUS a
+        // decay-smoothing pass (max with prev * 0.72). Without those, the
+        // EdgeLineIndicator halo never expanded meaningfully — typical
+        // Realtime RMS is 0.01-0.05 even during speech, and `pow(level,
+        // 0.55)` then yields a halo extension of <15px on a 3px core.
+        // User read this as "solid pink bar — pulsing gradient isn't
+        // working." Mirror legacy's boost + smoothing here so both audio
+        // sources hand the indicator comparable amplitudes.
         realtimeInputAudioLevelCancellable = manager.$inputAudioLevel
             .receive(on: DispatchQueue.main)
             .sink { [weak self] rms in
                 guard let self else { return }
-                self.realtimeInputAudioLevel = CGFloat(rms)
+                let boosted = CGFloat(min(max(rms * 10.2, 0), 1))
+                let smoothed = max(boosted, self.realtimeInputAudioLevel * 0.72)
+                self.realtimeInputAudioLevel = smoothed
             }
         // v15p2 (2026-05-03): mirror live transcripts so the panel
         // can show them in real time.
