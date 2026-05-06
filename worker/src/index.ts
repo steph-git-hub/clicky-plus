@@ -2275,14 +2275,18 @@ async function handleVoiceCommandPolish(
   );
 
   if (!anthropicResponse.ok) {
+    // v15p3 (2026-05-06): route through sanitizedUpstreamError like
+    // every other Anthropic-call route. The previous direct return
+    // logged the raw error body and sent unredacted bytes back to the
+    // client — inconsistent with the 8 other routes that already
+    // sanitize, and a real leak risk if Anthropic ever echoes request
+    // headers (including auth) into their error payload.
     const errorBody = await anthropicResponse.text();
-    console.error(
-      `[/voice-command polish] Anthropic API error ${anthropicResponse.status}: ${errorBody}`
+    return sanitizedUpstreamError(
+      "/voice-command polish",
+      anthropicResponse.status,
+      errorBody
     );
-    return new Response(errorBody, {
-      status: anthropicResponse.status,
-      headers: { "content-type": "application/json" },
-    });
   }
 
   // Non-streaming Anthropic response shape: { content: [{ type: "text", text: "..." }, ...], ... }
@@ -2439,16 +2443,27 @@ function sanitizedUpstreamError(
   upstreamStatus: number,
   rawBody: string
 ): Response {
-  // Token-shaped patterns to redact. Conservative — covers Google,
-  // Slack, OpenAI, Anthropic, GitHub, AWS, generic Bearer.
+  // Token-shaped patterns to redact. v15p3 (2026-05-06): expanded to
+  // cover Anthropic newer-prefix keys (sk-ant-), Notion integration
+  // tokens (secret_), generic JWTs (eyJ…), Linear (lin_), Asana PATs
+  // (1/...), Stripe live keys (sk_live_, rk_live_). The original list
+  // missed everything except the OpenAI-era prefixes.
   const tokenPatterns: RegExp[] = [
-    /sk-[A-Za-z0-9_-]{20,}/g,                  // OpenAI / Anthropic
+    /sk-ant-[A-Za-z0-9_-]{20,}/g,              // Anthropic newer prefix
+    /sk-[A-Za-z0-9_-]{20,}/g,                  // OpenAI / Anthropic legacy
+    /sk_live_[A-Za-z0-9]{20,}/g,               // Stripe live secret
+    /rk_live_[A-Za-z0-9]{20,}/g,               // Stripe live restricted
     /xox[baprs]-[A-Za-z0-9-]{10,}/g,           // Slack tokens
     /ya29\.[A-Za-z0-9_-]{20,}/g,               // Google access tokens
     /1\/\/[A-Za-z0-9_-]{20,}/g,                // Google refresh tokens
+    /1\/[A-Za-z0-9]{15,}/g,                    // Asana PATs (less specific; keep after Google refresh)
     /GOCSPX-[A-Za-z0-9_-]{20,}/g,              // Google OAuth client secrets
     /ghp_[A-Za-z0-9]{20,}/g,                   // GitHub PATs
+    /github_pat_[A-Za-z0-9_]{20,}/g,           // GitHub fine-grained PATs
+    /lin_[A-Za-z0-9]{20,}/g,                   // Linear API keys
+    /secret_[A-Za-z0-9]{20,}/g,                // Notion integration tokens
     /AKIA[0-9A-Z]{16}/g,                       // AWS access keys
+    /eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, // JWTs (header.payload.sig)
     /Bearer\s+[A-Za-z0-9._~+/=-]{20,}/gi,      // Bearer headers
     /\b[A-Fa-f0-9]{40,}\b/g,                   // Long hex strings (often hashes/tokens)
   ];
@@ -2461,7 +2476,12 @@ function sanitizedUpstreamError(
   if (sanitized.length > 800) {
     sanitized = sanitized.slice(0, 800) + "…[truncated]";
   }
-  console.error(`[${routeName}] upstream error ${upstreamStatus}: ${rawBody.slice(0, 500)}`);
+  // v15p3 (2026-05-06): log the SANITIZED body, not the raw one. The
+  // prior version called `rawBody.slice(0, 500)` BEFORE any redaction
+  // ran, which meant any tokens in the upstream error body would land
+  // unredacted in Cloudflare's persistent log surface — defeating the
+  // entire point of the redaction pass below it.
+  console.error(`[${routeName}] upstream error ${upstreamStatus}: ${sanitized.slice(0, 500)}`);
   return new Response(
     JSON.stringify({
       error: `Upstream error (${upstreamStatus})`,

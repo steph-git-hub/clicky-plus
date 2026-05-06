@@ -905,6 +905,19 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         submitDraftText: @escaping (String) -> Void,
         shouldAutomaticallySubmitFinalDraftOnStop: Bool
     ) async {
+        // v15p3 (2026-05-06): break the toggle-stuck race. If a prior
+        // session is still finalizing (rapid disengage→re-engage during
+        // the 2.4s fallback window), `isDictationInProgress` is still
+        // true via `isFinalizingTranscript`, and the guard below silently
+        // no-ops. User-visible symptom: hold or toggle mode does nothing
+        // on subsequent presses for a couple seconds. Cancel the prior
+        // session cleanly so the new one can run.
+        if isFinalizingTranscript {
+            print("🎙️ BuddyDictationManager: previous session still finalizing — force-resetting to allow new session")
+            Self.appendAudioDiag("FORCE_RESET_FROM_FINALIZE startSource=\(startSource)")
+            cancelCurrentDictation(preserveDraftText: false)
+        }
+
         guard !isDictationInProgress else { return }
 
         print("🎙️ BuddyDictationManager: start requested (\(startSource))")
@@ -1156,6 +1169,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         let finalDraftText = composeDraftText(withTranscribedText: latestRecognizedText)
         let finalTranscriptText = latestRecognizedText.trimmingCharacters(in: .whitespacesAndNewlines)
         let currentDraftCallbacks = draftCallbacks
+        // v15p3 (2026-05-06): capture start source for empty-transcript
+        // diagnostics. resetSessionState() below nils it out, so we have
+        // to grab it first or the log loses the mode that bailed.
+        let startSourceForLogging = activeStartSource
 
         if !shouldSubmitFinalDraft && !finalDraftText.isEmpty {
             currentDraftCallbacks?.updateDraftText(finalDraftText)
@@ -1166,7 +1183,17 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         resetSessionState()
 
         guard shouldSubmitFinalDraft else { return }
-        guard !finalTranscriptText.isEmpty else { return }
+        guard !finalTranscriptText.isEmpty else {
+            // v15p3 (2026-05-06): surface "no output" to the diagnostic log
+            // so we can correlate with audio failures, network blips, or
+            // user-spoke-too-softly cases. Used to be silent — user saw
+            // spinner clear with nothing pasted and no signal of why.
+            // Common causes: AssemblyAI fallback fired before final transcript
+            // arrived; mic captured silence; first-buffer audio race.
+            print("⚠️ BuddyDictationManager: empty final transcript — nothing to paste (startSource=\(String(describing: startSourceForLogging)))")
+            Self.appendAudioDiag("EMPTY_TRANSCRIPT_ON_FINALIZE startSource=\(String(describing: startSourceForLogging))")
+            return
+        }
 
         currentDraftCallbacks?.submitDraftText(finalDraftText)
     }

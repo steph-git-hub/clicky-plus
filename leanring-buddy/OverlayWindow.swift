@@ -218,6 +218,23 @@ struct BlueCursorView: View {
     /// becomes the universal indicator across idle/listening/processing
     /// states instead of swapping in the waveform/spinner views.
     private var dotModeForVoiceState: CursorPresenceDot.DotMode {
+        // v15p3 (2026-05-06): bridge Realtime state into the dot
+        // indicator the same way `lineModeForVoiceState` does. Without
+        // this, the dot indicator stayed in `.idle` mode through every
+        // Realtime session because voiceState only tracks
+        // buddyDictationManager — Steph saw no listening / processing
+        // animation when Marin was active.
+        if companionManager.isRealtimeModeActive
+            && !companionManager.isRealtimeSuspendedByOtherMode {
+            switch companionManager.realtimeSessionState {
+            case .listening:
+                return .listening
+            case .responding:
+                return .processing
+            case .connecting, .idle, .errored:
+                return .idle
+            }
+        }
         switch companionManager.voiceState {
         case .listening:
             return .listening
@@ -226,6 +243,32 @@ struct BlueCursorView: View {
         case .idle, .responding:
             return .idle
         }
+    }
+
+    /// v15p3 (2026-05-06): unified "is the listening visual active"
+    /// check. Used by waveform + spinner opacity modifiers so they
+    /// react to BOTH the legacy voiceState pipeline (VTT/Polish/etc)
+    /// AND the Realtime session state. Previously the waveform/spinner
+    /// only reacted to voiceState — invisible across Realtime sessions.
+    private var isListeningForIndicator: Bool {
+        if companionManager.isRealtimeModeActive
+            && !companionManager.isRealtimeSuspendedByOtherMode {
+            return companionManager.realtimeSessionState == .listening
+        }
+        return companionManager.voiceState == .listening
+    }
+
+    private var isProcessingForIndicator: Bool {
+        if companionManager.isRealtimeModeActive
+            && !companionManager.isRealtimeSuspendedByOtherMode {
+            switch companionManager.realtimeSessionState {
+            case .responding, .connecting:
+                return true
+            case .listening, .idle, .errored:
+                return false
+            }
+        }
+        return companionManager.voiceState == .processing
     }
 
     /// v15i: capture the most-recent NON-default tint so the indicator
@@ -629,13 +672,14 @@ struct BlueCursorView: View {
                 // Each handles its own listening visual.
                 .opacity(
                     buddyIsVisibleOnThisScreen
-                        && companionManager.voiceState == .listening
+                        && isListeningForIndicator
                         && !selfContainedStyleActive
                         ? cursorOpacity : 0
                 )
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
+                .animation(.easeIn(duration: 0.15), value: companionManager.realtimeSessionState)
                 .animation(.easeInOut(duration: 0.15), value: companionManager.isBurstModeActive)
                 .animation(.easeInOut(duration: 0.15), value: companionManager.isTypingModeActive)
                 .animation(.easeInOut(duration: 0.15), value: companionManager.isVoiceToTextModeActive)
@@ -652,13 +696,14 @@ struct BlueCursorView: View {
                 // style is selected. Each handles its own processing visual.
                 .opacity(
                     buddyIsVisibleOnThisScreen
-                        && companionManager.voiceState == .processing
+                        && isProcessingForIndicator
                         && !selfContainedStyleActive
                         ? cursorOpacity : 0
                 )
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
+                .animation(.easeIn(duration: 0.15), value: companionManager.realtimeSessionState)
                 .animation(.easeInOut(duration: 0.15), value: companionManager.isBurstModeActive)
                 .animation(.easeInOut(duration: 0.15), value: companionManager.isTypingModeActive)
                 .animation(.easeInOut(duration: 0.15), value: companionManager.isVoiceToTextModeActive)
@@ -1608,7 +1653,75 @@ class OverlayWindowManager {
     /// after the session ends.
     private var wasVisibleBeforeNativeScreenshot: Bool = false
 
+    // v15p3 (2026-05-06): screen-change handling for sleep/wake.
+    // The cursor-following overlay used to get stuck on the primary screen
+    // after the Mac slept and woke with multiple monitors attached. Root
+    // cause: BlueCursorView captures its `screenFrame` as an immutable
+    // `let` at init, and the per-frame cursor-tracking timer tested
+    // `screenFrame.contains(mouseLocation)` against that stale value
+    // forever. macOS rebuilds the screen list on wake, but nothing in
+    // this app subscribed to the geometry-changed notifications, so
+    // the indicator's `isCursorOnThisScreen` check would never go true
+    // for the cursor's actual second-monitor position until restart.
+    //
+    // Fix: subscribe to didChangeScreenParametersNotification (and the
+    // workspace didWake notification as a belt-and-suspenders) and tear
+    // down + recreate overlay windows on the current screen list. Debounced
+    // so a flurry of notifications during display reconfiguration coalesces
+    // into one rebuild.
+    private weak var lastCompanionManager: CompanionManager?
+    private var screenParametersObserver: NSObjectProtocol?
+    private var didWakeObserver: NSObjectProtocol?
+    private var pendingScreenChangeWorkItem: DispatchWorkItem?
+
+    init() {
+        screenParametersObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.scheduleOverlayRecreate() }
+        }
+        didWakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.scheduleOverlayRecreate() }
+        }
+    }
+
+    deinit {
+        if let obs = screenParametersObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
+        if let obs = didWakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+        }
+    }
+
+    /// Coalesce multiple screen-change / wake notifications into a single
+    /// overlay rebuild ~300ms after the last event. macOS often posts a
+    /// rapid burst during display reconfiguration; rebuilding on every one
+    /// would thrash. Only recreates if the overlay is currently visible —
+    /// if it's hidden, the next `showOverlay()` call will pick up fresh
+    /// `NSScreen.screens` automatically.
+    private func scheduleOverlayRecreate() {
+        pendingScreenChangeWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard !self.overlayWindows.isEmpty,
+                  let companionManager = self.lastCompanionManager else { return }
+            self.showOverlay(onScreens: NSScreen.screens, companionManager: companionManager)
+        }
+        pendingScreenChangeWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: workItem)
+    }
+
     func showOverlay(onScreens screens: [NSScreen], companionManager: CompanionManager) {
+        // Remember the manager so we can rebuild on screen-parameter change.
+        lastCompanionManager = companionManager
+
         // Hide any existing overlays
         hideOverlay()
 

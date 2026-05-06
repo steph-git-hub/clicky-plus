@@ -187,6 +187,18 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     /// a freshly-engaged hands-free session.
     private var sessionGeneration: UInt64 = 0
 
+    /// v15p3 (2026-05-06): track the detached engagement task from
+    /// `engageContinuousListening` so `disengageContinuousListening`
+    /// can cancel it. Previously fire-and-forget — if the user
+    /// double-toggled hands-free during a slow token-mint or WebSocket
+    /// open, the original engagement task would continue, eventually
+    /// call `startBridgePolling()` and set `state = .listening`, and
+    /// resurrect a session the user just dismissed. The task itself
+    /// uses the `aborted()` generation check internally, but disengage
+    /// previously didn't bump the generation — so the check wasn't
+    /// enough on its own. Now we track + cancel explicitly.
+    private var continuousEngagementTask: Task<Void, Never>?
+
     /// v15p2 (2026-05-03): set true when cancelCurrentResponse fires.
     /// Audio chunks arriving from the server after cancel are dropped
     /// instead of scheduled into the player — without this, Marin
@@ -488,9 +500,17 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                 self.completedTurns.removeAll()
                 self.state = .connecting
             }
-            Task.detached { [weak self] in
+            // v15p3 (2026-05-06): cancel any prior engagement task
+            // before spawning a new one. Belt-and-suspenders for the
+            // generation check below — explicit cancellation makes
+            // `Task.isCancelled` true within the prior task too, so
+            // the cooperative checks scattered through it can short-
+            // circuit cleanly.
+            continuousEngagementTask?.cancel()
+            continuousEngagementTask = Task.detached { [weak self] in
                 guard let self else { return }
                 func aborted() -> Bool {
+                    if Task.isCancelled { return true }
                     self.audioStateLock.lock()
                     defer { self.audioStateLock.unlock() }
                     return self.sessionGeneration != myGeneration
@@ -541,6 +561,14 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         isContinuousListening = false
         isHotkeyHeld = false
         audioStateLock.unlock()
+        // v15p3 (2026-05-06): cancel any in-flight engagement task that
+        // hasn't reached `state = .listening` yet. Without this, a
+        // disengage during a slow token-mint or WebSocket open would
+        // race the engagement task — the task would finish, set state
+        // to .listening, start bridge polling, and resurrect a session
+        // the user just dismissed.
+        continuousEngagementTask?.cancel()
+        continuousEngagementTask = nil
         if state.isActive {
             sendJSON([
                 "type": "session.update",
@@ -2198,9 +2226,19 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         // v15p2 (2026-05-03): capture the session generation at
         // schedule time. If a new session has started by the time
         // this fires, do not end it — it's a different session.
-        let scheduledGeneration: UInt64 = {
+        // v15p3 (2026-05-06): also capture isContinuousListening
+        // at schedule time. The grace task previously read the LIVE
+        // value at fire time, so a continuous-mode toggle during the
+        // 500ms grace window could leave server-side turn_detection
+        // mismatched with client-side state — user-visible symptom
+        // was Marin not responding to the user's reply because the
+        // server thought we were still in PTT mode while the client
+        // had already engaged hands-free. Now we honor the schedule
+        // time state for the end-session decision and re-sync server
+        // turn_detection if continuous mode changed during grace.
+        let (scheduledGeneration, scheduledIsContinuous): (UInt64, Bool) = {
             audioStateLock.lock(); defer { audioStateLock.unlock() }
-            return sessionGeneration
+            return (sessionGeneration, isContinuousListening)
         }()
         Task { [weak self] in
             try? await Task.sleep(nanoseconds: UInt64(Self.micReopenGraceSeconds * 1_000_000_000))
@@ -2209,7 +2247,7 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             // Re-check conditions in case a new response started
             // during the grace period.
             let stillSafe = self.responseDoneReceived && self.outputBuffersInFlight == 0
-            let isContinuous = self.isContinuousListening
+            let currentIsContinuous = self.isContinuousListening
             let currentGeneration = self.sessionGeneration
             if stillSafe {
                 self.isModelSpeaking = false
@@ -2227,10 +2265,38 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
 
             Self.appendDiag("mic reopened after playback drain + grace")
 
+            // v15p3 (2026-05-06): if continuous-listening toggled during
+            // grace, server-side turn_detection is now mismatched with
+            // client state. Resync so the next user turn registers.
+            if scheduledIsContinuous != currentIsContinuous {
+                Self.appendDiag("continuous-listening flipped during grace (\(scheduledIsContinuous) → \(currentIsContinuous)) — resyncing turn_detection")
+                if currentIsContinuous {
+                    self.sendJSON([
+                        "type": "session.update",
+                        "session": [
+                            "turn_detection": [
+                                "type": "server_vad",
+                                "threshold": 0.5,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 800,
+                            ],
+                        ],
+                    ])
+                } else {
+                    self.sendJSON([
+                        "type": "session.update",
+                        "session": ["turn_detection": NSNull()],
+                    ])
+                }
+            }
+
             // PTT mode + natural completion → end session. No warm
             // window. Cancellation paths pass naturalCompletion=false
             // so the user can keep talking after they Esc-interrupted.
-            if naturalCompletion && !isContinuous {
+            // Use scheduled value (not current) — the user's intent at
+            // the time the response completed is what matters, even if
+            // they've since toggled mid-grace.
+            if naturalCompletion && !scheduledIsContinuous && !currentIsContinuous {
                 Self.appendDiag("PTT mode — ending session after response complete (no warm window)")
                 self.endSession()
             }
@@ -2291,6 +2357,13 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         // v15p2 (2026-05-03): cancel the PTT response timeout so it
         // doesn't fire after the session is already torn down.
         cancelPTTResponseTimeout()
+
+        // v15p3 (2026-05-06): cancel any in-flight continuous-engagement
+        // task. teardown() can be called from within the engagement task
+        // itself (catch branch) — that's fine, Task.cancel on self is
+        // safe and doesn't deadlock.
+        continuousEngagementTask?.cancel()
+        continuousEngagementTask = nil
 
         // v15p2 (2026-05-03): stop bridge polling so it doesn't outlive
         // the session.

@@ -3753,6 +3753,14 @@ final class CompanionManager: ObservableObject {
 
     /// v15p2 (2026-05-04): write detection attempts to a file so we
     /// can debug missed matches without having to read Console.app.
+    /// v15p3 (2026-05-06): relabeled MATCHED/MISSED → FORMAT_RESPONSE/
+    /// OTHER_MODIFIER. The log fires on EVERY polish-with-modifier
+    /// invocation, not just format-response attempts — so most lines
+    /// reading "MISSED" are perfectly correct non-format-response
+    /// polish modifiers (spelling fixes, content rewrites, etc.). The
+    /// old label invited audit-agents to read a 92% "miss rate" as a
+    /// regression when it was just the relative frequency of
+    /// format-response vs other modifiers.
     private static let formatResponseDetectionLogPath = "/tmp/clicky_format_response_detection.log"
     private static func appendFormatResponseDetectionLog(
         matched: Bool,
@@ -3761,7 +3769,8 @@ final class CompanionManager: ObservableObject {
         cleaned: String
     ) {
         let formatter = ISO8601DateFormatter()
-        let line = "\(formatter.string(from: Date()))\t\(matched ? "MATCHED" : "MISSED")\tphrase=\"\(phrase ?? "")\"\traw=\"\(rawModifier ?? "")\"\tcleaned=\"\(cleaned)\"\n"
+        let label = matched ? "FORMAT_RESPONSE" : "OTHER_MODIFIER"
+        let line = "\(formatter.string(from: Date()))\t\(label)\tphrase=\"\(phrase ?? "")\"\traw=\"\(rawModifier ?? "")\"\tcleaned=\"\(cleaned)\"\n"
         guard let data = line.data(using: .utf8) else { return }
         let url = URL(fileURLWithPath: formatResponseDetectionLogPath)
         let fm = FileManager.default
