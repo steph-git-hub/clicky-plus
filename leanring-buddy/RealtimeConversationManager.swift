@@ -884,31 +884,35 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                 self.state = .listening
                 self.liveUserTranscript = ""
             }
-            // v15p2 (2026-05-02): in hands-free mode, refresh the
-            // active-screen screenshot at the start of each user turn
-            // so Marin sees the CURRENT view rather than whatever was
-            // on screen when the session started. Without this, if
-            // Steph navigates between turns Marin keeps responding
-            // based on the stale screen.
-            //
-            // Fire-and-forget. By the time the user finishes speaking
-            // (~1-2s) and server VAD commits, the screenshot
-            // (~50-200ms to capture) has already arrived in the
-            // conversation context for the upcoming response.
-            //
-            // Only fires in continuous mode — PTT already captures
-            // per-press in startSession.
+            // v15p3b (2026-05-07): screenshot capture MOVED from
+            // speech_started → speech_stopped (see speech_stopped case
+            // below). Old design captured at start-of-utterance, but
+            // Steph often navigates mid-question ("okay so now I'm
+            // looking at...") — the screenshot then captured the screen
+            // he was on BEFORE the navigation, and Marin would respond
+            // about the wrong view. Capturing at speech_stopped means
+            // we get the FINAL state Steph wants Marin reasoning about.
+            // The ~100-200ms screenshot capture races the server's
+            // auto-response trigger, but in practice the server takes
+            // 500-2000ms to generate, so the screenshot usually lands
+            // in conversation context before the response starts.
+            // (This change was first attempted in v15p4 alongside the
+            // broken click-await tool. v15p4 was rolled back; this
+            // specific timing change is preserved as a safe forward-pick.)
+
+        case "input_audio_buffer.speech_stopped":
+            Task { @MainActor in
+                self.state = .responding
+            }
+            // v15p3b (2026-05-07): see comment in speech_started case.
+            // Capture moved here so the screenshot reflects the screen
+            // state AFTER the user finishes speaking + navigating.
             let inContinuous: Bool = {
                 audioStateLock.lock(); defer { audioStateLock.unlock() }
                 return isContinuousListening
             }()
             if inContinuous {
                 captureAndSendActiveScreenshot()
-            }
-
-        case "input_audio_buffer.speech_stopped":
-            Task { @MainActor in
-                self.state = .responding
             }
 
         case "response.audio.delta":
