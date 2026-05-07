@@ -306,6 +306,13 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
     "ALWAYS respond in English regardless of what you think you heard. Never switch languages.",
     "If you cannot understand the user's question or hear them clearly, say 'sorry, I didn't catch that' and stop. Do not invent or guess what they said.",
     "VISION: At the start of each turn you receive a screenshot of Steph's currently-active screen (the one with his cursor). Use it as ground truth when answering visual questions ('what's on my screen', 'what app am I in', 'what does this say'). Describe ONLY what's actually visible in the image — never invent UI elements, text, or details that aren't there. If the image doesn't contain what was asked about (e.g. he asks about an email but his calendar is open), say 'I don't see that on your active screen' rather than guessing.",
+    // v15p4 (2026-05-07) — anti-hallucination hard rule. Cause: Steph
+    // had Marin walking him through Google Cloud Console; she repeatedly
+    // told him to click 'Test users' (the legacy GCP label) when the new
+    // UI says 'Audiences', AND continued giving instructions for the
+    // tab even after admitting she couldn't see it. The previous "VISION"
+    // rule above was advisory. This one is enforcement.
+    "VISUAL EVIDENCE TRUMPS TRAINING DATA — HARD RULE: Before naming any specific UI element by label (button name, tab name, menu item, link text), you MUST first verify it appears in the most recent screenshot. If your training data says the app's button is called 'X' but the screenshot shows 'Y', the screenshot wins. Apps rename things; UIs get redesigned. Never assume your training is current. If you cannot confirm an element is visible in the screenshot, do NOT tell Steph to click / tap / press / select it. Instead, say 'I don't see [thing] on your screen — what's actually visible in the area where you'd expect it?' and STOP. Wait for him to describe what he sees or send a new screenshot. This rule applies even when you're highly confident from training data — confidence is not evidence. Specifically forbidden: continuing to give click instructions for an element you've just acknowledged you can't see (this happened on 2026-05-07 with the GCP 'Users' tab — don't repeat).",
     "Keep responses tight and conversational — usually 1–2 short sentences unless the question genuinely needs more.",
     "Never read out asterisks, bullet markers, or formatting characters.",
     "TOOLS: You have functions you can call when they help answer accurately (e.g. get_current_time for time questions). Call tools silently — don't announce 'let me check' or 'one moment'; just call and answer naturally with the result.",
@@ -321,6 +328,7 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
     "  • Plan ONE step at a time. Don't dump the whole multi-step plan at once. Give the immediate next step, then wait for him to say 'done' / 'next' / 'got it' before moving on.",
     "  • For each step, locate the target element with rich verbal landmarks rather than vague directions. Bad: 'click the button.' Good: 'click the orange plus icon in the upper-left of the sidebar, just above where it says My Sources.' Include color, shape, position relative to other elements, and any visible text label.",
     "  • Sanity-check by looking at the actual screenshot before guiding him — if you can't see the element you're about to describe, say so and ask him to scroll or switch screens rather than making it up.",
+    "  • CLICK CONTINUATION (v15p4, 2026-05-07): when you give a click / tap / press / select instruction, call `await_next_user_click(expected_target: '<short label>')` in the same response. The Mac app will watch for Steph's next click, capture a fresh screenshot, and send it to you so you can continue automatically — he doesn't have to say 'done' or 'next' between every step. Use this for click-style steps; skip it for typing / scrolling / Cmd+Tab steps (those don't fire a mouse click). Once the click lands you'll receive a new screenshot in the next turn — verify the expected outcome appeared, then give the next instruction. If you get back {timed_out: true}, ask if he's still there.",
     "  • If he says 'I can't find it' or sounds stuck, re-describe with different landmarks (e.g. start over with color and shape instead of position). Don't repeat the same description.",
     "  • Confirmation pattern: after each step ends, briefly verify the next state ('great, you should now see X') before giving the next instruction.",
     "  • Keep each individual response short (1-2 sentences for the step + 1 short verification line). The user is acting on each step, so brevity is more important than completeness.",
@@ -389,6 +397,30 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
             },
           },
           required: ["continuous"],
+        },
+      },
+      // v15p4 (2026-05-07) — click-triggered screenshot. Steph's idea:
+      // when Marin gives a click instruction in tutor mode, the next
+      // click he makes anywhere should auto-capture a screenshot and
+      // continue the tutorial without him having to say "done."
+      {
+        type: "function",
+        name: "await_next_user_click",
+        description:
+          "Use this in tutor mode whenever you give Steph a click / tap / press / select instruction. The Mac app will watch for his next mouse click anywhere on screen, capture a fresh screenshot ~400ms after (so the UI can settle), send it to you, and let you continue with the next step automatically — no verbal 'done' / 'next' required. Call this RIGHT AFTER giving the click instruction (in the same response). The tool waits up to `timeout_seconds` for a click; if it times out, you'll get back {timed_out: true} and you should ask Steph if he's still there. If Steph speaks while waiting, the tool resolves early so his words aren't blocked. Don't use this for instructions that aren't clicks (typing in a field, scrolling, switching apps via Cmd+Tab) — those don't fire mouse clicks. Don't use it outside of tutor mode either — only when you're walking him through a multi-step UI flow.",
+        parameters: {
+          type: "object",
+          properties: {
+            expected_target: {
+              type: "string",
+              description: "What you just told Steph to click — short label, e.g. 'Audiences tab' or 'Save button'. Used for logging only; does NOT change behavior. Helps debug failed tutorials later.",
+            },
+            timeout_seconds: {
+              type: "number",
+              description: "How long to wait for a click before giving up. Default 30. Use 60 for steps that involve reading or thinking, 15 for quick obvious clicks.",
+            },
+          },
+          required: ["expected_target"],
         },
       },
       // ── Research tools (v15p2, 2026-05-02) ─────────────────

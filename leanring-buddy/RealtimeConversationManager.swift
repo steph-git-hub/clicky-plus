@@ -199,6 +199,20 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     /// enough on its own. Now we track + cancel explicitly.
     private var continuousEngagementTask: Task<Void, Never>?
 
+    // v15p4 (2026-05-07) — click-triggered screenshot tool state.
+    // When Marin calls `await_next_user_click(...)`, we install global
+    // and local NSEvent monitors for left-mouse-down. On the first
+    // click, we wait ~400ms (UI settle), capture the active screen,
+    // send screenshot + click coords back through the function_call
+    // result so Marin continues automatically. Steph's idea — removes
+    // the need to verbalize "done" between every step in tutor mode.
+    private var clickAwaitGlobalMonitor: Any?
+    private var clickAwaitLocalMonitor: Any?
+    private var clickAwaitTimeoutTask: Task<Void, Never>?
+    private var clickAwaitCallId: String?
+    private var clickAwaitExpectedTarget: String?
+    private var clickAwaitStartedAt: Date?
+
     /// v15p2 (2026-05-03): set true when cancelCurrentResponse fires.
     /// Audio chunks arriving from the server after cancel are dropped
     /// instead of scheduled into the player — without this, Marin
@@ -607,6 +621,13 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         guard active else { return }
         Self.appendDiag("cancelCurrentResponse — silencing model")
 
+        // v15p4 (2026-05-07): release any pending click-await so it
+        // doesn't outlive a cancelled response. Marin won't be coming
+        // back to consume the result.
+        if let priorCallId = clickAwaitCallId {
+            cancelClickAwait(reason: "cancelled", priorCallId: priorCallId)
+        }
+
         sendJSON(["type": "response.cancel"])
 
         // v15p2 (2026-05-03): set the cancel gate FIRST, BEFORE
@@ -884,31 +905,34 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                 self.state = .listening
                 self.liveUserTranscript = ""
             }
-            // v15p2 (2026-05-02): in hands-free mode, refresh the
-            // active-screen screenshot at the start of each user turn
-            // so Marin sees the CURRENT view rather than whatever was
-            // on screen when the session started. Without this, if
-            // Steph navigates between turns Marin keeps responding
-            // based on the stale screen.
-            //
-            // Fire-and-forget. By the time the user finishes speaking
-            // (~1-2s) and server VAD commits, the screenshot
-            // (~50-200ms to capture) has already arrived in the
-            // conversation context for the upcoming response.
-            //
-            // Only fires in continuous mode — PTT already captures
-            // per-press in startSession.
+            // v15p4 (2026-05-07): screenshot capture MOVED from
+            // speech_started to speech_stopped. Old design captured at
+            // start-of-utterance, but Steph often navigates mid-question
+            // ("okay so now I'm looking at...") — the screenshot then
+            // captured the screen he was on BEFORE the navigation, and
+            // Marin would respond about the wrong view. Capturing at
+            // speech_stopped means we get the FINAL state Steph wants
+            // Marin reasoning about. The ~100-200ms screenshot capture
+            // races the server's auto-response trigger, but in practice
+            // the server takes 500-2000ms to generate, so the screenshot
+            // usually lands in conversation context before the response
+            // starts. If a turn occasionally misses, Marin can also
+            // call await_next_user_click to force a fresh screenshot.
+
+        case "input_audio_buffer.speech_stopped":
+            Task { @MainActor in
+                self.state = .responding
+            }
+            // v15p4 (2026-05-07): capture the active-screen screenshot
+            // ONLY in continuous mode — PTT captures at session start.
+            // Fire-and-forget; the screenshot is sent as a conversation
+            // item that the server will see when generating the response.
             let inContinuous: Bool = {
                 audioStateLock.lock(); defer { audioStateLock.unlock() }
                 return isContinuousListening
             }()
             if inContinuous {
                 captureAndSendActiveScreenshot()
-            }
-
-        case "input_audio_buffer.speech_stopped":
-            Task { @MainActor in
-                self.state = .responding
             }
 
         case "response.audio.delta":
@@ -1349,6 +1373,173 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Click-triggered screenshot (v15p4, 2026-05-07)
+    //
+    // Tutor-mode helper: when Marin gives a click instruction and calls
+    // `await_next_user_click(...)`, install NSEvent monitors that fire
+    // on the next mouse down. On click: ~400ms debounce (let any UI
+    // animation settle), then capture the active screen and send it
+    // back as the function_call_output so Marin proceeds with the next
+    // step automatically. No verbal "done" required.
+    //
+    // Pattern mirrors `startVoiceModeClickCapture` in CompanionManager:
+    // global monitor for clicks anywhere, local monitor for clicks on
+    // Clicky's own windows (so we don't miss them).
+    //
+    // Cancellation paths:
+    //   - timeout fires → send {timed_out: true}
+    //   - user speaks (handled in input_audio_buffer.speech_started) → send {interrupted: true}
+    //   - cancelCurrentResponse → send {cancelled: true}
+    //   - teardown → send {cancelled: true}
+    //   - second await before first resolves → cancel first with {superseded: true}
+
+    @MainActor
+    private func awaitNextUserClick(
+        callId: String,
+        expectedTarget: String,
+        timeoutSeconds: Double
+    ) {
+        // If a prior await is still pending, supersede it.
+        if let priorCallId = clickAwaitCallId {
+            cancelClickAwait(reason: "superseded", priorCallId: priorCallId)
+        }
+
+        clickAwaitCallId = callId
+        clickAwaitExpectedTarget = expectedTarget
+        clickAwaitStartedAt = Date()
+        Self.appendDiag("await_next_user_click: armed (target=\"\(expectedTarget)\", timeout=\(timeoutSeconds)s)")
+
+        let mask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+
+        clickAwaitGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] _ in
+            let clickPoint = NSEvent.mouseLocation
+            Task { @MainActor in
+                self?.handleAwaitedClick(at: clickPoint)
+            }
+        }
+        // Local monitor: if Steph clicks on Clicky's own panel (e.g.,
+        // dismissing it), still register the click so the await
+        // doesn't sit forever. Pass event through unchanged.
+        clickAwaitLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            let clickPoint = NSEvent.mouseLocation
+            Task { @MainActor in
+                self?.handleAwaitedClick(at: clickPoint)
+            }
+            return event
+        }
+
+        // Timeout: send {timed_out: true} if no click within window.
+        clickAwaitTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.resolveClickAwait(with: ["timed_out": true, "expected_target": expectedTarget])
+            }
+        }
+    }
+
+    @MainActor
+    private func handleAwaitedClick(at point: CGPoint) {
+        // Capture-and-clear the await state ATOMICALLY (we're on
+        // MainActor, so this is single-threaded). The global and
+        // local NSEvent monitors both fire on the same click, so
+        // without clearing here a second handleAwaitedClick would
+        // also pass the guard — net result was two debounce tasks
+        // firing two captureAndSendActiveScreenshot() calls and the
+        // server seeing duplicate screenshots. v15p4 hotfix: set
+        // callId to nil immediately so the second invocation bails.
+        guard let callId = clickAwaitCallId else { return }
+        let target = clickAwaitExpectedTarget ?? "(unknown)"
+        let elapsed = clickAwaitStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+        clickAwaitCallId = nil
+        clickAwaitExpectedTarget = nil
+        clickAwaitStartedAt = nil
+        teardownClickAwaitMonitors()
+        clickAwaitTimeoutTask?.cancel()
+        clickAwaitTimeoutTask = nil
+
+        Self.appendDiag(
+            "await_next_user_click: click registered (target=\"\(target)\", " +
+            "at=(\(Int(point.x)), \(Int(point.y))), elapsed=\(String(format: "%.2f", elapsed))s) — " +
+            "scheduling 400ms-delayed screenshot"
+        )
+
+        // Wait 400ms for any click-triggered UI animation to settle,
+        // then capture the active screen and send it. The callId is
+        // captured in the closure so the function_call_output goes to
+        // the right pending request even though instance state is
+        // already cleared.
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            await MainActor.run {
+                guard let self else { return }
+                self.captureAndSendActiveScreenshot()
+                let result: [String: Any] = [
+                    "clicked": true,
+                    "expected_target": target,
+                    "click_point": ["x": Int(point.x), "y": Int(point.y)],
+                    "elapsed_seconds": String(format: "%.2f", elapsed),
+                    "note": "A fresh screenshot of the post-click state has been sent to you as a visual context message. Verify the expected outcome appeared, then give the next instruction.",
+                ]
+                self.sendFunctionCallResult(
+                    callId: callId,
+                    name: "await_next_user_click",
+                    result: result
+                )
+                Self.appendDiag("await_next_user_click: resolved (target=\"\(target)\")")
+            }
+        }
+    }
+
+    /// Send the function_call_output for the pending await tool call
+    /// and clear all pending await state.
+    @MainActor
+    private func resolveClickAwait(with result: [String: Any]) {
+        guard let callId = clickAwaitCallId else { return }
+        let target = clickAwaitExpectedTarget ?? "(unknown)"
+        sendFunctionCallResult(
+            callId: callId,
+            name: "await_next_user_click",
+            result: result
+        )
+        clickAwaitCallId = nil
+        clickAwaitExpectedTarget = nil
+        clickAwaitStartedAt = nil
+        teardownClickAwaitMonitors()
+        clickAwaitTimeoutTask?.cancel()
+        clickAwaitTimeoutTask = nil
+        Self.appendDiag("await_next_user_click: resolved (target=\"\(target)\")")
+    }
+
+    /// Cancel a pending await without firing the function_call_output.
+    /// Used when a NEW await is armed before the prior one resolved.
+    @MainActor
+    private func cancelClickAwait(reason: String, priorCallId: String) {
+        sendFunctionCallResult(
+            callId: priorCallId,
+            name: "await_next_user_click",
+            result: [reason: true, "expected_target": clickAwaitExpectedTarget ?? "(unknown)"]
+        )
+        clickAwaitCallId = nil
+        clickAwaitExpectedTarget = nil
+        clickAwaitStartedAt = nil
+        teardownClickAwaitMonitors()
+        clickAwaitTimeoutTask?.cancel()
+        clickAwaitTimeoutTask = nil
+    }
+
+    @MainActor
+    private func teardownClickAwaitMonitors() {
+        if let m = clickAwaitGlobalMonitor {
+            NSEvent.removeMonitor(m)
+            clickAwaitGlobalMonitor = nil
+        }
+        if let m = clickAwaitLocalMonitor {
+            NSEvent.removeMonitor(m)
+            clickAwaitLocalMonitor = nil
+        }
+    }
+
     // MARK: - Tool dispatcher (v15p2 Chunk 1, 2026-05-02)
     //
     // Routes a function call from Marin to a local Swift handler.
@@ -1387,6 +1578,21 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             let continuous = (args["continuous"] as? Bool) ?? false
             let result = toolSetListeningMode(continuous: continuous)
             sendFunctionCallResult(callId: callId, name: name, result: result)
+
+        // v15p4 (2026-05-07) — click-triggered screenshot for tutor mode.
+        case "await_next_user_click":
+            let expectedTarget = (args["expected_target"] as? String) ?? "(unspecified)"
+            let timeoutSeconds = (args["timeout_seconds"] as? NSNumber)?.doubleValue ?? 30.0
+            // The dispatcher fires the awaiter; the function_call_output
+            // is sent ONLY when the click lands or the timeout expires
+            // (handled inside awaitNextUserClick). No immediate result.
+            Task { @MainActor [weak self] in
+                self?.awaitNextUserClick(
+                    callId: callId,
+                    expectedTarget: expectedTarget,
+                    timeoutSeconds: timeoutSeconds
+                )
+            }
 
         // ── Research tools (v15p2, 2026-05-02) ────────────────
         case "list_scheduled_tasks":
@@ -2364,6 +2570,18 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         // safe and doesn't deadlock.
         continuousEngagementTask?.cancel()
         continuousEngagementTask = nil
+
+        // v15p4 (2026-05-07): tear down any pending click-await monitors
+        // so they don't outlive the session. The function_call_output
+        // would be undeliverable anyway (no socket). Just clear state.
+        Task { @MainActor [weak self] in
+            self?.teardownClickAwaitMonitors()
+            self?.clickAwaitTimeoutTask?.cancel()
+            self?.clickAwaitTimeoutTask = nil
+            self?.clickAwaitCallId = nil
+            self?.clickAwaitExpectedTarget = nil
+            self?.clickAwaitStartedAt = nil
+        }
 
         // v15p2 (2026-05-03): stop bridge polling so it doesn't outlive
         // the session.
