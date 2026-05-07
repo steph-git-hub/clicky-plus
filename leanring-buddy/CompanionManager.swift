@@ -2284,6 +2284,20 @@ final class CompanionManager: ObservableObject {
         case .pressed:
             // v15p2 (2026-05-03): suspend Marin if she's running.
             markOtherModePressed("vtt")
+            // v15p3c (2026-05-07): recover from stuck dictation state so
+            // a new press can start a fresh session. Symptom: VTT toggle
+            // engages (isVoiceToTextToggleLocked=true was set by the
+            // double-tap handler upstream) but the spinner is stuck on
+            // and no recording starts. Cause: a previous session left
+            // isFinalizingTranscript (or another isDictationInProgress
+            // flag) stuck true — the guard below silently bails. The
+            // v15p3 force-cancel inside startPushToTalk doesn't help
+            // because we never get that far. Force-cancel here so the
+            // guard passes and the new session runs.
+            if buddyDictationManager.isDictationInProgress {
+                print("🔧 VTT .pressed: dictation manager has stuck state — force-cancelling to recover")
+                buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
+            }
             guard !buddyDictationManager.isDictationInProgress else { return }
             guard !showOnboardingVideo else { return }
 
