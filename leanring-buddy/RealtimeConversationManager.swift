@@ -921,16 +921,16 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             Task { @MainActor in
                 self.state = .responding
             }
-            // v15p3b (2026-05-07): see comment in speech_started case.
-            // Capture moved here so the screenshot reflects the screen
-            // state AFTER the user finishes speaking + navigating.
-            let inContinuous: Bool = {
-                audioStateLock.lock(); defer { audioStateLock.unlock() }
-                return isContinuousListening
-            }()
-            if inContinuous {
-                captureAndSendActiveScreenshot()
-            }
+            // v15p3h (2026-05-08): screenshot capture deferred from
+            // speech_stopped → conversation.item.input_audio_transcription.completed
+            // (handled below). Steph reported gpt-realtime-2 feels slower than v1
+            // partly due to per-turn screenshot upload (~200-400ms) on questions
+            // that don't need vision. Sending the screenshot AFTER we have the
+            // transcript lets us apply a SEND-by-default heuristic with a
+            // narrow skip list for clearly non-visual queries (time, calendar,
+            // unread, conversational acks). Everything ambiguous still sends.
+            // Save: ~200-400ms + ~100-200KB upload + vision tokens per skipped turn.
+            // Only applies to continuous mode — PTT captures at session start.
 
         // v15p3e (2026-05-08): GA renamed several response.* events.
         // response.audio.delta → response.output_audio.delta
@@ -1033,6 +1033,19 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             if let transcript = json["transcript"] as? String {
                 Task { @MainActor in
                     self.liveUserTranscript = transcript
+                }
+                // v15p3h (2026-05-08): per-turn screenshot decision based on
+                // user's transcribed words. Continuous mode only — PTT handles
+                // its own screenshot at session start. Default = SEND. Skip list
+                // matches clearly-non-visual queries only.
+                let inContinuous: Bool = {
+                    audioStateLock.lock(); defer { audioStateLock.unlock() }
+                    return isContinuousListening
+                }()
+                if inContinuous && Self.shouldSendScreenshotForTranscript(transcript) {
+                    captureAndSendActiveScreenshot()
+                } else if inContinuous {
+                    Self.appendDiag("vision: SKIPPED screenshot — transcript matched non-visual skip pattern: \"\(transcript.prefix(80))\"")
                 }
             }
 
@@ -1349,6 +1362,80 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     /// secondary monitor" behavior. The active-screen helper uses
     /// `NSScreen.main` (the focused-window screen), which is exactly
     /// what users mean by "active screen."
+    /// v15p3h (2026-05-08): heuristic for whether the current turn's screenshot
+    /// should be sent based on the user's transcribed query. Default = SEND
+    /// (per Steph's "I'd rather miss the skip than miss the screenshot" bias).
+    /// Skip ONLY for transcripts that clearly request a tool call or are pure
+    /// conversational acks where vision wouldn't add anything.
+    ///
+    /// False positives (sending when we could've skipped) are the better failure
+    /// mode here — they cost ~200-400ms + tokens but Marin still answers correctly.
+    /// False negatives (skipping when we needed to) make Marin blind to context
+    /// Steph wants her to see. Bias accordingly.
+    static func shouldSendScreenshotForTranscript(_ transcript: String) -> Bool {
+        let lower = transcript
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        // Empty transcript — safer to send (we have no info to skip on).
+        if lower.isEmpty { return true }
+
+        // Strip common trailing punctuation for matching.
+        let punctuationToTrim = CharacterSet.punctuationCharacters
+        let normalized = lower.trimmingCharacters(in: punctuationToTrim)
+
+        // SKIP patterns — clearly tool-call or pure conversational queries.
+        // Match either the entire utterance or an explicit prefix.
+        let exactMatches: Set<String> = [
+            "thanks", "thank you", "okay", "ok", "got it", "cool", "great",
+            "continue", "go on", "keep going", "next", "done",
+            "stop", "we're done", "turn off hands free", "turn off hands-free",
+            "yes", "no", "yep", "nope", "sure",
+        ]
+        if exactMatches.contains(normalized) { return false }
+
+        // Prefix matches — utterance starts with one of these and is short.
+        // Length cap (60 chars) avoids skipping a long sentence that just
+        // happens to start with "what time" etc. Genuinely-tool requests are short.
+        let toolPrefixes: [String] = [
+            "what time",
+            "what's the time",
+            "what is the time",
+            "what time is it",
+            "next meeting",
+            "what's my next",
+            "what is my next",
+            "when's my next",
+            "when is my next",
+            "what's on my calendar",
+            "what is on my calendar",
+            "what's on my plate",
+            "what do i have today",
+            "any unread",
+            "any new email",
+            "any new emails",
+            "any new slack",
+            "any new messages",
+            "do i have any unread",
+            "do i have any new",
+            "check my slack",
+            "check my email",
+            "check my calendar",
+            "read my clipboard",
+            "what's on my clipboard",
+            "what is on my clipboard",
+        ]
+        if normalized.count <= 60 {
+            for prefix in toolPrefixes {
+                if normalized.hasPrefix(prefix) { return false }
+            }
+        }
+
+        // Default: SEND. Anything ambiguous, anything containing visual cues
+        // ("see", "this", "that", "explain", "show", "look", "screen", etc.),
+        // anything genuinely complex — all default to send.
+        return true
+    }
+
     private func captureAndSendActiveScreenshot() {
         Task { @MainActor in
             do {
