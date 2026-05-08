@@ -2535,8 +2535,29 @@ final class CompanionManager: ObservableObject {
             }
         }
 
-        // Force voiceState to idle if it's in any active state. The orb
-        // will fade out and the overlay will hide on its normal schedule.
+        // v15p3l (2026-05-08): force-cancel any in-flight dictation BEFORE
+        // touching voiceState. Esc has been theatrical for a class of
+        // stuck-spinner bugs because setting voiceState=.idle directly
+        // would get immediately overwritten by the Combine binding at
+        // line 1271 — that binding watches isFinalizingTranscript /
+        // isPreparingToRecord / isRecordingFromKeyboardShortcut and re-
+        // computes voiceState from them within milliseconds. So if any
+        // dictation flag was stuck true, Esc → idle → binding fires →
+        // back to .processing, instantly. cancelCurrentDictation clears
+        // ALL the flags via resetSessionState, so the binding then
+        // computes idle correctly and stays there.
+        buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
+
+        // Belt-and-suspenders: also clear any pending Task that might
+        // re-set a dictation flag after cancelCurrentDictation runs.
+        pendingVoiceToTextShortcutStartTask?.cancel()
+        pendingVoiceToTextShortcutStartTask = nil
+        pendingTypingShortcutStartTask?.cancel()
+        pendingTypingShortcutStartTask = nil
+
+        // NOW force voiceState to idle if it's in any active state.
+        // The dictation flags above are already cleared so the binding
+        // won't fight us this time.
         if voiceState != .idle {
             voiceState = .idle
             scheduleTransientHideIfNeeded()
