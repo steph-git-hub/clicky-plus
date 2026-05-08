@@ -265,6 +265,66 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Init
+
+    override init() {
+        super.init()
+        // v15p3q (2026-05-08): subscribe to AVAudioEngineConfigurationChange
+        // so plugging/unplugging headphones mid-conversation doesn't kill
+        // mic capture. macOS reroutes default audio devices on plug/unplug
+        // events; AVAudioEngine doesn't auto-follow — the input tap stays
+        // bound to the now-disconnected old device and silently stops
+        // delivering buffers. Steph reported: "If I take my headphones out
+        // or put them in during the conversation, she can't hear me anymore."
+        // The notification fires from the engine itself when its hardware
+        // configuration becomes invalid; standard pattern is to restart the
+        // engine in the handler.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioEngineConfigurationChange(_:)),
+            name: .AVAudioEngineConfigurationChange,
+            object: inputEngine
+        )
+        // Output engine config changes too — we listen separately so we can
+        // react to either side reconfiguring.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioEngineConfigurationChange(_:)),
+            name: .AVAudioEngineConfigurationChange,
+            object: outputEngine
+        )
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+    }
+
+    @objc private func handleAudioEngineConfigurationChange(_ note: Notification) {
+        // The engine has been auto-stopped by the system. Restart input
+        // capture so the new default device starts delivering buffers.
+        // Don't touch the WebSocket — the conversation continues with the
+        // new mic seamlessly. Skip if we don't actually have a session
+        // running (no point reinitializing audio for nothing).
+        let active: Bool = {
+            audioStateLock.lock(); defer { audioStateLock.unlock() }
+            return state.isActive
+        }()
+        guard active else {
+            Self.appendDiag("audio config change ignored — no active session")
+            return
+        }
+        Self.appendDiag("audio engine config changed (likely device plug/unplug) — restarting input capture")
+        // Force the external-audio cache to refresh so barge-in re-evaluates
+        // immediately under the new device, rather than waiting for the 1s TTL.
+        Self.externalAudioOutputCheckedAt = .distantPast
+        do {
+            try startAudioCapture()
+            Self.appendDiag("audio engine restart succeeded — mic capture resumed")
+        } catch {
+            Self.appendDiag("audio engine restart FAILED: \(error.localizedDescription)")
+        }
+    }
+
     // MARK: - Public API
 
     /// Start a new session OR resume a warm one. Safe to call from any
