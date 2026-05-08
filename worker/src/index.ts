@@ -330,23 +330,40 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
     ? `${basePersona}\n\n[Steph's persistent memory — apply where relevant during conversation]\n\n${personalFacts}`
     : basePersona;
 
-  const sessionRequest: Record<string, unknown> = {
-    model: overrides.model ?? "gpt-realtime",
-    voice: overrides.voice ?? "marin",
-    modalities: overrides.modalities ?? ["audio", "text"],
-    input_audio_format: overrides.input_audio_format ?? "pcm16",
-    output_audio_format: overrides.output_audio_format ?? "pcm16",
-    // Manual turn detection — Mac app uses true PTT, client commits
-    // explicitly on hotkey release. Server VAD was triggering responses
-    // from background noise and Marin's own voice through the mic in
-    // v15p; null mode eliminates that class of bug entirely.
-    turn_detection: overrides.turn_detection !== undefined
-      ? overrides.turn_detection
-      : null,
+  // v15p3e (2026-05-08): migrated to GA Realtime API for gpt-realtime-2.
+  // GA endpoint /v1/realtime/client_secrets requires:
+  //   - body wrapped in { session: {...} }
+  //   - session.type: "realtime"
+  //   - audio split into audio.input/output halves
+  //   - format as object: { type: "audio/pcm", rate: 24000 } (not bare "pcm16")
+  //   - "modalities" → "output_modalities"
+  // Response shape changed too: top-level { value: "ek_..." } instead of
+  // { client_secret: { value } }. Reshape on the way out so Mac app's
+  // existing parser keeps working.
+  const sessionConfig: Record<string, unknown> = {
+    type: "realtime",
+    model: overrides.model ?? "gpt-realtime-2",
     instructions: overrides.instructions ?? composedInstructions,
-    input_audio_transcription: overrides.input_audio_transcription ?? {
-      model: "whisper-1",
+    audio: {
+      input: {
+        format: overrides.input_audio_format ?? { type: "audio/pcm", rate: 24000 },
+        transcription: overrides.input_audio_transcription ?? {
+          model: "whisper-1",
+        },
+        // Manual turn detection — Mac app uses true PTT, client commits
+        // explicitly on hotkey release. Server VAD was triggering responses
+        // from background noise and Marin's own voice through the mic in
+        // v15p; null mode eliminates that class of bug entirely.
+        turn_detection: overrides.turn_detection !== undefined
+          ? overrides.turn_detection
+          : null,
+      },
+      output: {
+        format: overrides.output_audio_format ?? { type: "audio/pcm", rate: 24000 },
+        voice: overrides.voice ?? "marin",
+      },
     },
+    output_modalities: overrides.modalities ?? ["audio"],
     // v15p2 Chunk 1 (2026-05-02): function-calling foundation.
     // The model can call these tools mid-conversation. Mac client
     // executes them locally and sends the result back via
@@ -719,15 +736,18 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
     tool_choice: overrides.tool_choice ?? "auto",
   };
 
+  // v15p3e (2026-05-08): GA endpoint requires body wrapped in { session }.
+  const requestBody = { session: sessionConfig };
+
   const response = await fetch(
-    "https://api.openai.com/v1/realtime/sessions",
+    "https://api.openai.com/v1/realtime/client_secrets",
     {
       method: "POST",
       headers: {
         authorization: `Bearer ${env.OPENAI_API_KEY}`,
         "content-type": "application/json",
       },
-      body: JSON.stringify(sessionRequest),
+      body: JSON.stringify(requestBody),
     }
   );
 
@@ -742,8 +762,26 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
     });
   }
 
-  const data = await response.text();
-  return new Response(data, {
+  // GA returns { value: "ek_...", session: {...}, expires_at: ... }.
+  // Reshape into legacy { client_secret: { value } } envelope so the Mac
+  // app's existing fetchEphemeralToken parser keeps working unchanged.
+  const upstreamJson = (await response.json()) as Record<string, unknown>;
+  const ephemeralValue = typeof upstreamJson.value === "string" ? upstreamJson.value : null;
+  if (!ephemeralValue) {
+    console.error(
+      `[/realtime-session] GA response missing top-level value field: ${JSON.stringify(upstreamJson).slice(0, 500)}`
+    );
+    return new Response(
+      JSON.stringify({ error: "GA response missing value field", upstream: upstreamJson }),
+      { status: 502, headers: { "content-type": "application/json" } }
+    );
+  }
+  const macClientPayload = {
+    client_secret: { value: ephemeralValue },
+    session: upstreamJson.session ?? null,
+    expires_at: upstreamJson.expires_at ?? null,
+  };
+  return new Response(JSON.stringify(macClientPayload), {
     status: 200,
     headers: { "content-type": "application/json" },
   });

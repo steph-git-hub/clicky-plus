@@ -98,7 +98,9 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     // MARK: - Configuration
 
     private let workerSessionURL = URL(string: "https://clicky-proxy.sapierso.workers.dev/realtime-session")!
-    private let openAIRealtimeURL = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime")!
+    // v15p3e (2026-05-08): upgraded to gpt-realtime-2 (GPT-5-class reasoning,
+    // 128K context, GA). Worker side migrated to /v1/realtime/client_secrets.
+    private let openAIRealtimeURL = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime-2")!
 
     // MARK: - WebSocket + audio plumbing
 
@@ -467,11 +469,16 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             sendJSON([
                 "type": "session.update",
                 "session": [
-                    "turn_detection": [
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 800,
+                    "type": "realtime",
+                    "audio": [
+                        "input": [
+                            "turn_detection": [
+                                "type": "server_vad",
+                                "threshold": 0.5,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 800,
+                            ],
+                        ],
                     ],
                 ],
             ])
@@ -528,11 +535,16 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                     self.sendJSON([
                         "type": "session.update",
                         "session": [
-                            "turn_detection": [
-                                "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": 800,
+                            "type": "realtime",
+                            "audio": [
+                                "input": [
+                                    "turn_detection": [
+                                        "type": "server_vad",
+                                        "threshold": 0.5,
+                                        "prefix_padding_ms": 300,
+                                        "silence_duration_ms": 800,
+                                    ],
+                                ],
                             ],
                         ],
                     ])
@@ -572,7 +584,7 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         if state.isActive {
             sendJSON([
                 "type": "session.update",
-                "session": ["turn_detection": NSNull()],
+                "session": ["type": "realtime", "audio": ["input": ["turn_detection": NSNull()]]],
             ])
             sendJSON(["type": "input_audio_buffer.clear"])
             Self.appendDiag("disengageContinuousListening: back to PTT")
@@ -774,7 +786,12 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     private func openWebSocket(token: String) async throws {
         var request = URLRequest(url: openAIRealtimeURL)
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("realtime=v1", forHTTPHeaderField: "OpenAI-Beta")
+        // v15p3e (2026-05-08): the OpenAI-Beta: realtime=v1 header is
+        // INCOMPATIBLE with GA ephemeral keys. Sending it produces:
+        //   "API version mismatch. You cannot start a Realtime beta
+        //    session with a GA client secret."
+        // Header omitted entirely for GA. Re-add only if rolling back
+        // both endpoint AND model to preview.
 
         let task = urlSession.webSocketTask(with: request)
         audioStateLock.lock()
@@ -915,13 +932,22 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                 captureAndSendActiveScreenshot()
             }
 
-        case "response.audio.delta":
+        // v15p3e (2026-05-08): GA renamed several response.* events.
+        // response.audio.delta → response.output_audio.delta
+        // response.audio_transcript.delta → response.output_audio_transcript.delta
+        // (plus .done variants — added below). Old names kept as fallthrough
+        // in case overrides revert to preview server. Without this rename
+        // Marin's audio chunks were silently dropped — diag log showed
+        // dozens of "unhandled server event: type=response.output_audio.delta"
+        // and the user heard nothing despite the model successfully
+        // generating a response.
+        case "response.output_audio.delta", "response.audio.delta":
             if let base64 = json["delta"] as? String,
                let pcmData = Data(base64Encoded: base64) {
                 playPCM16Chunk(pcmData)
             }
 
-        case "response.audio_transcript.delta":
+        case "response.output_audio_transcript.delta", "response.audio_transcript.delta":
             if let delta = json["delta"] as? String {
                 Task { @MainActor in
                     self.liveAssistantTranscript += delta
@@ -1019,7 +1045,11 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             }
 
         default:
-            break
+            // v15p3e (2026-05-08) DIAGNOSTIC: log unknown event types so we
+            // can see what GA is actually sending us. Switch was built for
+            // preview API event names; some may have been renamed in GA.
+            // Truncated to 200 chars to avoid log spam from large payloads.
+            Self.appendDiag("unhandled server event: type=\(type) raw=\(text.prefix(200))")
         }
     }
 
@@ -1895,11 +1925,16 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             let updatePayload: [String: Any] = [
                 "type": "session.update",
                 "session": [
-                    "turn_detection": [
-                        "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 800,
+                    "type": "realtime",
+                    "audio": [
+                        "input": [
+                            "turn_detection": [
+                                "type": "server_vad",
+                                "threshold": 0.5,
+                                "prefix_padding_ms": 300,
+                                "silence_duration_ms": 800,
+                            ],
+                        ],
                     ],
                 ],
             ]
@@ -1916,7 +1951,12 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             let updatePayload: [String: Any] = [
                 "type": "session.update",
                 "session": [
-                    "turn_detection": NSNull(),
+                    "type": "realtime",
+                    "audio": [
+                        "input": [
+                            "turn_detection": NSNull(),
+                        ],
+                    ],
                 ],
             ]
             sendJSON(updatePayload)
@@ -2278,18 +2318,23 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                     self.sendJSON([
                         "type": "session.update",
                         "session": [
-                            "turn_detection": [
-                                "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": 800,
+                            "type": "realtime",
+                            "audio": [
+                                "input": [
+                                    "turn_detection": [
+                                        "type": "server_vad",
+                                        "threshold": 0.5,
+                                        "prefix_padding_ms": 300,
+                                        "silence_duration_ms": 800,
+                                    ],
+                                ],
                             ],
                         ],
                     ])
                 } else {
                     self.sendJSON([
                         "type": "session.update",
-                        "session": ["turn_detection": NSNull()],
+                        "session": ["type": "realtime", "audio": ["input": ["turn_detection": NSNull()]]],
                     ])
                 }
             }
@@ -2544,12 +2589,15 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                 ])
             }
             if !entry.assistant.isEmpty {
+                // v15p3e (2026-05-08): GA renamed assistant content type
+                // "text" → "output_text". Sending "text" produces a server
+                // error and breaks history replay.
                 sendJSON([
                     "type": "conversation.item.create",
                     "item": [
                         "type": "message",
                         "role": "assistant",
-                        "content": [["type": "text", "text": entry.assistant]],
+                        "content": [["type": "output_text", "text": entry.assistant]],
                     ],
                 ])
             }
