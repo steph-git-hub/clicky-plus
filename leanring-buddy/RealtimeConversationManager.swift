@@ -41,6 +41,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import CoreAudio
 import Foundation
 
 /// A completed Marin conversation turn — used by the panel's live
@@ -888,6 +889,32 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                         self.outputPlayer.play()
                     }
                     self.outputAudioLevel = 0
+
+                    // v15p3o (2026-05-08): inject a system note containing
+                    // Marin's partial response so she can resume after the
+                    // user's interjection. Without this, gpt-realtime-2
+                    // treats the cancelled item as "thread closed" and
+                    // ignores even explicit "then continue" instructions.
+                    // Only fire if the partial transcript is substantive
+                    // (>20 chars) so quick interrupts on short utterances
+                    // don't spam noise.
+                    let partialTranscript = self.liveAssistantTranscript
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    if partialTranscript.count > 20 {
+                        let note = "[System note — barge-in context: Your prior response was interrupted mid-stream. The partial response you had spoken so far was: \"\(partialTranscript)\". After addressing the user's current interjection, briefly return to that thread and continue from where you stopped — unless the user's new request makes the prior thread obviously irrelevant. If they explicitly say 'then continue' or similar, you MUST resume.]"
+                        self.sendJSON([
+                            "type": "conversation.item.create",
+                            "item": [
+                                "type": "message",
+                                "role": "user",
+                                "content": [["type": "input_text", "text": note]],
+                            ],
+                        ])
+                        Self.appendDiag("barge-in: injected resume-context note (\(partialTranscript.count) chars)")
+                    } else {
+                        Self.appendDiag("barge-in: skipped resume-context note (partial transcript only \(partialTranscript.count) chars)")
+                    }
+
                     self.liveAssistantTranscript = ""
                 }
                 audioStateLock.lock()
@@ -1198,7 +1225,32 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         // pipeline — see comment above the inputNode setup. So we
         // mute during her speech to prevent feedback. Esc remains
         // the interrupt mechanism.
-        let shouldStreamAudio = (isHotkeyHeld || isContinuousListening) && !isModelSpeaking && !isSuspendedByOtherMode
+        // v15p3p (2026-05-08): barge-in is now AUTO based on audio output
+        // device. Headphones / Bluetooth / USB headsets / AirPlay → mic
+        // stays open during model speech (real-time interruption works).
+        // Built-in speakers / HDMI → mic gates off during model speech
+        // (avoids feedback loop where Marin hears herself).
+        //
+        // Manual override via UserDefaults:
+        //   defaults write com.stephenpierson.clickyplus clicky.realtimeBargeInForce -string on
+        //   defaults write com.stephenpierson.clickyplus clicky.realtimeBargeInForce -string off
+        //   defaults delete com.stephenpierson.clickyplus clicky.realtimeBargeInForce
+        // (Last one returns to auto.)
+        //
+        // Backward compat: the old bool key clicky.realtimeBargeInEnabled
+        // still works as "force on" if explicitly set true.
+        let bargeInEnabled: Bool = {
+            let force = UserDefaults.standard.string(forKey: "clicky.realtimeBargeInForce")
+            if force == "on" { return true }
+            if force == "off" { return false }
+            // Backward-compat path: explicit `enabled = true` forces on.
+            if UserDefaults.standard.bool(forKey: "clicky.realtimeBargeInEnabled") { return true }
+            // Auto.
+            return Self.cachedIsExternalAudioOutput()
+        }()
+        let shouldStreamAudio = (isHotkeyHeld || isContinuousListening)
+            && (bargeInEnabled || !isModelSpeaking)
+            && !isSuspendedByOtherMode
         let shouldFlush: Bool
         if shouldStreamAudio {
             inputAudioBuffer.append(bytes)
@@ -1372,6 +1424,105 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     /// mode here — they cost ~200-400ms + tokens but Marin still answers correctly.
     /// False negatives (skipping when we needed to) make Marin blind to context
     /// Steph wants her to see. Bias accordingly.
+    /// v15p3p (2026-05-08): cached headphone-detection for auto barge-in.
+    /// Refreshed every 1s — fast enough to react to plug/unplug events
+    /// (user expects barge-in to start working ~immediately after putting
+    /// in headphones), cheap enough to call from the audio thread (the
+    /// underlying Core Audio query is microseconds, but we still avoid
+    /// hammering it on every 100ms tap).
+    private static var externalAudioOutputCachedValue = false
+    private static var externalAudioOutputCheckedAt = Date.distantPast
+    private static let externalAudioOutputCacheTTL: TimeInterval = 1.0
+
+    static func cachedIsExternalAudioOutput() -> Bool {
+        let now = Date()
+        if now.timeIntervalSince(externalAudioOutputCheckedAt) > externalAudioOutputCacheTTL {
+            externalAudioOutputCachedValue = isExternalAudioOutput()
+            externalAudioOutputCheckedAt = now
+        }
+        return externalAudioOutputCachedValue
+    }
+
+    /// True if the system's default audio output is an external device
+    /// (headphones via 3.5mm jack, Bluetooth, USB, AirPlay, etc.) — i.e.
+    /// the model's audio won't bleed back into the mic. False for built-in
+    /// speakers and HDMI/DisplayPort (TV/monitor speakers).
+    ///
+    /// Used to gate barge-in: external = mic stays open during model speech
+    /// (interruption works); built-in = mic gates off (no feedback loop).
+    static func isExternalAudioOutput() -> Bool {
+        // Step 1: get the system default output device ID.
+        var deviceID = AudioDeviceID(0)
+        var deviceIDSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var deviceIDAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let deviceIDStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &deviceIDAddr, 0, nil, &deviceIDSize, &deviceID
+        )
+        guard deviceIDStatus == noErr, deviceID != 0 else { return false }
+
+        // Step 2: get the device's transport type.
+        var transport: UInt32 = 0
+        var transportSize = UInt32(MemoryLayout<UInt32>.size)
+        var transportAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let transportStatus = AudioObjectGetPropertyData(
+            deviceID, &transportAddr, 0, nil, &transportSize, &transport
+        )
+        guard transportStatus == noErr else { return false }
+
+        switch transport {
+        case kAudioDeviceTransportTypeBuiltIn:
+            // Built-in transport could be internal speakers OR the 3.5mm
+            // headphone jack — same physical device, different data sources.
+            // 'hdpn' = headphones jack, 'ispk' = internal speakers.
+            var dataSource: UInt32 = 0
+            var dataSourceSize = UInt32(MemoryLayout<UInt32>.size)
+            var dataSourceAddr = AudioObjectPropertyAddress(
+                mSelector: kAudioDevicePropertyDataSource,
+                mScope: kAudioObjectPropertyScopeOutput,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            let dataSourceStatus = AudioObjectGetPropertyData(
+                deviceID, &dataSourceAddr, 0, nil, &dataSourceSize, &dataSource
+            )
+            // If we can't read the data source, default to "internal" (safer).
+            guard dataSourceStatus == noErr else { return false }
+            // FourCC 'hdpn' = 0x6864706e (h=0x68, d=0x64, p=0x70, n=0x6E).
+            let headphonesDataSource: UInt32 = 0x6864706e
+            return dataSource == headphonesDataSource
+
+        case kAudioDeviceTransportTypeBluetooth,
+             kAudioDeviceTransportTypeBluetoothLE,
+             kAudioDeviceTransportTypeUSB,
+             kAudioDeviceTransportTypeFireWire,
+             kAudioDeviceTransportTypeThunderbolt,
+             kAudioDeviceTransportTypeAirPlay,
+             kAudioDeviceTransportTypeContinuityCaptureWired,
+             kAudioDeviceTransportTypeContinuityCaptureWireless:
+            // External audio path — assume safe for barge-in. Bluetooth
+            // speakers are a theoretical false-positive but rare for Steph.
+            return true
+
+        case kAudioDeviceTransportTypeHDMI,
+             kAudioDeviceTransportTypeDisplayPort:
+            // TV / external monitor speakers — feedback risk, treat as
+            // built-in speakers.
+            return false
+
+        default:
+            // Unknown transport — default to "no barge-in" for safety.
+            return false
+        }
+    }
+
     static func shouldSendScreenshotForTranscript(_ transcript: String) -> Bool {
         let lower = transcript
             .trimmingCharacters(in: .whitespacesAndNewlines)
