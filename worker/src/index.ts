@@ -1729,17 +1729,29 @@ async function handleSlackUnreadInbox(request: Request, env: Env): Promise<Respo
     // Silent failure here is fine — falls back to types-only list.
   }
 
-  // Build the final probed list, PRIORITIZING starred items.
-  // Without prioritization, Steph's starred DMs could be silently
-  // dropped behind unstarred recent DMs that happened to come
-  // first from users.conversations. Order: stars first (uniqued),
-  // then fill remaining slots from the recent-conversations list.
+  // v15p3j (2026-05-08): split the channel-probe budget evenly
+  // between starred and recent. Bug we just hit: Steph's starred
+  // count (>20) consumed the entire 20-slot budget, so unstarred
+  // recent DMs got ZERO slots. Specifically Bunheng DM'd him,
+  // unread badge was visible in Slack UI, but list_unread_slack
+  // returned nothing because Bunheng's DM wasn't starred and had
+  // no slot left to probe.
+  //
+  // New scheme: starred takes up to half the slots (10 of 20),
+  // recent unstarred fills the rest. If starred has fewer than
+  // 10, recent backfills the unused starred slots too. So worst
+  // case starred is well-represented; best case both halves are
+  // probed.
+  const starredSlotCap = Math.floor(maxChannels / 2);
   const seen = new Set<string>();
   const orderedIds: string[] = [];
+  let starredAdded = 0;
   for (const id of starredIds) {
+    if (starredAdded >= starredSlotCap) break;
     if (!seen.has(id)) {
       seen.add(id);
       orderedIds.push(id);
+      starredAdded++;
     }
   }
   for (const ch of recentChannels) {
@@ -1747,6 +1759,16 @@ async function handleSlackUnreadInbox(request: Request, env: Env): Promise<Respo
     if (!seen.has(ch.id)) {
       seen.add(ch.id);
       orderedIds.push(ch.id);
+    }
+  }
+  // If starred had room left over after its cap, backfill any
+  // remaining starred items into the unused slots. (Rare — only
+  // happens when total channels < cap.)
+  for (const id of starredIds) {
+    if (orderedIds.length >= maxChannels) break;
+    if (!seen.has(id)) {
+      seen.add(id);
+      orderedIds.push(id);
     }
   }
   const channels = orderedIds.slice(0, maxChannels).map((id) => ({ id }));
