@@ -270,7 +270,7 @@ async function handleTranscribeToken(env: Env): Promise<Response> {
  * that token. The real key never leaves Cloudflare.
  *
  * Defaults baked in (callers can override via request body):
- *   - model: "gpt-realtime"
+ *   - model: "gpt-realtime-2" (was "gpt-realtime" pre-v15p3d)
  *   - voice: "marin"
  *   - turn_detection: null (manual mode — Mac app uses true push-to-talk
  *     semantics; client decides when the user's turn ends, server only
@@ -331,7 +331,13 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
     : basePersona;
 
   const sessionRequest: Record<string, unknown> = {
-    model: overrides.model ?? "gpt-realtime",
+    // v15p3d (2026-05-07): upgraded to gpt-realtime-2 — GPT-5-class
+    // reasoning, 128K context (was 32K), API officially GA. Direct
+    // motivation: yesterday's Marin accuracy issues (telling Steph to
+    // click elements not on screen) plausibly reduce or vanish under
+    // a stronger reasoning model with better vision grounding. Same
+    // pricing per token. Roll back to "gpt-realtime" if regressions.
+    model: overrides.model ?? "gpt-realtime-2",
     voice: overrides.voice ?? "marin",
     modalities: overrides.modalities ?? ["audio", "text"],
     input_audio_format: overrides.input_audio_format ?? "pcm16",

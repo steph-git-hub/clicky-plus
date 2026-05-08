@@ -31,7 +31,7 @@
 //        ↓ POST /realtime-session
 //    [Cloudflare Worker uses OPENAI_API_KEY secret to mint ephemeral token]
 //        ↓ ephemeral client_secret (~60s TTL)
-//    [Mac app opens wss://api.openai.com/v1/realtime?model=gpt-realtime]
+//    [Mac app opens wss://api.openai.com/v1/realtime?model=gpt-realtime-2]
 //        ↓ session.update + audio frames
 //    [OpenAI Realtime: streams response audio + transcripts]
 //        ↓ output audio frames (PCM16 24kHz mono)
@@ -98,7 +98,11 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     // MARK: - Configuration
 
     private let workerSessionURL = URL(string: "https://clicky-proxy.sapierso.workers.dev/realtime-session")!
-    private let openAIRealtimeURL = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime")!
+    // v15p3d (2026-05-07): upgraded model to gpt-realtime-2 — GPT-5-class
+    // reasoning, 128K context, GA (out of beta). Should improve vision
+    // grounding and persona adherence (the Marin accuracy issues from
+    // 2026-05-07). Roll back to gpt-realtime if regressions.
+    private let openAIRealtimeURL = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime-2")!
 
     // MARK: - WebSocket + audio plumbing
 
