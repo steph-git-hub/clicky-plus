@@ -375,6 +375,19 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
         format: overrides.input_audio_format ?? { type: "audio/pcm", rate: 24000 },
         transcription: overrides.input_audio_transcription ?? {
           model: "whisper-1",
+          // v15p3k (2026-05-08): bias Whisper toward correct spellings
+          // of proper nouns Steph uses daily — names, brands, tools.
+          // Mirrors BuddyDictationManager.baseTranscriptionKeyterms
+          // (AssemblyAI keyterms_prompt) so VTT and Marin transcribe the
+          // same names the same way. Real bug we hit today: Marin
+          // transcribed "Bunheng" as "Boonhang" then queried Slack with
+          // the wrong spelling, returning zero results despite Bunheng
+          // having an unread DM visible in Steph's Slack right now.
+          //
+          // Whisper's `prompt` is a free-text hint — listing proper
+          // nouns (without context sentences) is the documented pattern.
+          // 224-token cap; we're well under at ~30 names.
+          prompt: "Bunheng, Lukas, Phil Kramer, Calvin, Eileen, Lisa, Janelle, Anas Abdullah, Nerisa, Mia, Kevin, Harshika, Glamnetic, Kombo, Anthropic, OpenAI, Claude, Cowork, Clicky, Marin, Wispr, Obsidian, ClickUp, Omni, Slack, Axiom, Codex, Voicebox, Shipmonk, Ulta, Amazon, Chevron, ASIN.",
         },
         // Manual turn detection — Mac app uses true PTT, client commits
         // explicitly on hotkey release. Server VAD was triggering responses
