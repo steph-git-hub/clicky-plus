@@ -2120,6 +2120,13 @@ async function handleVoiceCommandPolish(
       `- Drop standalone punctuation-cue words: "comma", "period", "question mark", "exclamation point", "new paragraph", "open paren", "close paren", "open quote", "close quote".\n` +
       `- Drop FALSE STARTS only when the speaker EXPLICITLY self-corrects with words like "no actually", "wait, I mean", "scratch that", "let me restart". For these, output only the corrected version.\n` +
       `- Match destination tone if a screenshot is provided (Slack stays casual, email stays professional). The image informs register, not whether to rewrite.\n` +
+      // v15p3r (2026-05-08): sentence cohesion — anti-fragmentation rule.
+      // Audit of VTT toggle → Polish sequences found a recurring pattern
+      // where Steph re-polished after toggle to fix over-fragmented output:
+      // streams of related thoughts split into choppy short sentences when
+      // they should flow as one. Spoken thought naturally comes out in
+      // fragments; written form should flow.
+      `- SENTENCE COHESION (anti-fragmentation): when adjacent sentences are tightly connected (same subject continuing, single thread of thought, would naturally read as one breath in speech), JOIN them with a comma + connector ("and", "but", "so", "then") rather than splitting with periods. Concrete example. Spoken: "I think we should do this. and then we should do that. also we need to consider this." Default polish often pastes that verbatim with capitalized "And"/"Also" — over-fragmented. CORRECT polish: "I think we should do this, then we should do that, and we also need to consider this." (comma-and-connector cohesion). The test: if the second sentence starts with a connector ("And", "But", "So", "Also", "Then", "Plus") AND continues the same subject/thread, fold it into the prior sentence using comma + connector. Don't fold across topic shifts, paragraph breaks, or genuinely independent thoughts. (Reminder: NEVER use em-dashes for cohesion — use commas and connectors only.)\n` +
       `\n` +
       `WHAT NOT TO DO:\n` +
       `- DO NOT paraphrase. Keep the user's actual words.\n` +
@@ -2244,7 +2251,20 @@ async function handleVoiceCommandPolish(
     `DEFAULT BEHAVIOR (no additional guidance from the user):\n` +
     styleGuidance +
     `- GRAMMATICAL CORRECTNESS IS NON-NEGOTIABLE. If you remove a connector word ("because", "since", "so", "however", "but", "and", "though", etc.) you MUST add proper punctuation (period, em-dash with spaces " — ", semicolon, or comma) to maintain a complete grammatical sentence. Never produce run-on fragments like "more sense the team has..." where two clauses are jammed together with no punctuation between them. If you're unsure whether removing a connector will create a fragment, KEEP the connector.\n` +
-    `- WORD SPACING: every word MUST have a space (or appropriate punctuation + space) between it and the next word. Never concatenate two words ("sensethe", "andthen", "tomorrowi"). Never write an em-dash without spaces around it ("sense—the" is wrong; "sense — the" is right).\n\n` +
+    `- WORD SPACING: every word MUST have a space (or appropriate punctuation + space) between it and the next word. Never concatenate two words ("sensethe", "andthen", "tomorrowi"). Never write an em-dash without spaces around it ("sense—the" is wrong; "sense — the" is right).\n` +
+    // v15p3r (2026-05-08): subject-verb agreement + grammar fix-it rule.
+    // Audit found cases where polish preserved literal grammar errors
+    // ("the fixes handles" instead of "the fixes handle") — preserving
+    // user voice was being interpreted as preserving syntactic errors,
+    // which is wrong. Mechanical correctness is faithful, not infidelity.
+    `- SUBJECT-VERB AGREEMENT + BASIC GRAMMAR: fix these even if user said it wrong. "the fixes handles" → "the fixes handle". "the team are working" → "the team is working". "I seen it" → "I saw it". This is mechanical correctness, NOT paraphrasing — preserving syntactic errors verbatim is wrong, not faithful. Apply to obvious agreement errors only; don't second-guess deliberate stylistic choices.\n` +
+    // v15p3r (2026-05-08): proper noun normalization. Same names list
+    // we bias Whisper with (worker session config) and AssemblyAI keyterms
+    // — but applied at the polish layer too as a safety net for cases
+    // where STT got the phonetic variant. Audit found polish was preserving
+    // mishearings: Boonhang/Bunhang (real spelling: Bunheng), Lucas (Lukas),
+    // Quickie/Qlikki (Clicky), Shipmunk/Shipbunk (Shipmonk).
+    `- PROPER NOUN NORMALIZATION: if the input contains a phonetic mishearing of one of Steph's known proper nouns, replace with the correct spelling. Known names/brands/tools (replace any phonetic variant with these): Bunheng (NOT Boonhang/Bunhang), Lukas (NOT Lucas), Phil Kramer, Calvin, Eileen, Lisa, Janelle, Anas Abdullah, Nerisa, Mia, Kevin, Harshika, Glamnetic, Kombo, Anthropic, OpenAI, Claude, Cowork, Clicky (NOT Quickie/Qlikki when in product/tool context), Marin, Wispr, Obsidian, ClickUp, Omni, Slack, Axiom, Codex, Voicebox, Shipmonk (NOT Shipmunk/Shipbunk), Ulta, Amazon, Chevron, ASIN. Apply only when the mishearing is unambiguous given context — e.g. "I asked Lucas about it" obviously means "Lukas" if no other Lucas exists in context.\n\n` +
     `WHEN ADDITIONAL STYLE GUIDANCE IS PROVIDED (a "modifier"):\n` +
     `- The user has explicitly asked for a change. Follow the guidance precisely.\n` +
     `- For SURGICAL edits (find-and-replace, targeted additions/deletions, spelling fixes, "add quotes around X", "Lucas is spelled with a K"): make ONLY that change. Don't also tighten phrasing, don't reflow paragraphs, don't touch anything outside the targeted edit.\n` +
