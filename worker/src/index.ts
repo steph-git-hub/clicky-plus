@@ -127,6 +127,10 @@ export default {
       if (url.pathname === "/slack/post-message") {
         return await handleSlackPostMessage(request, env);
       }
+
+      if (url.pathname === "/web-search") {
+        return await handleWebSearch(request, env);
+      }
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
       return new Response(
@@ -138,6 +142,75 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 };
+
+/// v15p3u (2026-05-09): web search via Anthropic's web_search tool. Marin
+/// calls this when she needs current web information. We make a single
+/// Anthropic call with web_search enabled, Claude searches + synthesizes,
+/// we return the synthesized answer + source URLs back to Marin.
+///
+/// Why Anthropic-mediated vs raw Brave/Perplexity: simpler setup (already
+/// have ANTHROPIC_API_KEY), better synthesis (Claude reads + summarizes
+/// vs raw search snippets), worse latency (~3-8s instead of ~500ms). For
+/// Marin's low-volume use case the trade-off is right.
+async function handleWebSearch(request: Request, env: Env): Promise<Response> {
+  let payload: { query?: string };
+  try {
+    payload = (await request.json()) as { query?: string };
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+  const query = (payload.query ?? "").trim();
+  if (query.length === 0) {
+    return jsonError("Missing 'query' parameter", 400);
+  }
+
+  const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 800,
+      tools: [
+        {
+          type: "web_search_20250305",
+          name: "web_search",
+          max_uses: 3,
+        },
+      ],
+      system: "You are a search assistant. The user will give you a query. Use web_search to find current information, then return a tight 2-4 sentence answer with the key facts. Cite sources inline as [1], [2], etc., then list the source URLs at the end as a flat list. No preamble, no commentary on the search process — just the answer + sources.",
+      messages: [
+        { role: "user", content: query },
+      ],
+    }),
+  });
+
+  if (!anthropicResponse.ok) {
+    const errorBody = await anthropicResponse.text();
+    return sanitizedUpstreamError("/web-search", anthropicResponse.status, errorBody);
+  }
+
+  const responseJson = (await anthropicResponse.json()) as {
+    content?: Array<{ type: string; text?: string }>;
+  };
+  // Concatenate all text content blocks (web_search may produce multiple).
+  const answer = (responseJson.content ?? [])
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+
+  return new Response(
+    JSON.stringify({
+      query,
+      answer: answer.length > 0 ? answer : "No answer returned.",
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
 
 async function handleChat(request: Request, env: Env): Promise<Response> {
   const rawBody = await request.text();
@@ -455,6 +528,41 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
             },
           },
           required: ["continuous"],
+        },
+      },
+      // v15p3u (2026-05-09): web search. Marin previously had no way to
+      // reach the web — answered current-event / research questions from
+      // training data only. Now routes through Anthropic's web_search tool
+      // for actual current information. Mac dispatcher hits Worker
+      // /web-search route which calls Anthropic with web_search enabled.
+      {
+        type: "function",
+        name: "web_search",
+        description:
+          "Search the web for current information Steph asks about. Use ONLY when the question genuinely requires current/recent web data: news, current events, recent product launches, today's weather, sports scores, stock prices, factual lookups beyond your training knowledge. Do NOT use for: questions you can answer from training (history, definitions, math), questions about Steph's personal data (use search_obsidian/search_gmail/etc instead), or general conversation. The query should be a short focused search phrase, not a full sentence — e.g. 'OpenAI gpt-realtime-3 release date' not 'when is gpt-realtime-3 coming out'. Returns a synthesized answer with key facts + sources. Uses Anthropic's web search behind the scenes; expect 3-8 second latency.",
+        parameters: {
+          type: "object",
+          properties: {
+            query: {
+              type: "string",
+              description: "Focused search query, 2-8 words. Short, keyword-rich, like you'd type into Google.",
+            },
+          },
+          required: ["query"],
+        },
+      },
+      // v15p3t (2026-05-09): on-demand fresh screenshot. Closes the
+      // "Marin is stale" gap — she can request a fresh visual whenever
+      // she suspects the per-turn screenshot doesn't match current state.
+      {
+        type: "function",
+        name: "get_current_screenshot",
+        description:
+          "Capture a fresh screenshot of Steph's currently-active screen RIGHT NOW and inject it into the conversation. Use ONLY when you have a specific reason to think your existing visual context is stale: (a) Steph says 'look at this now' / 'see what's on my screen' / 'wait, this changed' / 'check this out', (b) you're in tutor mode and need to verify a UI state changed after Steph's action, (c) you're answering a visual question and the prior screenshot was from a clearly different context. Do NOT call defensively — every call costs vision tokens and adds latency. The screenshot lands in your context as a new user message; reference it in your next response.",
+        parameters: {
+          type: "object",
+          properties: {},
+          required: [],
         },
       },
       // ── Research tools (v15p2, 2026-05-02) ─────────────────

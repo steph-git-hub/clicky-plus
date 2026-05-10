@@ -81,7 +81,7 @@ enum CompanionScreenCaptureUtility {
             let filter = SCContentFilter(display: display, excludingWindows: ownAppWindows)
 
             let configuration = SCStreamConfiguration()
-            let maxDimension = 1280
+            let maxDimension = 1920
             let aspectRatio = CGFloat(display.width) / CGFloat(display.height)
             if display.width >= display.height {
                 configuration.width = maxDimension
@@ -197,7 +197,7 @@ enum CompanionScreenCaptureUtility {
         let filter = SCContentFilter(display: targetDisplay, excludingWindows: ownAppWindows)
 
         let configuration = SCStreamConfiguration()
-        let maxDimension = 1280
+        let maxDimension = 1920
         let aspectRatio = CGFloat(targetDisplay.width) / CGFloat(targetDisplay.height)
         if targetDisplay.width >= targetDisplay.height {
             configuration.width = maxDimension

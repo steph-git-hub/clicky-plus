@@ -1482,7 +1482,7 @@ final class CompanionManager: ObservableObject {
         case .pressed:
             // v15p2 (2026-05-03): suspend Marin if she's running.
             markOtherModePressed("basePTT")
-            guard !buddyDictationManager.isDictationInProgress else { return }
+            guard ensureDictationReady() else { return }
             // Don't register push-to-talk while the onboarding video is playing
             guard !showOnboardingVideo else { return }
 
@@ -1598,7 +1598,7 @@ final class CompanionManager: ObservableObject {
 
         switch transition {
         case .pressed:
-            guard !buddyDictationManager.isDictationInProgress else { return }
+            guard ensureDictationReady() else { return }
             guard !showOnboardingVideo else { return }
 
             // Bring the overlay forward if it's currently hidden
@@ -2170,7 +2170,7 @@ final class CompanionManager: ObservableObject {
         case .pressed:
             // v15p2 (2026-05-03): suspend Marin if she's running.
             markOtherModePressed("typing")
-            guard !buddyDictationManager.isDictationInProgress else { return }
+            guard ensureDictationReady() else { return }
             guard !showOnboardingVideo else { return }
 
             // Bring the overlay forward if it's currently hidden
@@ -2279,26 +2279,38 @@ final class CompanionManager: ObservableObject {
     // (shift+opt+fn), typing (cmd+fn), and normal PTT (ctrl+opt,
     // which forbids .function) cannot double-fire with it.
 
+    // v15p3s (2026-05-09): unified stuck-state recovery for all
+    // dictation engage paths. Generalizes the v15p3c fix that was
+    // only applied to handleVoiceToTextTransition .pressed. Same
+    // failure mode could happen on any mode engage (typing toggle,
+    // capture-to-inbox, polish, base PTT, realtime engagement) —
+    // BuddyDictationManager flag stuck true, guard silently bails,
+    // toggle "engages" but no actual session starts.
+    //
+    // Call this BEFORE the isDictationInProgress guard at any user-
+    // initiated press/engage handler. Returns true if dictation is
+    // ready (either was never running, or stuck state was recovered).
+    // Returns false only if recovery failed (very rare — usually
+    // means cancelCurrentDictation itself bailed).
+    private func ensureDictationReady() -> Bool {
+        if buddyDictationManager.isDictationInProgress {
+            print("🔧 ensureDictationReady: dictation manager has stuck state — recovering before engage")
+            buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
+        }
+        return !buddyDictationManager.isDictationInProgress
+    }
+
     private func handleVoiceToTextTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
             // v15p2 (2026-05-03): suspend Marin if she's running.
             markOtherModePressed("vtt")
-            // v15p3c (2026-05-07): recover from stuck dictation state so
-            // a new press can start a fresh session. Symptom: VTT toggle
-            // engages (isVoiceToTextToggleLocked=true was set by the
-            // double-tap handler upstream) but the spinner is stuck on
-            // and no recording starts. Cause: a previous session left
-            // isFinalizingTranscript (or another isDictationInProgress
-            // flag) stuck true — the guard below silently bails. The
-            // v15p3 force-cancel inside startPushToTalk doesn't help
-            // because we never get that far. Force-cancel here so the
-            // guard passes and the new session runs.
-            if buddyDictationManager.isDictationInProgress {
-                print("🔧 VTT .pressed: dictation manager has stuck state — force-cancelling to recover")
-                buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
-            }
-            guard !buddyDictationManager.isDictationInProgress else { return }
+            // v15p3c (2026-05-07): the inline if+cancel+guard pattern
+            // here was the original recovery for stuck VTT toggle state.
+            // v15p3s (2026-05-09): generalized into ensureDictationReady()
+            // and applied to all 12 mode-engage call sites. Same effect,
+            // single source of truth.
+            guard ensureDictationReady() else { return }
             guard !showOnboardingVideo else { return }
 
             // Bring the overlay forward if hidden so the purple
@@ -2583,7 +2595,7 @@ final class CompanionManager: ObservableObject {
     private func handleVoiceModeDoubleTapEngage() {
         guard !isVoiceModeToggleLocked else { return }
         // Don't engage if dictation is mid-flight from a different mode.
-        guard !buddyDictationManager.isDictationInProgress else { return }
+        guard ensureDictationReady() else { return }
         guard !showOnboardingVideo else { return }
         print("🔒 Voice mode toggle: engaging (double-tap Opt) — click-to-capture armed")
 
@@ -2629,7 +2641,7 @@ final class CompanionManager: ObservableObject {
     /// mode pre-swap). Same effect as Fn+Cmd+Opt before this swap, just
     /// with easier ergonomics.
     private func handleOptionDoubleTapForRealtimeHandsFree() {
-        guard !buddyDictationManager.isDictationInProgress else { return }
+        guard ensureDictationReady() else { return }
         guard !showOnboardingVideo else { return }
         // v15p2 hotfix (2026-05-03): only no-op if BOTH the persisted
         // flag is on AND a session is actually running. Previous logic
@@ -2680,7 +2692,7 @@ final class CompanionManager: ObservableObject {
         _ transition: BuddyPushToTalkShortcut.ShortcutTransition
     ) {
         guard transition == .pressed else { return }
-        guard !buddyDictationManager.isDictationInProgress else { return }
+        guard ensureDictationReady() else { return }
         guard !showOnboardingVideo else { return }
         if isVoiceModeToggleLocked {
             print("🔒 Base voice-mode toggle: disengaging (Fn+Shift+Opt)")
@@ -2759,7 +2771,7 @@ final class CompanionManager: ObservableObject {
         case .pressed:
             // v15p2 (2026-05-03): suspend Marin if she's running.
             markOtherModePressed("captureToInbox")
-            guard !buddyDictationManager.isDictationInProgress else { return }
+            guard ensureDictationReady() else { return }
             guard !showOnboardingVideo else { return }
 
             // Bring the overlay forward so the yellow waveform gives
@@ -2849,7 +2861,7 @@ final class CompanionManager: ObservableObject {
     private func handleRealtimeTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
-            guard !buddyDictationManager.isDictationInProgress else { return }
+            guard ensureDictationReady() else { return }
             guard !showOnboardingVideo else { return }
 
             // Cancel any in-flight Claude/TTS so Realtime doesn't fight
@@ -2958,7 +2970,7 @@ final class CompanionManager: ObservableObject {
         _ transition: BuddyPushToTalkShortcut.ShortcutTransition
     ) {
         guard transition == .pressed else { return }
-        guard !buddyDictationManager.isDictationInProgress else { return }
+        guard ensureDictationReady() else { return }
         guard !showOnboardingVideo else { return }
 
         // Flip the persisted flag.
@@ -3011,7 +3023,7 @@ final class CompanionManager: ObservableObject {
             markOtherModePressed("polish")
             // Don't fire if any other capture is in progress — polish is a
             // pure write path and shouldn't overlap with active dictation.
-            guard !buddyDictationManager.isDictationInProgress else { return }
+            guard ensureDictationReady() else { return }
             guard !showOnboardingVideo else { return }
             // Don't double-fire if a polish call is already in flight.
             guard pendingPolishCommandTask == nil else { return }
@@ -3105,7 +3117,7 @@ final class CompanionManager: ObservableObject {
     /// the structure of handleVoiceToTextTransition's pressed branch but
     /// scoped to polish modifier capture.
     private func engagePolishHotkeyDictationForSpokenModifier() {
-        guard !buddyDictationManager.isDictationInProgress else { return }
+        guard ensureDictationReady() else { return }
         guard !showOnboardingVideo else { return }
 
         isPolishHotkeyDictatingForModifier = true

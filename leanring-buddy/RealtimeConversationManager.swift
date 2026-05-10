@@ -1720,6 +1720,48 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             let result = toolSetListeningMode(continuous: continuous)
             sendFunctionCallResult(callId: callId, name: name, result: result)
 
+        // v15p3u (2026-05-09): web search via Anthropic's web_search tool.
+        // Marin sends a query, Worker calls Anthropic with web_search enabled,
+        // Anthropic searches + synthesizes, returns answer with sources.
+        case "web_search":
+            let query = (args["query"] as? String) ?? ""
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let result = try await self.callWorkerJSON(
+                        path: "/web-search",
+                        body: ["query": query]
+                    )
+                    self.sendFunctionCallResult(callId: callId, name: name, result: result)
+                } catch {
+                    self.sendFunctionCallResult(
+                        callId: callId,
+                        name: name,
+                        result: ["status": "error", "reason": error.localizedDescription]
+                    )
+                }
+            }
+
+        // v15p3t (2026-05-09): on-demand fresh screenshot. Marin called the
+        // tool because she suspects her visual context is stale. We capture
+        // a new screenshot, send it as a conversation item (the actual image
+        // payload), AND immediately resolve the function call with a tiny
+        // ack so she continues. The screenshot will be in context for her
+        // next response.
+        case "get_current_screenshot":
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.captureAndSendActiveScreenshot()
+                self.sendFunctionCallResult(
+                    callId: callId,
+                    name: name,
+                    result: [
+                        "status": "ok",
+                        "note": "Fresh screenshot has been sent as a new user message in the conversation. Reference it in your next response.",
+                    ]
+                )
+            }
+
         // ── Research tools (v15p2, 2026-05-02) ────────────────
         case "list_scheduled_tasks":
             Task { @MainActor [weak self] in
