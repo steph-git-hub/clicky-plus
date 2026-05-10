@@ -748,7 +748,15 @@ struct BlueCursorView: View {
             if !companionManager.vttLiveTranscript.isEmpty
                 && (companionManager.isVoiceToTextModeActive || companionManager.isPolishHotkeyModifierCaptureModeActive)
                 && buddyIsVisibleOnThisScreen {
-                LiveVTTPreviewView(transcript: companionManager.vttLiveTranscript)
+                // v15p3aa (2026-05-10): tint matches the active mode color
+                // (purple for VTT, cyan for Polish-modifier capture). Polish
+                // mode showed the pill but in VTT's purple — visual mismatch.
+                LiveVTTPreviewView(
+                    transcript: companionManager.vttLiveTranscript,
+                    tint: companionManager.isPolishHotkeyModifierCaptureModeActive
+                        ? DS.Colors.overlayCursorCyan
+                        : DS.Colors.overlayCursorPurple
+                )
                     .position(x: cursorPosition.x, y: max(40, cursorPosition.y - 60))
                     .transition(.asymmetric(
                         insertion: .opacity,
@@ -1713,15 +1721,18 @@ private struct BlueCursorWaveformView: View {
 
 // MARK: - Idea Captured Toast
 
-/// v15p3v (2026-05-09): live VTT preview overlay. Shows AssemblyAI's
-/// streaming partial transcript above the cursor while a VTT session
-/// is active. Lets Steph see his words landing as he speaks — gives
-/// confidence the mic + STT are working, lets him catch a mishearing
-/// before he releases. Distinct from IdeaCapturedToast (yellow,
-/// post-capture) — this is purple (matches VTT), pre-finalize, only
-/// shows during active dictation. Empty transcript = view collapses.
+/// v15p3v (2026-05-09): live preview overlay for in-flight dictation.
+/// Shows AssemblyAI's streaming partial transcript above the cursor
+/// during VTT or Polish-modifier capture. Lets Steph see his words
+/// landing as he speaks. Distinct from IdeaCapturedToast (yellow,
+/// post-capture) — this is mode-tinted, pre-finalize, only shows during
+/// active dictation. Empty transcript = view collapses.
+/// v15p3aa (2026-05-10): tint is now driven by the active mode (purple
+/// for VTT, cyan for Polish modifier capture) so the pill matches the
+/// rest of the visual language for that mode.
 private struct LiveVTTPreviewView: View {
     let transcript: String
+    var tint: Color = DS.Colors.overlayCursorPurple
 
     var body: some View {
         Text(transcript)
@@ -1739,9 +1750,9 @@ private struct LiveVTTPreviewView: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .strokeBorder(DS.Colors.overlayCursorPurple.opacity(0.5), lineWidth: 1)
+                    .strokeBorder(tint.opacity(0.5), lineWidth: 1)
             )
-            .shadow(color: DS.Colors.overlayCursorPurple.opacity(0.35), radius: 10, x: 0, y: 3)
+            .shadow(color: tint.opacity(0.35), radius: 10, x: 0, y: 3)
             .allowsHitTesting(false)
     }
 }
