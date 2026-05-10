@@ -672,6 +672,43 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     @Published var lastErrorMessage: String?
     @Published private(set) var currentPermissionProblem: BuddyDictationPermissionProblem?
 
+    /// v15p3v (2026-05-09): live partial transcript for the in-progress
+    /// dictation. Mirrors `latestRecognizedText` (which is private and
+    /// updated as AssemblyAI delivers streaming partials) so SwiftUI
+    /// overlays can show what's being recognized in real time. Empty
+    /// when no dictation in progress. Cleared on session end via
+    /// resetSessionState. Steph asked for this so he has live
+    /// confidence the mic + STT are working, can catch a misheard
+    /// word mid-flight, and is never surprised by what got transcribed.
+    @Published private(set) var liveTranscriptForDisplay: String = ""
+
+    // v15p3w (2026-05-10): clean AssemblyAI's raw partial text for the
+    // floating live-preview overlay. Removes em-dash / en-dash pause
+    // artifacts, collapses runs of whitespace, trims edges. Cheap —
+    // runs on every transcript update on the main actor; transcripts
+    // stay short (a few sentences worth of in-flight words).
+    fileprivate static func sanitizeForLiveDisplay(_ raw: String) -> String {
+        guard !raw.isEmpty else { return "" }
+        var cleaned = raw
+        // Remove em-dash and en-dash (with any adjacent spaces) entirely.
+        cleaned = cleaned.replacingOccurrences(of: " — ", with: " ")
+        cleaned = cleaned.replacingOccurrences(of: " – ", with: " ")
+        cleaned = cleaned.replacingOccurrences(of: "—", with: " ")
+        cleaned = cleaned.replacingOccurrences(of: "–", with: " ")
+        // Collapse multiple whitespace (incl. newlines) into single space.
+        let whitespaceRegex = try? NSRegularExpression(pattern: "\\s+", options: [])
+        if let regex = whitespaceRegex {
+            let range = NSRange(cleaned.startIndex..., in: cleaned)
+            cleaned = regex.stringByReplacingMatches(
+                in: cleaned,
+                options: [],
+                range: range,
+                withTemplate: " "
+            )
+        }
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     var isDictationInProgress: Bool {
         isPreparingToRecord || isRecordingFromMicrophoneButton || isRecordingFromKeyboardShortcut || isFinalizingTranscript
     }
@@ -1110,6 +1147,15 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             onTranscriptUpdate: { [weak self] transcriptText in
                 Task { @MainActor in
                     self?.latestRecognizedText = transcriptText
+                    // v15p3v (2026-05-09): mirror partial to the public
+                    // display var so the live-preview overlay can show
+                    // words as they're recognized.
+                    // v15p3w (2026-05-10): sanitize for display only —
+                    // AssemblyAI's unformatted partials sprinkle em/en
+                    // dashes at every pause, which makes the overlay
+                    // look fragmented. Strip them + collapse whitespace
+                    // for the display path; raw text still feeds polish.
+                    self?.liveTranscriptForDisplay = Self.sanitizeForLiveDisplay(transcriptText)
                 }
             },
             onFinalTranscriptReady: { [weak self] transcriptText in
@@ -1227,6 +1273,9 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         activeStartSource = nil
         draftTextBeforeCurrentDictation = ""
         latestRecognizedText = ""
+        // v15p3v (2026-05-09): clear the live-preview mirror so the
+        // overlay disappears when the session ends.
+        liveTranscriptForDisplay = ""
         shouldAutomaticallySubmitFinalDraft = false
         hasFinishedCurrentDictationSession = false
         isPreparingToRecord = false

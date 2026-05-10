@@ -322,6 +322,12 @@ final class CompanionManager: ObservableObject {
     @Published private(set) var voiceState: CompanionVoiceState = .idle
     @Published private(set) var lastTranscript: String?
     @Published private(set) var currentAudioPowerLevel: CGFloat = 0
+    /// v15p3v (2026-05-09): live partial transcript from VTT/dictation
+    /// sessions, mirrored from BuddyDictationManager. SwiftUI overlays
+    /// observe this to show words as they're being recognized — gives
+    /// Steph live confidence the mic + STT are working and lets him
+    /// catch a misheard word mid-flight without committing to release.
+    @Published private(set) var vttLiveTranscript: String = ""
     @Published private(set) var hasAccessibilityPermission = false
     @Published private(set) var hasScreenRecordingPermission = false
     @Published private(set) var hasMicrophonePermission = false
@@ -666,6 +672,7 @@ final class CompanionManager: ObservableObject {
     private var nativeScreenshotSessionCancellable: AnyCancellable?
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
+    private var vttLiveTranscriptCancellable: AnyCancellable?
     private var accessibilityCheckTimer: Timer?
     private var pendingKeyboardShortcutStartTask: Task<Void, Never>?
     private var pendingBurstShortcutStartTask: Task<Void, Never>?
@@ -1226,6 +1233,26 @@ final class CompanionManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] powerLevel in
                 self?.currentAudioPowerLevel = powerLevel
+            }
+        // v15p3v (2026-05-09): mirror the live partial transcript so the
+        // overlay can show it. Same observation pattern as audio power.
+        // v15p3x (2026-05-10): dedupe + throttle. AssemblyAI emits 5-10
+        // partials/sec, often with duplicate or near-identical text. The
+        // raw firehose was forcing the OverlayWindow ZStack (which now
+        // contains LiveVTTPreviewView) to invalidate constantly. That
+        // invalidation pressure was implicated in two SwiftUI Button
+        // crashes (CompanionPanelView indicator/model picker) — the
+        // panel was getting re-hosted mid-click and the gesture fired
+        // on a freed view. Dedupe + 10Hz cap kills the churn at the
+        // source without losing any visible information.
+        vttLiveTranscriptCancellable = buddyDictationManager.$liveTranscriptForDisplay
+            .removeDuplicates()
+            .throttle(for: .milliseconds(100), scheduler: DispatchQueue.main, latest: true)
+            .sink { [weak self] transcript in
+                guard let self else { return }
+                if self.vttLiveTranscript != transcript {
+                    self.vttLiveTranscript = transcript
+                }
             }
     }
 

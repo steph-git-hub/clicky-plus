@@ -715,6 +715,22 @@ struct BlueCursorView: View {
             // shown for ~3s after a capture-to-inbox append lands.
             // Positioned just below the cursor so the visual chain is
             // waveform (at cursor) → toast (below cursor) → fade.
+            // v15p3v (2026-05-09): live VTT preview — sits ABOVE the cursor
+            // (so it doesn't conflict with the IdeaCapturedToast below).
+            // Only shows when there's a partial transcript AND a VTT
+            // session is genuinely active (avoids ghost text from prior
+            // sessions). Auto-collapses on session end (transcript clears).
+            if !companionManager.vttLiveTranscript.isEmpty
+                && (companionManager.isVoiceToTextModeActive || companionManager.isPolishHotkeyModifierCaptureModeActive)
+                && buddyIsVisibleOnThisScreen {
+                LiveVTTPreviewView(transcript: companionManager.vttLiveTranscript)
+                    .position(x: cursorPosition.x, y: max(40, cursorPosition.y - 60))
+                    .transition(.asymmetric(
+                        insertion: .opacity,
+                        removal: .opacity
+                    ))
+            }
+
             if let ideaText = companionManager.recentIdeaCaptureText, buddyIsVisibleOnThisScreen {
                 IdeaCapturedToast(transcript: ideaText)
                     .position(x: cursorPosition.x, y: cursorPosition.y + 42)
@@ -1581,6 +1597,39 @@ private struct BlueCursorWaveformView: View {
 }
 
 // MARK: - Idea Captured Toast
+
+/// v15p3v (2026-05-09): live VTT preview overlay. Shows AssemblyAI's
+/// streaming partial transcript above the cursor while a VTT session
+/// is active. Lets Steph see his words landing as he speaks — gives
+/// confidence the mic + STT are working, lets him catch a mishearing
+/// before he releases. Distinct from IdeaCapturedToast (yellow,
+/// post-capture) — this is purple (matches VTT), pre-finalize, only
+/// shows during active dictation. Empty transcript = view collapses.
+private struct LiveVTTPreviewView: View {
+    let transcript: String
+
+    var body: some View {
+        Text(transcript)
+            .font(.system(size: 13, weight: .regular, design: .default))
+            .foregroundColor(.white)
+            .lineLimit(4)
+            .truncationMode(.head)
+            .multilineTextAlignment(.leading)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .frame(maxWidth: 380, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.black.opacity(0.78))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .strokeBorder(DS.Colors.overlayCursorPurple.opacity(0.5), lineWidth: 1)
+            )
+            .shadow(color: DS.Colors.overlayCursorPurple.opacity(0.35), radius: 10, x: 0, y: 3)
+            .allowsHitTesting(false)
+    }
+}
 
 /// A small yellow pill that floats below the cursor for ~3 seconds
 /// after a capture-to-inbox append, echoing the transcript that

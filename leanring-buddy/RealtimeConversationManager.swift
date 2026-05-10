@@ -1647,6 +1647,16 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         return true
     }
 
+    // MARK: - Cowork bridge handoff — REMOVED 2026-05-10 (v15p3y)
+    //
+    // The send_to_cowork tool, sendToCoworkBridge helper, bridge attachment
+    // statics, and cowork-bridge-watcher scheduled task were tabled and removed.
+    // Polling latency floor was unacceptable; URL-scheme alternative pulls
+    // focus; clipboard handoff breaks conversation flow. Replaced by the design
+    // for a Marin local-helper sub-agent (Mac-side Sonnet 4.6 with file/web/bash
+    // tools) — see Roadmap "Brain-dump candidates added 2026-05-10". Bridge file
+    // format + the disabled watcher retained as scaffolding if revived.
+
     private func captureAndSendActiveScreenshot() {
         Task { @MainActor in
             do {
@@ -1719,6 +1729,9 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             let continuous = (args["continuous"] as? Bool) ?? false
             let result = toolSetListeningMode(continuous: continuous)
             sendFunctionCallResult(callId: callId, name: name, result: result)
+
+        // v15p3y (2026-05-10): send_to_cowork case removed — bridge tabled.
+        // See MARK: - Cowork bridge handoff comment above for context.
 
         // v15p3u (2026-05-09): web search via Anthropic's web_search tool.
         // Marin sends a query, Worker calls Anthropic with web_search enabled,

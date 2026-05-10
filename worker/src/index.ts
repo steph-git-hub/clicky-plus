@@ -551,6 +551,11 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
           required: ["query"],
         },
       },
+      // v15p3y (2026-05-10): send_to_cowork tool def removed. Bridge-based
+      // delegation tabled in favor of a future Marin local-helper sub-agent
+      // (see Roadmap "Brain-dump candidates added 2026-05-10"). Worker
+      // retains the bridge file format and cowork-bridge-watcher (disabled)
+      // as scaffolding if revived.
       // v15p3t (2026-05-09): on-demand fresh screenshot. Closes the
       // "Marin is stale" gap — she can request a fresh visual whenever
       // she suspects the per-turn screenshot doesn't match current state.

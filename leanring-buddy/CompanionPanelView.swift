@@ -641,7 +641,16 @@ struct CompanionPanelView: View {
     private func modelOptionButton(label: String, modelID: String) -> some View {
         let isSelected = companionManager.selectedModel == modelID
         return Button(action: {
-            companionManager.setSelectedModel(modelID)
+            // v15p3x (2026-05-10): defer one runloop tick. Same rationale
+            // as the indicator picker — the captured `companionManager`
+            // (a @MainActor class) is held as @StateObject upstream; if
+            // the panel re-hosts mid-click the old instance frees and
+            // the action crashes accessing it. Hopping a tick lets the
+            // gesture machinery unwind first.
+            let chosen = modelID
+            DispatchQueue.main.async {
+                companionManager.setSelectedModel(chosen)
+            }
         }) {
             Text(label)
                 .font(.system(size: 11, weight: .medium))
@@ -945,7 +954,17 @@ struct CompanionPanelView: View {
             VStack(alignment: .leading, spacing: 4) {
                 ForEach(Self.indicatorStyleOptions) { option in
                     Button {
-                        cursorIndicatorStyle = option.id
+                        // v15p3x (2026-05-10): defer the @AppStorage write
+                        // one runloop tick so the gesture fully completes
+                        // before the cascading re-render of OverlayWindow's
+                        // indicator views fires. Two crashes 2026-05-10
+                        // landed on this picker mid-click while the panel
+                        // was being re-hosted under update pressure from
+                        // the Ship 5 live VTT publisher.
+                        let chosen = option.id
+                        DispatchQueue.main.async {
+                            cursorIndicatorStyle = chosen
+                        }
                     } label: {
                         HStack(spacing: 8) {
                             ZStack {
