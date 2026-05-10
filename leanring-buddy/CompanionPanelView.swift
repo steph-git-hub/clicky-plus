@@ -937,6 +937,7 @@ struct CompanionPanelView: View {
     private static let indicatorStyleOptions: [IndicatorStyleOption] = [
         .init(id: "triangle", label: "Triangle", hint: "Classic — small blue triangle by cursor"),
         .init(id: "cursorDot", label: "Cursor dot", hint: "Tiny pulsing dot near cursor"),
+        .init(id: "cursorDotRing", label: "Cursor dot + ring", hint: "Small fixed dot with a sonar-style ring that expands with your voice"),
         .init(id: "bottomEdgeLine", label: "Bottom-edge line", hint: "Horizontal line at the bottom of the screen"),
         .init(id: "sideStrip", label: "Side strip", hint: "Vertical strip on right edge, pulses"),
     ]

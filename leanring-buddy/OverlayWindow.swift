@@ -340,6 +340,7 @@ struct BlueCursorView: View {
     /// handles all states with its own animation language.
     private var selfContainedStyleActive: Bool {
         cursorIndicatorStyle == "cursorDot"
+            || cursorIndicatorStyle == "cursorDotRing"
             || cursorIndicatorStyle == "bottomEdgeLine"
             || cursorIndicatorStyle == "sideStrip"
     }
@@ -615,6 +616,30 @@ struct BlueCursorView: View {
                 .animation(.easeOut(duration: 0.12), value: companionManager.isTypingModeActive)
                 .animation(.easeOut(duration: 0.12), value: companionManager.isBurstModeActive)
                 .animation(.easeOut(duration: 0.12), value: companionManager.isCaptureToInboxModeActive)
+
+            // v15p3z (2026-05-10): cursor dot + sonar ring variant.
+            // Same dot as `cursorDot` but the dot itself stays a fixed
+            // small size; an expanding faint ring around it (sonar-style)
+            // carries the audio-level feedback. Steph asked for an
+            // alternative because the standard dot's growth gets too big
+            // at peaks. Toggleable via the indicator picker — switching
+            // back to "Cursor dot" reverts.
+            CursorDotWithSonarRing(
+                tint: indicatorTint,
+                mode: dotModeForVoiceState,
+                audioPowerLevel: indicatorAudioPowerLevel
+            )
+                .opacity(
+                    cursorIndicatorStyle == "cursorDotRing" && buddyIsVisibleOnThisScreen
+                        ? cursorOpacity : 0
+                )
+                .position(
+                    x: cursorPosition.x - 17,
+                    y: cursorPosition.y - 7
+                )
+                .animation(.linear(duration: 0.04), value: cursorPosition)
+                .animation(.easeInOut(duration: 0.2), value: companionManager.voiceState)
+                .animation(.easeOut(duration: 0.12), value: companionManager.isVoiceToTextModeActive)
 
             // v15g: top-edge line — full-screen-width horizontal line.
             // Universal indicator across all voice states — color from
@@ -1262,6 +1287,96 @@ private struct CursorPresenceDot: View {
         case .listening:
             let level = Double(max(0, min(1, audioPowerLevel)))
             return 0.65 + level * 0.35
+        case .processing:
+            return 0.85
+        }
+    }
+}
+
+/// v15p3z (2026-05-10): cursor dot + sonar ring. Steph asked for an
+/// alternative to the dot-grows-with-volume pattern in CursorPresenceDot
+/// because at high audio levels the dot got too big near the cursor.
+/// This variant keeps the dot at a stable small size and uses an
+/// expanding concentric ring to carry the audio-level signal — like a
+/// sonar ping. The ring's radius and opacity both track the audio level:
+/// quiet → small bright ring close to dot; loud → large faint ring far
+/// from dot. Always returns to the dot when audio drops to zero.
+private struct CursorDotWithSonarRing: View {
+    // Reuse CursorPresenceDot's enum so callers can pass the same
+    // dotModeForVoiceState computed value to both indicator variants
+    // without conversion plumbing.
+    typealias DotMode = CursorPresenceDot.DotMode
+
+    var tint: Color = DS.Colors.overlayCursorBlue
+    var mode: DotMode = .idle
+    /// 0.0–1.0 audio level. Only used in .listening mode.
+    var audioPowerLevel: CGFloat = 0
+
+    private let dotDiameter: CGFloat = 7
+    private let ringMinDiameter: CGFloat = 11
+    private let ringMaxDiameter: CGFloat = 36
+
+    @State private var processingSpin: Double = 0
+
+    var body: some View {
+        ZStack {
+            // Spinning dashed ring during processing (matches CursorPresenceDot).
+            Circle()
+                .stroke(tint, style: StrokeStyle(lineWidth: 1.2, dash: [3, 2.5]))
+                .frame(width: 18, height: 18)
+                .opacity(mode == .processing ? 0.7 : 0)
+                .rotationEffect(.degrees(processingSpin))
+
+            // Sonar ring — expands and fades with audio level. Only visible
+            // when listening AND there's actual audio to react to.
+            Circle()
+                .stroke(tint, lineWidth: 1.4)
+                .frame(width: sonarDiameter, height: sonarDiameter)
+                .opacity(sonarOpacity)
+                .shadow(color: tint.opacity(0.4), radius: 2)
+
+            // Main dot — fixed small size, bright. Anchors the eye.
+            Circle()
+                .fill(tint)
+                .frame(width: dotDiameter, height: dotDiameter)
+                .opacity(dotOpacity)
+                .shadow(color: tint.opacity(0.6), radius: 2)
+        }
+        .allowsHitTesting(false)
+        .onAppear {
+            withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
+                processingSpin = 360
+            }
+        }
+        .animation(.spring(response: 0.18, dampingFraction: 0.65), value: sonarDiameter)
+        .animation(.easeInOut(duration: 0.2), value: mode)
+    }
+
+    private var sonarDiameter: CGFloat {
+        guard mode == .listening else { return ringMinDiameter }
+        let level = max(0, min(1, audioPowerLevel))
+        let eased = pow(level, 0.7)
+        return ringMinDiameter + (ringMaxDiameter - ringMinDiameter) * eased
+    }
+
+    private var sonarOpacity: Double {
+        guard mode == .listening else { return 0 }
+        let level = Double(max(0, min(1, audioPowerLevel)))
+        // As the ring expands outward it fades, like a real sonar ping.
+        // Min 0.15 so a quiet voice still shows something; max 0.55 so it
+        // doesn't compete with the dot for attention.
+        return 0.15 + (0.55 - 0.15) * (1 - level * 0.6)
+    }
+
+    private var dotOpacity: Double {
+        switch mode {
+        case .idle:
+            return 0.85
+        case .listening:
+            // Slight dot brighten with audio so there's a subtle secondary
+            // signal beyond the ring. Not the primary feedback.
+            let level = Double(max(0, min(1, audioPowerLevel)))
+            return 0.80 + level * 0.15
         case .processing:
             return 0.85
         }
