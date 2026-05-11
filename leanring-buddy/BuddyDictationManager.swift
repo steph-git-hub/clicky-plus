@@ -1198,14 +1198,25 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // buffered in `audioHandoff`, then flushed in order once the session
         // is live. Without this, the first ~100–400ms of audio (the handshake
         // window) is silently dropped, clipping the first word.
+        // v15p3aj (2026-05-10): only recreate the engine on mode transitions
+        // (Bluetooth ↔ built-in). Codex's original approach recreated the
+        // engine for EVERY Bluetooth capture, which fixed staleness but
+        // added ~500-1500ms of pre-record latency from AirPods HFP
+        // re-negotiation on every engage. Reusing the engine across
+        // consecutive same-mode engages keeps the cost paid once on
+        // transition. The proper teardown order (removeTap before
+        // engine.stop()) that Codex shipped should be enough to keep the
+        // VP'd engine healthy across multiple PTT cycles. If staleness
+        // resurfaces we'll add a "recreate every N sessions" guard.
         let shouldUseVoiceProcessing = Self.defaultInputDeviceUsesBluetoothTransport()
-        if shouldUseVoiceProcessing {
-            // Bluetooth headsets need the VoiceProcessingIO path to negotiate
-            // bidirectional HFP audio. Recreate the engine for each Bluetooth
-            // capture so the AU/HAL state does not go stale across PTT cycles.
-            replaceAudioEngine(reason: "fresh Bluetooth voice-processing capture", voiceProcessing: true)
-        } else if audioEngineUsesVoiceProcessing || audioEngine.inputNode.isVoiceProcessingEnabled {
-            replaceAudioEngine(reason: "leaving Bluetooth voice-processing mode", voiceProcessing: false)
+        let modeChanged = shouldUseVoiceProcessing != audioEngineUsesVoiceProcessing
+            || (shouldUseVoiceProcessing && !audioEngine.inputNode.isVoiceProcessingEnabled)
+            || (!shouldUseVoiceProcessing && audioEngine.inputNode.isVoiceProcessingEnabled)
+        if modeChanged {
+            let reason = shouldUseVoiceProcessing
+                ? "transitioning into Bluetooth voice-processing mode"
+                : "transitioning out of Bluetooth voice-processing mode"
+            replaceAudioEngine(reason: reason, voiceProcessing: shouldUseVoiceProcessing)
         }
 
         let inputNode = audioEngine.inputNode
