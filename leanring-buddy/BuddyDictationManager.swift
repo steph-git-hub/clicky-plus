@@ -738,7 +738,9 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private let transcriptionProvider: any BuddyTranscriptionProvider
-    private let audioEngine = AVAudioEngine()
+    private var audioEngine = AVAudioEngine()
+    private var audioEngineUsesVoiceProcessing = false
+    private var audioEngineConfigurationObserver: NSObjectProtocol?
     /// Serializes audio buffers from the tap thread so buffers captured during
     /// the transcription provider's websocket handshake (before the session is
     /// live) are replayed in order once the session opens. This eliminates
@@ -783,6 +785,91 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         self.transcriptionProvider = transcriptionProvider
         self.transcriptionProviderDisplayName = transcriptionProvider.displayName
         super.init()
+        observeAudioEngineConfigurationChanges(for: audioEngine)
+    }
+
+    deinit {
+        if let audioEngineConfigurationObserver {
+            NotificationCenter.default.removeObserver(audioEngineConfigurationObserver)
+        }
+    }
+
+    private func observeAudioEngineConfigurationChanges(for engine: AVAudioEngine) {
+        if let audioEngineConfigurationObserver {
+            NotificationCenter.default.removeObserver(audioEngineConfigurationObserver)
+        }
+        audioEngineConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleAudioEngineConfigurationChange()
+            }
+        }
+    }
+
+    private func replaceAudioEngine(reason: String, voiceProcessing: Bool = false) {
+        let oldEngine = audioEngine
+        oldEngine.inputNode.removeTap(onBus: 0)
+        if oldEngine.isRunning {
+            oldEngine.stop()
+        }
+        if let audioEngineConfigurationObserver {
+            NotificationCenter.default.removeObserver(audioEngineConfigurationObserver)
+            self.audioEngineConfigurationObserver = nil
+        }
+
+        audioEngine = AVAudioEngine()
+        audioEngineUsesVoiceProcessing = voiceProcessing
+        observeAudioEngineConfigurationChanges(for: audioEngine)
+        Self.appendAudioDiag("audioEngine: replaced (\(reason))")
+    }
+
+    private func handleAudioEngineConfigurationChange() {
+        Self.appendAudioDiag("audioEngine: configuration changed; will rebuild before next capture")
+        if !isActivelyRecordingAudio {
+            replaceAudioEngine(reason: "configuration change while idle", voiceProcessing: false)
+        }
+    }
+
+    private static func defaultInputDeviceUsesBluetoothTransport() -> Bool {
+        var deviceID = AudioDeviceID(0)
+        var deviceIDSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var deviceIDAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let deviceIDStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &deviceIDAddr,
+            0,
+            nil,
+            &deviceIDSize,
+            &deviceID
+        )
+        guard deviceIDStatus == noErr, deviceID != 0 else { return false }
+
+        var transport: UInt32 = 0
+        var transportSize = UInt32(MemoryLayout<UInt32>.size)
+        var transportAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let transportStatus = AudioObjectGetPropertyData(
+            deviceID,
+            &transportAddr,
+            0,
+            nil,
+            &transportSize,
+            &transport
+        )
+        guard transportStatus == noErr else { return false }
+
+        return transport == kAudioDeviceTransportTypeBluetooth
+            || transport == kAudioDeviceTransportTypeBluetoothLE
     }
 
     func updateContextualKeyterms(_ contextualKeyterms: [String]) {
@@ -882,10 +969,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // working baseline. Item 1's cleanup unification stays.
         // File-based diag at /tmp/clicky_audio_diag.log captures every cycle
         // for offline analysis when failure recurs.
+        audioEngine.inputNode.removeTap(onBus: 0)
         if audioEngine.isRunning {
             audioEngine.stop()
         }
-        audioEngine.inputNode.removeTap(onBus: 0)
 
         if cancelTranscription {
             activeTranscriptionSession?.cancel()
@@ -1111,25 +1198,30 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // buffered in `audioHandoff`, then flushed in order once the session
         // is live. Without this, the first ~100–400ms of audio (the handshake
         // window) is silently dropped, clipping the first word.
-        let inputNode = audioEngine.inputNode
+        let shouldUseVoiceProcessing = Self.defaultInputDeviceUsesBluetoothTransport()
+        if shouldUseVoiceProcessing {
+            // Bluetooth headsets need the VoiceProcessingIO path to negotiate
+            // bidirectional HFP audio. Recreate the engine for each Bluetooth
+            // capture so the AU/HAL state does not go stale across PTT cycles.
+            replaceAudioEngine(reason: "fresh Bluetooth voice-processing capture", voiceProcessing: true)
+        } else if audioEngineUsesVoiceProcessing || audioEngine.inputNode.isVoiceProcessingEnabled {
+            replaceAudioEngine(reason: "leaving Bluetooth voice-processing mode", voiceProcessing: false)
+        }
 
-        // v15p3ah (2026-05-10): FULL REVERT to no voice processing at all.
-        // VP was helping AirPods but introducing instability for built-in
-        // mic (latency, sticky state, AGC quirks). Keep AirPods support as
-        // a separate task — needs second-agent review of macOS audio
-        // patterns. clickyDeepCopyAsMono stays in the tap callback because
-        // it's a no-op for the mono format that built-in mic delivers.
-        if inputNode.isVoiceProcessingEnabled {
+        let inputNode = audioEngine.inputNode
+        if shouldUseVoiceProcessing && !inputNode.isVoiceProcessingEnabled {
             do {
-                try inputNode.setVoiceProcessingEnabled(false)
-                Self.appendAudioDiag("voiceProcessing: disabled (full revert)")
+                try inputNode.setVoiceProcessingEnabled(true)
+                audioEngineUsesVoiceProcessing = true
+                Self.appendAudioDiag("voiceProcessing: enabled for Bluetooth input")
             } catch {
-                Self.appendAudioDiag("voiceProcessing: disable threw \(error.localizedDescription)")
+                audioEngineUsesVoiceProcessing = false
+                Self.appendAudioDiag("voiceProcessing: enable threw \(error.localizedDescription)")
             }
         }
 
         let inputFormat = inputNode.outputFormat(forBus: 0)
-        Self.appendAudioDiag("input format: sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue) vpEnabled=\(inputNode.isVoiceProcessingEnabled)")
+        Self.appendAudioDiag("input format: sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue) vpEnabled=\(inputNode.isVoiceProcessingEnabled) bluetoothInput=\(shouldUseVoiceProcessing)")
 
         // Track first tap callback timing (Atomic-ish via instance var to
         // survive across async boundaries). Reset each session.
