@@ -1110,6 +1110,25 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // is live. Without this, the first ~100–400ms of audio (the handshake
         // window) is silently dropped, clipping the first word.
         let inputNode = audioEngine.inputNode
+
+        // v15p3ad (2026-05-10): REVERTED v15p3ac. Enabling voice processing
+        // on the input node flipped the format from 1-channel mono to
+        // 3-channel (1 input + 2 echo reference channels). The tap was
+        // built for mono so AssemblyAI received garbled multi-channel data
+        // and produced empty transcripts both with AND without AirPods.
+        // Defensively disable in case it got stuck on from a prior session.
+        // Real AirPods fix is task #51: detect Bluetooth input via Core
+        // Audio transport type, override system default input to built-in
+        // mic for the capture session.
+        if inputNode.isVoiceProcessingEnabled {
+            do {
+                try inputNode.setVoiceProcessingEnabled(false)
+                Self.appendAudioDiag("voiceProcessing: disabled (defensive)")
+            } catch {
+                Self.appendAudioDiag("voiceProcessing: disable threw \(error.localizedDescription)")
+            }
+        }
+
         let inputFormat = inputNode.outputFormat(forBus: 0)
 
         // Track first tap callback timing (Atomic-ish via instance var to
@@ -1137,9 +1156,20 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
 
         print("🎙️ T+\(elapsedMs())ms: tap installed; calling audioEngine.prepare()")
+        // v15p3ab (2026-05-10): log input device + format right before
+        // engine.start(). When AirPods are the input, start() can throw
+        // OSStatus errors that only appear in stdout — surface them in
+        // the diag log instead so we can debug without Xcode attached.
+        let inputFormatDiag = "sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue)"
+        Self.appendAudioDiag("engine.prepare: \(inputFormatDiag)")
         audioEngine.prepare()
         print("🎙️ T+\(elapsedMs())ms: prepare() returned; calling audioEngine.start()")
-        try audioEngine.start()
+        do {
+            try audioEngine.start()
+        } catch {
+            Self.appendAudioDiag("engine.start THREW: \(error) [nsError=\((error as NSError).domain) code=\((error as NSError).code) userInfo=\((error as NSError).userInfo)] \(inputFormatDiag)")
+            throw error
+        }
         print("🎙️ T+\(elapsedMs())ms: audioEngine.start() returned; opening transcription provider \(transcriptionProvider.displayName)")
 
         let session = try await transcriptionProvider.startStreamingSession(
