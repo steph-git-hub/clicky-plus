@@ -5216,38 +5216,22 @@ final class CompanionManager: ObservableObject {
         lastPasteAt: Date?,
         now: Date
     ) -> String {
-        if let first = transcript.first, first.isWhitespace {
-            return transcript
-        }
-
-        let needsSpaceAfter: Set<Character> = [
-            ".", "?", "!", ",", ";", ":", ")", "]", "}", "\"", "'", "”", "’"
-        ]
-
-        func needsSpace(_ c: Character) -> Bool {
-            return c.isLetter || c.isNumber || needsSpaceAfter.contains(c)
-        }
-
-        // 1. AX recentText is our best signal when present.
-        if let tail = axRecentText, let lastChar = tail.last {
-            if lastChar.isWhitespace || lastChar.isNewline {
-                return transcript
-            }
-            if needsSpace(lastChar) {
-                return " " + transcript
-            }
-            return transcript
-        }
-
-        // 2. v15p3ap (2026-05-11): AX is silent. Previously we fell back
-        // to a local memory of the last paste's ending character — but
-        // that memory persists across manual edits. If Steph types
-        // text + presses Enter to start a new paragraph, then VTTs, the
-        // local memory still says "last paste ended with a letter, add
-        // space" — and we paste a leading space at the start of the new
-        // paragraph. The cure was worse than the disease: rather than
-        // false-positive a leading space, do nothing when AX can't tell us.
-        // Steph can manually add a space if he genuinely needs one.
+        // v15p3as (2026-05-11): smart-space-prepend fully disabled. Even
+        // the AX-recentText path was producing false positives — when the
+        // cursor is on a fresh line below a paragraph, AX returns the
+        // previous paragraph's tail (often without a trailing newline),
+        // last char is a letter, and we add a leading space. There's no
+        // reliable signal for "cursor at start-of-paragraph vs mid-line"
+        // across all the apps Steph uses. The cost of the wrong space
+        // (annoying leading space on every new line) is worse than the
+        // cost of a missing space (he types one). User wins by always
+        // controlling spacing themselves.
+        //
+        // Args kept for API stability with callers; no longer used.
+        _ = axRecentText
+        _ = lastPasteEndedWith
+        _ = lastPasteAt
+        _ = now
         return transcript
     }
 

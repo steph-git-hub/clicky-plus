@@ -749,15 +749,33 @@ struct BlueCursorView: View {
                 && (companionManager.isVoiceToTextModeActive || companionManager.isPolishHotkeyModifierCaptureModeActive)
                 && buddyIsVisibleOnThisScreen {
                 // v15p3aa (2026-05-10): tint matches the active mode color
-                // (purple for VTT, cyan for Polish-modifier capture). Polish
-                // mode showed the pill but in VTT's purple — visual mismatch.
+                // (purple for VTT, cyan for Polish-modifier capture).
+                // v15p3aq (2026-05-11): pinned to the bottom-right of the
+                // active screen instead of following the cursor. Steph
+                // wanted to try a static position so it doesn't compete
+                // for visual space with where he's typing. The pill's
+                // .position modifier targets its CENTER, so we offset
+                // by half the max width (190) + a small margin.
+                // v15p3ar (2026-05-11): pill is now uncapped width/height, so
+                // .position (which anchors center) would let it grow off screen.
+                // Wrap in a full-screen frame with bottom-trailing alignment
+                // so the pill's bottom-right corner stays pinned ~20px from
+                // the screen's bottom-right and the content grows up/left.
                 LiveVTTPreviewView(
                     transcript: companionManager.vttLiveTranscript,
                     tint: companionManager.isPolishHotkeyModifierCaptureModeActive
                         ? DS.Colors.overlayCursorCyan
                         : DS.Colors.overlayCursorPurple
                 )
-                    .position(x: cursorPosition.x, y: max(40, cursorPosition.y - 60))
+                    .padding(.trailing, 20)
+                    .padding(.bottom, 20)
+                    .frame(
+                        maxWidth: .infinity,
+                        maxHeight: .infinity,
+                        alignment: .bottomTrailing
+                    )
+                    .frame(width: screenFrame.width, height: screenFrame.height)
+                    .position(x: screenFrame.width / 2, y: screenFrame.height / 2)
                     .transition(.asymmetric(
                         insertion: .opacity,
                         removal: .opacity
@@ -1734,16 +1752,17 @@ private struct LiveVTTPreviewView: View {
     let transcript: String
     var tint: Color = DS.Colors.overlayCursorPurple
 
+    // v15p3ar (2026-05-11): no width or line cap — full transcript visible
+    // so Steph can see all the context. Caller positions us anchored to
+    // the bottom-right; we grow left/up as content adds.
     var body: some View {
         Text(transcript)
             .font(.system(size: 13, weight: .regular, design: .default))
             .foregroundColor(.white)
-            .lineLimit(4)
-            .truncationMode(.head)
             .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .frame(maxWidth: 380, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(Color.black.opacity(0.78))
