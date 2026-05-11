@@ -103,6 +103,19 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     // 128K context, GA). Worker side migrated to /v1/realtime/client_secrets.
     private let openAIRealtimeURL = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime-2")!
 
+    // v15p3au (2026-05-11): pre-warmed ephemeral token cache. OpenAI's
+    // ephemeral keys have ~60s TTL, so we re-mint every 30s in the
+    // background. When Steph engages Marin, we use the cached token
+    // (saving the 200-800ms Worker call) instead of fetching fresh.
+    // If the cache is somehow expired or empty, getEphemeralToken()
+    // falls through to a synchronous fetch — never blocks engage on
+    // a stale cache.
+    private static let ephemeralTokenRefreshIntervalSeconds: TimeInterval = 30
+    private static let ephemeralTokenMaxAgeSeconds: TimeInterval = 45
+    private var cachedEphemeralToken: String?
+    private var cachedEphemeralTokenAt: Date?
+    private var ephemeralTokenWarmingTask: Task<Void, Never>?
+
     // MARK: - WebSocket + audio plumbing
 
     private let urlSession: URLSession = .shared
@@ -269,6 +282,9 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        // v15p3au (2026-05-11): start the ephemeral-token warming loop
+        // so Marin's first engage skips the ~200-800ms Worker call.
+        startEphemeralTokenWarming()
         // v15p3q (2026-05-08): subscribe to AVAudioEngineConfigurationChange
         // so plugging/unplugging headphones mid-conversation doesn't kill
         // mic capture. macOS reroutes default audio devices on plug/unplug
@@ -405,7 +421,7 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
             do {
                 try self.startAudioCapture()
                 if aborted() { return }
-                let token = try await self.fetchEphemeralToken()
+                let token = try await self.getEphemeralToken()
                 if aborted() {
                     Self.appendDiag("startSession aborted after token mint — generation changed")
                     return
@@ -586,7 +602,7 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                 do {
                     try self.startAudioCapture()
                     if aborted() { return }
-                    let token = try await self.fetchEphemeralToken()
+                    let token = try await self.getEphemeralToken()
                     if aborted() { return }
                     try await self.openWebSocket(token: token)
                     if aborted() { self.teardown(); return }
@@ -813,6 +829,55 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     }
 
     // MARK: - Token mint
+
+    // v15p3au (2026-05-11): kick off background loop that re-mints the
+    // ephemeral token every 30s. Caller can fetch via getEphemeralToken()
+    // and skip the network round-trip when the cache is fresh.
+    private func startEphemeralTokenWarming() {
+        ephemeralTokenWarmingTask?.cancel()
+        ephemeralTokenWarmingTask = Task { [weak self] in
+            // Mint immediately so the first engage hits a warm cache.
+            await self?.refreshEphemeralTokenIfNeeded(force: true)
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.ephemeralTokenRefreshIntervalSeconds * 1_000_000_000))
+                if Task.isCancelled { return }
+                await self?.refreshEphemeralTokenIfNeeded(force: true)
+            }
+        }
+    }
+
+    private func refreshEphemeralTokenIfNeeded(force: Bool) async {
+        if !force, let at = cachedEphemeralTokenAt,
+           Date().timeIntervalSince(at) < Self.ephemeralTokenMaxAgeSeconds {
+            return
+        }
+        do {
+            let token = try await fetchEphemeralToken()
+            await MainActor.run {
+                self.cachedEphemeralToken = token
+                self.cachedEphemeralTokenAt = Date()
+            }
+        } catch {
+            // Quiet failure — next call to getEphemeralToken will fall
+            // through to a fresh fetch and surface the error there.
+        }
+    }
+
+    /// Cached-first ephemeral token getter. Returns the warm cached value
+    /// when it's still fresh; otherwise fetches a new one synchronously.
+    private func getEphemeralToken() async throws -> String {
+        if let cached = cachedEphemeralToken,
+           let at = cachedEphemeralTokenAt,
+           Date().timeIntervalSince(at) < Self.ephemeralTokenMaxAgeSeconds {
+            return cached
+        }
+        let token = try await fetchEphemeralToken()
+        await MainActor.run {
+            self.cachedEphemeralToken = token
+            self.cachedEphemeralTokenAt = Date()
+        }
+        return token
+    }
 
     private func fetchEphemeralToken() async throws -> String {
         var request = URLRequest(url: workerSessionURL)

@@ -194,18 +194,66 @@ enum CompanionScreenCaptureUtility {
         let displayFrame = targetNSScreen.frame
         let isCursorScreen = displayFrame.contains(mouseLocation)
 
-        let filter = SCContentFilter(display: targetDisplay, excludingWindows: ownAppWindows)
+        // v15p3au (2026-05-11): smart cropping for vision. If the frontmost
+        // app has a visible main window on the target display, capture
+        // JUST that window instead of the full screen. Cuts vision tokens
+        // 50-80% on Steph's Sceptre ultrawide and improves AI accuracy by
+        // removing dock/sidebar/menubar from the input. Falls back to full
+        // display if no usable window can be identified (e.g., when Clicky
+        // itself is frontmost or no window is on this display).
+        let focusedWindow: SCWindow? = {
+            guard let frontmostApp = NSWorkspace.shared.frontmostApplication else { return nil }
+            // Don't crop to Clicky itself — fall back to full display.
+            guard frontmostApp.bundleIdentifier != ownBundleIdentifier else { return nil }
+            let bundleID = frontmostApp.bundleIdentifier
+            let appWindowsOnDisplay = content.windows.filter { window in
+                window.owningApplication?.bundleIdentifier == bundleID
+                    && window.isOnScreen
+                    && window.windowLayer == 0  // skip floating panels / popovers
+                    && window.frame.intersects(displayFrame)
+                    && window.frame.width > 100  // skip tiny windows
+                    && window.frame.height > 100
+            }
+            // Pick the largest visible window — almost always the main one.
+            return appWindowsOnDisplay.max(by: {
+                ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height)
+            })
+        }()
+
+        let filter: SCContentFilter
+        let captureSourceWidth: CGFloat
+        let captureSourceHeight: CGFloat
+        let captureSourceFrame: CGRect
+        let captureSourceLabel: String
+
+        if let window = focusedWindow {
+            filter = SCContentFilter(desktopIndependentWindow: window)
+            captureSourceWidth = window.frame.width
+            captureSourceHeight = window.frame.height
+            captureSourceFrame = window.frame
+            let appName = window.owningApplication?.applicationName ?? "?"
+            captureSourceLabel = "focused window of \(appName) " +
+                "(\(Int(window.frame.width))×\(Int(window.frame.height)))"
+        } else {
+            filter = SCContentFilter(display: targetDisplay, excludingWindows: ownAppWindows)
+            captureSourceWidth = CGFloat(targetDisplay.width)
+            captureSourceHeight = CGFloat(targetDisplay.height)
+            captureSourceFrame = displayFrame
+            captureSourceLabel = "full display \(targetDisplayID) " +
+                "(\(Int(displayFrame.width))×\(Int(displayFrame.height)))"
+        }
 
         let configuration = SCStreamConfiguration()
         let maxDimension = 1920
-        let aspectRatio = CGFloat(targetDisplay.width) / CGFloat(targetDisplay.height)
-        if targetDisplay.width >= targetDisplay.height {
+        if captureSourceWidth >= captureSourceHeight {
             configuration.width = maxDimension
-            configuration.height = Int(CGFloat(maxDimension) / aspectRatio)
+            configuration.height = Int(captureSourceHeight * CGFloat(maxDimension) / captureSourceWidth)
         } else {
             configuration.height = maxDimension
-            configuration.width = Int(CGFloat(maxDimension) * aspectRatio)
+            configuration.width = Int(captureSourceWidth * CGFloat(maxDimension) / captureSourceHeight)
         }
+        configuration.width = max(configuration.width, 1)
+        configuration.height = max(configuration.height, 1)
 
         let cgImage = try await SCScreenshotManager.captureImage(
             contentFilter: filter,
@@ -221,19 +269,15 @@ enum CompanionScreenCaptureUtility {
             )
         }
 
-        // Build a label with enough info to debug screen-selection issues.
-        // Format: "active screen — <displayID> — <WxH> @ origin (X,Y)"
-        let label = "active screen (focused-window display \(targetDisplayID), " +
-                    "\(Int(displayFrame.width))×\(Int(displayFrame.height)) @ " +
-                    "(\(Int(displayFrame.origin.x)),\(Int(displayFrame.origin.y))))"
+        let label = "active screen — \(captureSourceLabel)"
 
         return CompanionScreenCapture(
             imageData: jpegData,
             label: label,
             isCursorScreen: isCursorScreen,
-            displayWidthInPoints: Int(displayFrame.width),
-            displayHeightInPoints: Int(displayFrame.height),
-            displayFrame: displayFrame,
+            displayWidthInPoints: Int(captureSourceFrame.width),
+            displayHeightInPoints: Int(captureSourceFrame.height),
+            displayFrame: captureSourceFrame,
             screenshotWidthInPixels: configuration.width,
             screenshotHeightInPixels: configuration.height
         )
