@@ -741,6 +741,18 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     private var audioEngine = AVAudioEngine()
     private var audioEngineUsesVoiceProcessing = false
     private var audioEngineConfigurationObserver: NSObjectProtocol?
+    // v15p3an (2026-05-10): bounded-warm-window state for Bluetooth VP
+    // engines, per Codex's recommended production policy. Reuse a warm
+    // engine for up to N consecutive engages within a time window;
+    // tear down + rebuild beyond either bound. Avoids paying the
+    // 1-1.5s HFP renegotiation tax on every engage during a burst of
+    // dictation, while still rebuilding often enough to dodge the
+    // stale-AU-state issue from earlier in this session.
+    private static let bluetoothWarmWindowSeconds: TimeInterval = 15
+    private static let bluetoothWarmMaxReuses: Int = 3
+    private var bluetoothEngineLastReleasedAt: Date?
+    private var bluetoothEngineReuseCount: Int = 0
+    private var bluetoothEngineWarmTimeoutWorkItem: DispatchWorkItem?
     /// Serializes audio buffers from the tap thread so buffers captured during
     /// the transcription provider's websocket handshake (before the session is
     /// live) are replayed in order once the session opens. This eliminates
@@ -823,6 +835,14 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         audioEngine = AVAudioEngine()
         audioEngineUsesVoiceProcessing = voiceProcessing
         observeAudioEngineConfigurationChanges(for: audioEngine)
+        // v15p3an (2026-05-10): any engine replacement invalidates the warm
+        // window state, since the new engine has not yet captured anything.
+        bluetoothEngineLastReleasedAt = nil
+        bluetoothEngineWarmTimeoutWorkItem?.cancel()
+        bluetoothEngineWarmTimeoutWorkItem = nil
+        // Note: bluetoothEngineReuseCount is reset by the caller in
+        // startRecognitionSession after replaceAudioEngine returns, so
+        // we don't touch it here (the caller knows the right value).
         Self.appendAudioDiag("audioEngine: replaced (\(reason))")
     }
 
@@ -977,6 +997,42 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         if cancelTranscription {
             activeTranscriptionSession?.cancel()
         }
+
+        // v15p3an (2026-05-10): if this was a Bluetooth VP capture, mark
+        // when it ended and schedule a tear-down for after the warm
+        // window. The next engage within the window will reuse the
+        // engine; if no engage arrives, the timer fires and rebuilds
+        // fresh on the engage that does eventually arrive.
+        if audioEngineUsesVoiceProcessing {
+            bluetoothEngineLastReleasedAt = Date()
+            scheduleBluetoothWarmTimeout()
+        }
+    }
+
+    // v15p3an (2026-05-10): schedule a tear-down for the warm Bluetooth VP
+    // engine after the configured warm window. If a new engage arrives
+    // before this fires, it cancels the work item and reuses the engine.
+    // If the timer fires, we mark the engine as "needs rebuild" by
+    // clearing the bluetoothEngineLastReleasedAt — the next engage will
+    // see no warm window and rebuild fresh. We don't actively tear down
+    // the engine here (no audio is flowing through a stopped engine
+    // anyway), we just invalidate its reuse eligibility. This avoids
+    // any race between this timer and a near-simultaneous engage.
+    private func scheduleBluetoothWarmTimeout() {
+        bluetoothEngineWarmTimeoutWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.bluetoothEngineLastReleasedAt = nil
+                self.bluetoothEngineReuseCount = 0
+                Self.appendAudioDiag("audioEngine: Bluetooth warm window expired — next engage will rebuild")
+            }
+        }
+        bluetoothEngineWarmTimeoutWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.bluetoothWarmWindowSeconds,
+            execute: workItem
+        )
     }
 
     /// File-based diagnostic logger for audio cleanup events. Bypasses OSLog
@@ -1199,13 +1255,58 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // is live. Without this, the first ~100–400ms of audio (the handshake
         // window) is silently dropped, clipping the first word.
         let shouldUseVoiceProcessing = Self.defaultInputDeviceUsesBluetoothTransport()
+
+        // v15p3an (2026-05-10): bounded warm window for Bluetooth VP. Per
+        // Codex's recommended production policy:
+        //   - First Bluetooth engage: fresh VP engine (slower, ~1-1.5s
+        //     for HFP renegotiation)
+        //   - Subsequent engage within 15s: REUSE the warm VP engine
+        //     (instant capture)
+        //   - After 3 warm reuses: rebuild on next engage anyway
+        //     (count-based guardrail against the stale-AU-state issue)
+        //   - 15s after last release with no new engage: tear down via
+        //     scheduled work item
+        // The reuse-vs-rebuild decision below replaces the previous
+        // "always fresh" behavior that worked but added 1-1.5s lag per
+        // engage during dictation bursts.
+        let now = Date()
+        let canReuseWarmBluetoothEngine: Bool = {
+            guard shouldUseVoiceProcessing else { return false }
+            guard audioEngineUsesVoiceProcessing else { return false }
+            guard audioEngine.inputNode.isVoiceProcessingEnabled else { return false }
+            guard let lastReleased = bluetoothEngineLastReleasedAt else { return false }
+            guard now.timeIntervalSince(lastReleased) < Self.bluetoothWarmWindowSeconds else { return false }
+            guard bluetoothEngineReuseCount < Self.bluetoothWarmMaxReuses else { return false }
+            return true
+        }()
+
         if shouldUseVoiceProcessing {
-            // Bluetooth headsets need the VoiceProcessingIO path to negotiate
-            // bidirectional HFP audio. Recreate the engine for each Bluetooth
-            // capture so the AU/HAL state does not go stale across PTT cycles.
-            replaceAudioEngine(reason: "fresh Bluetooth voice-processing capture", voiceProcessing: true)
+            if canReuseWarmBluetoothEngine {
+                bluetoothEngineReuseCount += 1
+                bluetoothEngineWarmTimeoutWorkItem?.cancel()
+                bluetoothEngineWarmTimeoutWorkItem = nil
+                Self.appendAudioDiag("audioEngine: reusing warm Bluetooth VP engine (reuse=\(bluetoothEngineReuseCount)/\(Self.bluetoothWarmMaxReuses))")
+            } else {
+                let reason: String
+                if audioEngineUsesVoiceProcessing {
+                    if bluetoothEngineReuseCount >= Self.bluetoothWarmMaxReuses {
+                        reason = "rebuilding Bluetooth VP engine after \(bluetoothEngineReuseCount) warm reuses"
+                    } else {
+                        reason = "rebuilding Bluetooth VP engine after warm-window timeout"
+                    }
+                } else {
+                    reason = "first Bluetooth voice-processing capture"
+                }
+                replaceAudioEngine(reason: reason, voiceProcessing: true)
+                bluetoothEngineReuseCount = 0
+            }
         } else if audioEngineUsesVoiceProcessing || audioEngine.inputNode.isVoiceProcessingEnabled {
+            // Switching from Bluetooth VP back to non-VP — fresh engine.
             replaceAudioEngine(reason: "leaving Bluetooth voice-processing mode", voiceProcessing: false)
+            bluetoothEngineReuseCount = 0
+            bluetoothEngineLastReleasedAt = nil
+            bluetoothEngineWarmTimeoutWorkItem?.cancel()
+            bluetoothEngineWarmTimeoutWorkItem = nil
         }
 
         let inputNode = audioEngine.inputNode
@@ -1213,7 +1314,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             do {
                 try inputNode.setVoiceProcessingEnabled(true)
                 audioEngineUsesVoiceProcessing = true
-                Self.appendAudioDiag("voiceProcessing: enabled for Bluetooth input")
+                // v15p3an (2026-05-10): per Codex — disable AGC explicitly
+                // on the VP input. AGC was a likely culprit for the very
+                // low / fluctuating input volume we saw in Voice Memos,
+                // and we want predictable input level for STT regardless.
+                inputNode.isVoiceProcessingAGCEnabled = false
+                Self.appendAudioDiag("voiceProcessing: enabled for Bluetooth input, AGC=\(inputNode.isVoiceProcessingAGCEnabled)")
             } catch {
                 audioEngineUsesVoiceProcessing = false
                 Self.appendAudioDiag("voiceProcessing: enable threw \(error.localizedDescription)")
