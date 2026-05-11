@@ -8,8 +8,10 @@
 //
 
 import AppKit
+import AudioToolbox
 import AVFoundation
 import Combine
+import CoreAudio
 import Foundation
 import Speech
 
@@ -1111,25 +1113,23 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // window) is silently dropped, clipping the first word.
         let inputNode = audioEngine.inputNode
 
-        // v15p3ad (2026-05-10): REVERTED v15p3ac. Enabling voice processing
-        // on the input node flipped the format from 1-channel mono to
-        // 3-channel (1 input + 2 echo reference channels). The tap was
-        // built for mono so AssemblyAI received garbled multi-channel data
-        // and produced empty transcripts both with AND without AirPods.
-        // Defensively disable in case it got stuck on from a prior session.
-        // Real AirPods fix is task #51: detect Bluetooth input via Core
-        // Audio transport type, override system default input to built-in
-        // mic for the capture session.
+        // v15p3ah (2026-05-10): FULL REVERT to no voice processing at all.
+        // VP was helping AirPods but introducing instability for built-in
+        // mic (latency, sticky state, AGC quirks). Keep AirPods support as
+        // a separate task — needs second-agent review of macOS audio
+        // patterns. clickyDeepCopyAsMono stays in the tap callback because
+        // it's a no-op for the mono format that built-in mic delivers.
         if inputNode.isVoiceProcessingEnabled {
             do {
                 try inputNode.setVoiceProcessingEnabled(false)
-                Self.appendAudioDiag("voiceProcessing: disabled (defensive)")
+                Self.appendAudioDiag("voiceProcessing: disabled (full revert)")
             } catch {
                 Self.appendAudioDiag("voiceProcessing: disable threw \(error.localizedDescription)")
             }
         }
 
         let inputFormat = inputNode.outputFormat(forBus: 0)
+        Self.appendAudioDiag("input format: sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue) vpEnabled=\(inputNode.isVoiceProcessingEnabled)")
 
         // Track first tap callback timing (Atomic-ish via instance var to
         // survive across async boundaries). Reset each session.
@@ -1148,10 +1148,14 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             }
             self.tapBufferCount += 1
             self.updateAudioPowerLevel(from: buffer)
-            // AVAudioEngine may reuse the tap buffer's backing memory on the
-            // next callback, so we must deep-copy before queueing for async
-            // handoff. ~2 KB per copy @ 16 kHz/1024 frames ≈ 32 KB/sec churn.
-            guard let copy = buffer.clickyDeepCopy() else { return }
+            // v15p3ae (2026-05-10): voice processing AU emits multi-channel
+            // buffers (channel 0 = post-AEC mic, channels 1+ = echo
+            // reference). AssemblyAI expects mono, so collapse to channel 0
+            // before handoff. When voice processing isn't engaged the
+            // buffer is already mono and this is a no-op deep copy.
+            // AVAudioEngine may reuse the tap buffer's backing memory on
+            // the next callback, so we must own our own storage here.
+            guard let copy = buffer.clickyDeepCopyAsMono() else { return }
             self.audioHandoff.enqueue(copy)
         }
 
@@ -1676,6 +1680,56 @@ private extension AVAudioPCMBuffer {
             for channel in 0..<channelCount {
                 memcpy(dst[channel], src[channel], frames * MemoryLayout<Int32>.size)
             }
+        }
+        return copy
+    }
+
+    /// v15p3ae (2026-05-10): deep-copy as mono. When voice processing AU is
+    /// engaged on macOS the input bus emits multi-channel buffers (channel
+    /// 0 = post-AEC mic, additional channels = echo reference). AssemblyAI
+    /// expects mono PCM, so we extract just channel 0 into a fresh
+    /// single-channel buffer with the same sample rate. When the input is
+    /// already mono this is equivalent to clickyDeepCopy().
+    func clickyDeepCopyAsMono() -> AVAudioPCMBuffer? {
+        let frames = Int(frameLength)
+        guard frames > 0 else {
+            // Empty buffer — return an empty mono buffer of the same format.
+            let monoFormat = AVAudioFormat(
+                commonFormat: format.commonFormat,
+                sampleRate: format.sampleRate,
+                channels: 1,
+                interleaved: false
+            )
+            guard let mf = monoFormat else { return nil }
+            return AVAudioPCMBuffer(pcmFormat: mf, frameCapacity: frameCapacity)
+        }
+
+        // If already mono, just deep-copy. No need to construct a new format.
+        if format.channelCount == 1 {
+            return clickyDeepCopy()
+        }
+
+        guard let monoFormat = AVAudioFormat(
+            commonFormat: format.commonFormat,
+            sampleRate: format.sampleRate,
+            channels: 1,
+            interleaved: false
+        ) else {
+            return nil
+        }
+        guard let copy = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: frameCapacity) else {
+            return nil
+        }
+        copy.frameLength = AVAudioFrameCount(frames)
+
+        if let src = floatChannelData, let dst = copy.floatChannelData {
+            memcpy(dst[0], src[0], frames * MemoryLayout<Float>.size)
+        } else if let src = int16ChannelData, let dst = copy.int16ChannelData {
+            memcpy(dst[0], src[0], frames * MemoryLayout<Int16>.size)
+        } else if let src = int32ChannelData, let dst = copy.int32ChannelData {
+            memcpy(dst[0], src[0], frames * MemoryLayout<Int32>.size)
+        } else {
+            return nil
         }
         return copy
     }
