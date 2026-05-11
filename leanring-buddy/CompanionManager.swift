@@ -5216,22 +5216,48 @@ final class CompanionManager: ObservableObject {
         lastPasteAt: Date?,
         now: Date
     ) -> String {
-        // v15p3as (2026-05-11): smart-space-prepend fully disabled. Even
-        // the AX-recentText path was producing false positives — when the
-        // cursor is on a fresh line below a paragraph, AX returns the
-        // previous paragraph's tail (often without a trailing newline),
-        // last char is a letter, and we add a leading space. There's no
-        // reliable signal for "cursor at start-of-paragraph vs mid-line"
-        // across all the apps Steph uses. The cost of the wrong space
-        // (annoying leading space on every new line) is worse than the
-        // cost of a missing space (he types one). User wins by always
-        // controlling spacing themselves.
+        // v15p3at (2026-05-11): re-enable AX-only smart-space path. Steph
+        // prefers the AX-based behavior (with a known false-positive on
+        // new lines, where AX often returns the previous paragraph's text
+        // without a trailing newline) over no smart-space at all — because
+        // pasting "Hi there." then VTTing "How are you?" should produce
+        // "Hi there. How are you?" not "Hi there.How are you?".
         //
-        // Args kept for API stability with callers; no longer used.
-        _ = axRecentText
+        // Local-memory fallback (using lastPasteEndedWith / lastPasteAt)
+        // remains DISABLED — that was the worse offender (memory persisted
+        // across manual edits + new lines). AX-only is more conservative
+        // and less false-positive-prone.
+        //
+        // Future fix for the new-line case: query AX for cursor position
+        // explicitly, look at the character at position-1 to check for \n,
+        // rather than trusting tail-of-recentText.
         _ = lastPasteEndedWith
         _ = lastPasteAt
         _ = now
+
+        if let first = transcript.first, first.isWhitespace {
+            return transcript
+        }
+
+        let needsSpaceAfter: Set<Character> = [
+            ".", "?", "!", ",", ";", ":", ")", "]", "}", "\"", "'", "”", "’"
+        ]
+
+        func needsSpace(_ c: Character) -> Bool {
+            return c.isLetter || c.isNumber || needsSpaceAfter.contains(c)
+        }
+
+        if let tail = axRecentText, let lastChar = tail.last {
+            if lastChar.isWhitespace || lastChar.isNewline {
+                return transcript
+            }
+            if needsSpace(lastChar) {
+                return " " + transcript
+            }
+            return transcript
+        }
+
+        // AX silent — be conservative, do nothing.
         return transcript
     }
 

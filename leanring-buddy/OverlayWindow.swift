@@ -1752,9 +1752,9 @@ private struct LiveVTTPreviewView: View {
     let transcript: String
     var tint: Color = DS.Colors.overlayCursorPurple
 
-    // v15p3ar (2026-05-11): no width or line cap — full transcript visible
-    // so Steph can see all the context. Caller positions us anchored to
-    // the bottom-right; we grow left/up as content adds.
+    // v15p3at (2026-05-11): Steph wants width capped (back to 380) but no
+    // line cap — text wraps within the pill, height grows as content adds,
+    // anchored to bottom-right. Only vertical expansion.
     var body: some View {
         Text(transcript)
             .font(.system(size: 13, weight: .regular, design: .default))
@@ -1763,6 +1763,7 @@ private struct LiveVTTPreviewView: View {
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+            .frame(maxWidth: 380, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(Color.black.opacity(0.78))
