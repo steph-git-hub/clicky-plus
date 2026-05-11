@@ -2660,6 +2660,68 @@ async function handleRepunctuate(request: Request, env: Env): Promise<Response> 
     .join("")
     .trim();
 
+  // v15p3ap (2026-05-11): post-validation. Despite the strict system
+  // prompt above, Haiku still occasionally responds conversationally —
+  // most commonly "I'm ready to punctuate speech-to-text transcripts.
+  // Please provide the text..." or similar. When this happens it lands
+  // in Steph's text field instead of his actual transcript.
+  //
+  // Detection: response starts with "I" or "Please" AND contains any of
+  // a few hallmark conversational tokens. AND its words don't substantially
+  // overlap with the input. In that case fall back to the raw input — at
+  // least Steph gets HIS words instead of the model's apology.
+  const looksConversational = (() => {
+    const lower = punctuatedText.toLowerCase();
+    const hallmarks = [
+      "ready to punctuate",
+      "please provide",
+      "i'll punctuate",
+      "i'll add punctuation",
+      "i can punctuate",
+      "i'm not able",
+      "i cannot",
+      "share the text",
+      "share the transcript",
+      "send the text",
+      "send the transcript",
+    ];
+    if (!hallmarks.some((h) => lower.includes(h))) return false;
+    // Check word overlap with input. If the response shares few/no
+    // words with the input, it's almost certainly meta-text rather than
+    // a punctuated version of what Steph said.
+    const wordTokens = (s: string) =>
+      new Set(
+        s
+          .toLowerCase()
+          .split(/[^a-z0-9]+/)
+          .filter((w) => w.length > 2)
+      );
+    const inputWords = wordTokens(inputTextRaw);
+    const outputWords = wordTokens(punctuatedText);
+    if (inputWords.size === 0) return true;
+    let overlap = 0;
+    inputWords.forEach((w) => {
+      if (outputWords.has(w)) overlap += 1;
+    });
+    const overlapRatio = overlap / inputWords.size;
+    return overlapRatio < 0.4;
+  })();
+
+  if (looksConversational) {
+    console.error(
+      `[/repunctuate] guard tripped: response looks conversational ` +
+        `(input="${inputTextRaw.slice(0, 80)}", ` +
+        `output="${punctuatedText.slice(0, 80)}") — falling back to raw input`
+    );
+    return new Response(
+      JSON.stringify({
+        output: inputTextRaw,
+        guardTripped: "conversational_response",
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+
   return new Response(JSON.stringify({ output: punctuatedText }), {
     status: 200,
     headers: { "content-type": "application/json" },

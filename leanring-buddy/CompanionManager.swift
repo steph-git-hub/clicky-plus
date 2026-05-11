@@ -5239,14 +5239,15 @@ final class CompanionManager: ObservableObject {
             return transcript
         }
 
-        // 2. AX is silent — fall back to local memory.
-        if let lastChar = lastPasteEndedWith,
-           let pasteAt = lastPasteAt,
-           now.timeIntervalSince(pasteAt) < voiceToTextMemoryWindowSeconds,
-           needsSpace(lastChar) {
-            return " " + transcript
-        }
-
+        // 2. v15p3ap (2026-05-11): AX is silent. Previously we fell back
+        // to a local memory of the last paste's ending character — but
+        // that memory persists across manual edits. If Steph types
+        // text + presses Enter to start a new paragraph, then VTTs, the
+        // local memory still says "last paste ended with a letter, add
+        // space" — and we paste a leading space at the start of the new
+        // paragraph. The cure was worse than the disease: rather than
+        // false-positive a leading space, do nothing when AX can't tell us.
+        // Steph can manually add a space if he genuinely needs one.
         return transcript
     }
 
