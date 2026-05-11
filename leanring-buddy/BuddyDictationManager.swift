@@ -8,8 +8,10 @@
 //
 
 import AppKit
+import AudioToolbox
 import AVFoundation
 import Combine
+import CoreAudio
 import Foundation
 import Speech
 
@@ -736,7 +738,9 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private let transcriptionProvider: any BuddyTranscriptionProvider
-    private let audioEngine = AVAudioEngine()
+    private var audioEngine = AVAudioEngine()
+    private var audioEngineUsesVoiceProcessing = false
+    private var audioEngineConfigurationObserver: NSObjectProtocol?
     /// Serializes audio buffers from the tap thread so buffers captured during
     /// the transcription provider's websocket handshake (before the session is
     /// live) are replayed in order once the session opens. This eliminates
@@ -781,6 +785,91 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         self.transcriptionProvider = transcriptionProvider
         self.transcriptionProviderDisplayName = transcriptionProvider.displayName
         super.init()
+        observeAudioEngineConfigurationChanges(for: audioEngine)
+    }
+
+    deinit {
+        if let audioEngineConfigurationObserver {
+            NotificationCenter.default.removeObserver(audioEngineConfigurationObserver)
+        }
+    }
+
+    private func observeAudioEngineConfigurationChanges(for engine: AVAudioEngine) {
+        if let audioEngineConfigurationObserver {
+            NotificationCenter.default.removeObserver(audioEngineConfigurationObserver)
+        }
+        audioEngineConfigurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.handleAudioEngineConfigurationChange()
+            }
+        }
+    }
+
+    private func replaceAudioEngine(reason: String, voiceProcessing: Bool = false) {
+        let oldEngine = audioEngine
+        oldEngine.inputNode.removeTap(onBus: 0)
+        if oldEngine.isRunning {
+            oldEngine.stop()
+        }
+        if let audioEngineConfigurationObserver {
+            NotificationCenter.default.removeObserver(audioEngineConfigurationObserver)
+            self.audioEngineConfigurationObserver = nil
+        }
+
+        audioEngine = AVAudioEngine()
+        audioEngineUsesVoiceProcessing = voiceProcessing
+        observeAudioEngineConfigurationChanges(for: audioEngine)
+        Self.appendAudioDiag("audioEngine: replaced (\(reason))")
+    }
+
+    private func handleAudioEngineConfigurationChange() {
+        Self.appendAudioDiag("audioEngine: configuration changed; will rebuild before next capture")
+        if !isActivelyRecordingAudio {
+            replaceAudioEngine(reason: "configuration change while idle", voiceProcessing: false)
+        }
+    }
+
+    private static func defaultInputDeviceUsesBluetoothTransport() -> Bool {
+        var deviceID = AudioDeviceID(0)
+        var deviceIDSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var deviceIDAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let deviceIDStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &deviceIDAddr,
+            0,
+            nil,
+            &deviceIDSize,
+            &deviceID
+        )
+        guard deviceIDStatus == noErr, deviceID != 0 else { return false }
+
+        var transport: UInt32 = 0
+        var transportSize = UInt32(MemoryLayout<UInt32>.size)
+        var transportAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let transportStatus = AudioObjectGetPropertyData(
+            deviceID,
+            &transportAddr,
+            0,
+            nil,
+            &transportSize,
+            &transport
+        )
+        guard transportStatus == noErr else { return false }
+
+        return transport == kAudioDeviceTransportTypeBluetooth
+            || transport == kAudioDeviceTransportTypeBluetoothLE
     }
 
     func updateContextualKeyterms(_ contextualKeyterms: [String]) {
@@ -880,10 +969,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // working baseline. Item 1's cleanup unification stays.
         // File-based diag at /tmp/clicky_audio_diag.log captures every cycle
         // for offline analysis when failure recurs.
+        audioEngine.inputNode.removeTap(onBus: 0)
         if audioEngine.isRunning {
             audioEngine.stop()
         }
-        audioEngine.inputNode.removeTap(onBus: 0)
 
         if cancelTranscription {
             activeTranscriptionSession?.cancel()
@@ -1109,8 +1198,30 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // buffered in `audioHandoff`, then flushed in order once the session
         // is live. Without this, the first ~100–400ms of audio (the handshake
         // window) is silently dropped, clipping the first word.
+        let shouldUseVoiceProcessing = Self.defaultInputDeviceUsesBluetoothTransport()
+        if shouldUseVoiceProcessing {
+            // Bluetooth headsets need the VoiceProcessingIO path to negotiate
+            // bidirectional HFP audio. Recreate the engine for each Bluetooth
+            // capture so the AU/HAL state does not go stale across PTT cycles.
+            replaceAudioEngine(reason: "fresh Bluetooth voice-processing capture", voiceProcessing: true)
+        } else if audioEngineUsesVoiceProcessing || audioEngine.inputNode.isVoiceProcessingEnabled {
+            replaceAudioEngine(reason: "leaving Bluetooth voice-processing mode", voiceProcessing: false)
+        }
+
         let inputNode = audioEngine.inputNode
+        if shouldUseVoiceProcessing && !inputNode.isVoiceProcessingEnabled {
+            do {
+                try inputNode.setVoiceProcessingEnabled(true)
+                audioEngineUsesVoiceProcessing = true
+                Self.appendAudioDiag("voiceProcessing: enabled for Bluetooth input")
+            } catch {
+                audioEngineUsesVoiceProcessing = false
+                Self.appendAudioDiag("voiceProcessing: enable threw \(error.localizedDescription)")
+            }
+        }
+
         let inputFormat = inputNode.outputFormat(forBus: 0)
+        Self.appendAudioDiag("input format: sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue) vpEnabled=\(inputNode.isVoiceProcessingEnabled) bluetoothInput=\(shouldUseVoiceProcessing)")
 
         // Track first tap callback timing (Atomic-ish via instance var to
         // survive across async boundaries). Reset each session.
@@ -1129,17 +1240,32 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             }
             self.tapBufferCount += 1
             self.updateAudioPowerLevel(from: buffer)
-            // AVAudioEngine may reuse the tap buffer's backing memory on the
-            // next callback, so we must deep-copy before queueing for async
-            // handoff. ~2 KB per copy @ 16 kHz/1024 frames ≈ 32 KB/sec churn.
-            guard let copy = buffer.clickyDeepCopy() else { return }
+            // v15p3ae (2026-05-10): voice processing AU emits multi-channel
+            // buffers (channel 0 = post-AEC mic, channels 1+ = echo
+            // reference). AssemblyAI expects mono, so collapse to channel 0
+            // before handoff. When voice processing isn't engaged the
+            // buffer is already mono and this is a no-op deep copy.
+            // AVAudioEngine may reuse the tap buffer's backing memory on
+            // the next callback, so we must own our own storage here.
+            guard let copy = buffer.clickyDeepCopyAsMono() else { return }
             self.audioHandoff.enqueue(copy)
         }
 
         print("🎙️ T+\(elapsedMs())ms: tap installed; calling audioEngine.prepare()")
+        // v15p3ab (2026-05-10): log input device + format right before
+        // engine.start(). When AirPods are the input, start() can throw
+        // OSStatus errors that only appear in stdout — surface them in
+        // the diag log instead so we can debug without Xcode attached.
+        let inputFormatDiag = "sr=\(inputFormat.sampleRate) ch=\(inputFormat.channelCount) fmt=\(inputFormat.commonFormat.rawValue)"
+        Self.appendAudioDiag("engine.prepare: \(inputFormatDiag)")
         audioEngine.prepare()
         print("🎙️ T+\(elapsedMs())ms: prepare() returned; calling audioEngine.start()")
-        try audioEngine.start()
+        do {
+            try audioEngine.start()
+        } catch {
+            Self.appendAudioDiag("engine.start THREW: \(error) [nsError=\((error as NSError).domain) code=\((error as NSError).code) userInfo=\((error as NSError).userInfo)] \(inputFormatDiag)")
+            throw error
+        }
         print("🎙️ T+\(elapsedMs())ms: audioEngine.start() returned; opening transcription provider \(transcriptionProvider.displayName)")
 
         let session = try await transcriptionProvider.startStreamingSession(
@@ -1646,6 +1772,56 @@ private extension AVAudioPCMBuffer {
             for channel in 0..<channelCount {
                 memcpy(dst[channel], src[channel], frames * MemoryLayout<Int32>.size)
             }
+        }
+        return copy
+    }
+
+    /// v15p3ae (2026-05-10): deep-copy as mono. When voice processing AU is
+    /// engaged on macOS the input bus emits multi-channel buffers (channel
+    /// 0 = post-AEC mic, additional channels = echo reference). AssemblyAI
+    /// expects mono PCM, so we extract just channel 0 into a fresh
+    /// single-channel buffer with the same sample rate. When the input is
+    /// already mono this is equivalent to clickyDeepCopy().
+    func clickyDeepCopyAsMono() -> AVAudioPCMBuffer? {
+        let frames = Int(frameLength)
+        guard frames > 0 else {
+            // Empty buffer — return an empty mono buffer of the same format.
+            let monoFormat = AVAudioFormat(
+                commonFormat: format.commonFormat,
+                sampleRate: format.sampleRate,
+                channels: 1,
+                interleaved: false
+            )
+            guard let mf = monoFormat else { return nil }
+            return AVAudioPCMBuffer(pcmFormat: mf, frameCapacity: frameCapacity)
+        }
+
+        // If already mono, just deep-copy. No need to construct a new format.
+        if format.channelCount == 1 {
+            return clickyDeepCopy()
+        }
+
+        guard let monoFormat = AVAudioFormat(
+            commonFormat: format.commonFormat,
+            sampleRate: format.sampleRate,
+            channels: 1,
+            interleaved: false
+        ) else {
+            return nil
+        }
+        guard let copy = AVAudioPCMBuffer(pcmFormat: monoFormat, frameCapacity: frameCapacity) else {
+            return nil
+        }
+        copy.frameLength = AVAudioFrameCount(frames)
+
+        if let src = floatChannelData, let dst = copy.floatChannelData {
+            memcpy(dst[0], src[0], frames * MemoryLayout<Float>.size)
+        } else if let src = int16ChannelData, let dst = copy.int16ChannelData {
+            memcpy(dst[0], src[0], frames * MemoryLayout<Int16>.size)
+        } else if let src = int32ChannelData, let dst = copy.int32ChannelData {
+            memcpy(dst[0], src[0], frames * MemoryLayout<Int32>.size)
+        } else {
+            return nil
         }
         return copy
     }
