@@ -1204,9 +1204,30 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         case "error":
             let errorJSON = (json["error"] as? [String: Any]) ?? [:]
             let message = (errorJSON["message"] as? String) ?? text
-            Self.appendDiag("server error: \(message)")
-            Task { @MainActor in
-                self.state = .errored(message)
+            // v15p3bc (2026-05-11): not every server "error" is a real
+            // session failure. The most common one we see is OpenAI
+            // replying "Cancellation failed: no active response found"
+            // when our response.cancel races with response.done — totally
+            // benign, just means cancel arrived after the response had
+            // already completed. Previously we flipped state to .errored
+            // on every error, which has isActive=false → indicator went
+            // blue, Esc handler's state.isActive guard failed (no kill on
+            // next Esc), but the websocket stayed alive (Marin still
+            // heard the user) — confusing "she's still there but I can't
+            // exit" state.
+            //
+            // Filter known-benign errors. They get logged but don't
+            // touch state.
+            let lowerMessage = message.lowercased()
+            let isBenignCancelRace = lowerMessage.contains("cancellation failed")
+                || lowerMessage.contains("no active response")
+            if isBenignCancelRace {
+                Self.appendDiag("server benign-error (state preserved): \(message)")
+            } else {
+                Self.appendDiag("server error: \(message)")
+                Task { @MainActor in
+                    self.state = .errored(message)
+                }
             }
 
         default:
