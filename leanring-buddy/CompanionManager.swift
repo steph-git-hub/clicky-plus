@@ -2558,13 +2558,17 @@ final class CompanionManager: ObservableObject {
         // response start, only cleared after grace timer) so two Esc
         // hits in quick succession both saw isModelSpeaking=true and
         // only cancelled. Now the second press force-kills.
-        // v15p3ay (2026-05-11): double-tap window bumped 1.5s → 3s. Steph
-        // reported Esc twice didn't reliably exit. Common case: he Esc's
-        // to interrupt Marin (cancel only), Marin starts a new turn,
-        // Steph Esc's again >1.5s later — old window meant second press
-        // saw isModelSpeaking=true again and just cancelled instead of
-        // ending. 3s is more forgiving without being so wide that
-        // unrelated Esc presses get coalesced.
+        // v15p3az (2026-05-11): use realtimeSessionState == .responding
+        // as the "she's actively talking" signal instead of
+        // isModelCurrentlySpeaking() (which checked isModelSpeaking flag
+        // OR outputBuffersInFlight > 0). Both those flags can drop to
+        // false during the TTS tail-end or between sentences, so single
+        // Esc would mistakenly take the "end session" branch when Steph
+        // thought he was just cancelling mid-speech.
+        //
+        // Cleaner mental model:
+        //   - State == .responding → she's mid-turn → cancel only
+        //   - Anything else (.listening / .connecting / .idle) → end session
         let now = Date()
         let isDoubleTap = lastEscapeKeyForRealtime.map {
             now.timeIntervalSince($0) < 3.0
@@ -2573,7 +2577,7 @@ final class CompanionManager: ObservableObject {
         if let realtimeManager, realtimeManager.state.isActive {
             if isDoubleTap {
                 realtimeManager.endSession()
-            } else if realtimeManager.isModelCurrentlySpeaking() {
+            } else if realtimeManager.state == .responding {
                 realtimeManager.cancelCurrentResponse()
                 // Don't end session — user wants to keep talking.
             } else {
