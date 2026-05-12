@@ -194,13 +194,17 @@ enum CompanionScreenCaptureUtility {
         let displayFrame = targetNSScreen.frame
         let isCursorScreen = displayFrame.contains(mouseLocation)
 
-        // v15p3av (2026-05-11): cursor-based window detection. Steph's idea:
-        // mimic Cmd+Shift+4+Space — capture whichever window the cursor is
-        // hovering over. Much more intuitive than "frontmost app's window"
-        // (which fails when the focused app's window isn't on the cursor's
-        // screen, causing the full-display fallback we saw earlier).
-        // Falls back to full display only when no window contains the cursor
-        // (e.g., cursor is on the desktop).
+        // v15p3aw (2026-05-11): cursor-based window detection — picker fix.
+        // v15p3av tried .first(where:) trusting SC's content.windows to be
+        // z-ordered, but Steph reported it kept picking the focused window
+        // rather than the hovered one. Either SC isn't z-ordered the way we
+        // assumed, or the focused window bubbles to the front of the array.
+        //
+        // New picker: collect ALL candidates whose frame contains the cursor,
+        // pick the one with the SMALLEST area (smaller windows are typically
+        // more foreground / more specific — e.g., a chat window on top of a
+        // fullscreen browser). This matches the Cmd+Shift+4+Space behavior
+        // more reliably than trusting array order.
         let focusedWindow: SCWindow? = {
             // Convert NSEvent.mouseLocation (NS-space, bottom-left primary
             // screen origin) to CG-space (top-left primary screen origin)
@@ -211,17 +215,24 @@ enum CompanionScreenCaptureUtility {
                 y: primaryScreen.frame.maxY - mouseLocation.y
             )
 
-            // Topmost on-screen normal-layer window whose frame contains
-            // the cursor. SC returns content.windows in z-order (front to
-            // back), so the first match is the topmost.
-            return content.windows.first(where: { window in
+            let candidates = content.windows.filter { window in
                 window.owningApplication?.bundleIdentifier != ownBundleIdentifier
                     && window.isOnScreen
                     && window.windowLayer == 0
                     && window.frame.contains(cgMouse)
                     && window.frame.width > 100
                     && window.frame.height > 100
+            }
+            // Smallest by area = most likely foreground/specific window.
+            let picked = candidates.min(by: {
+                ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height)
             })
+            // Diag so Steph can verify what's being picked vs what's available.
+            print("🖼️  cursor-window pick: ns=(\(mouseLocation.x), \(mouseLocation.y)) " +
+                  "cg=(\(cgMouse.x), \(cgMouse.y)) candidates=\(candidates.count) " +
+                  "picked=\(picked?.owningApplication?.applicationName ?? "nil") " +
+                  "(\(Int(picked?.frame.width ?? 0))×\(Int(picked?.frame.height ?? 0)))")
+            return picked
         }()
 
         let filter: SCContentFilter
