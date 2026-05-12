@@ -2558,9 +2558,16 @@ final class CompanionManager: ObservableObject {
         // response start, only cleared after grace timer) so two Esc
         // hits in quick succession both saw isModelSpeaking=true and
         // only cancelled. Now the second press force-kills.
+        // v15p3ay (2026-05-11): double-tap window bumped 1.5s → 3s. Steph
+        // reported Esc twice didn't reliably exit. Common case: he Esc's
+        // to interrupt Marin (cancel only), Marin starts a new turn,
+        // Steph Esc's again >1.5s later — old window meant second press
+        // saw isModelSpeaking=true again and just cancelled instead of
+        // ending. 3s is more forgiving without being so wide that
+        // unrelated Esc presses get coalesced.
         let now = Date()
         let isDoubleTap = lastEscapeKeyForRealtime.map {
-            now.timeIntervalSince($0) < 1.5
+            now.timeIntervalSince($0) < 3.0
         } ?? false
         lastEscapeKeyForRealtime = now
         if let realtimeManager, realtimeManager.state.isActive {

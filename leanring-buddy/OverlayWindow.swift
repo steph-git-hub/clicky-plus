@@ -1293,12 +1293,16 @@ private struct CursorPresenceDot: View {
         case .idle:
             return idleDiameter
         case .listening:
-            // Audio-reactive scaling. Power level is clamped 0..1 and
-            // raised to 0.7 to give visual response at lower mic levels
-            // (linear scaling makes quiet speech look invisible).
+            // v15p3ay (2026-05-11): bumped listening MIN diameter from
+            // baseDiameter (6) to baseDiameter+4 (10) so the dot is
+            // clearly LARGER than idle (7) at silence — Steph reported
+            // listening looked "smaller and dimmer than idle, like she
+            // wasn't listening." It still scales up audio-reactively
+            // from there.
             let level = max(0, min(1, audioPowerLevel))
             let eased = pow(level, 0.7)
-            return baseDiameter + (listeningMaxDiameter - baseDiameter) * eased
+            let listeningMinDiameter: CGFloat = baseDiameter + 4
+            return listeningMinDiameter + (listeningMaxDiameter - listeningMinDiameter) * eased
         case .processing:
             return baseDiameter + 1
         }
@@ -1311,8 +1315,13 @@ private struct CursorPresenceDot: View {
             // reserved for actual feedback (listening, processing).
             return 0.85
         case .listening:
+            // v15p3ay (2026-05-11): bumped silent floor from 0.65 to 0.95
+            // so the listening color reads brightly even when nothing
+            // is being said. Previously listening at silence was DIMMER
+            // than idle (0.65 vs 0.85), so Marin "still listening" after
+            // Esc looked like she'd gone idle / blue.
             let level = Double(max(0, min(1, audioPowerLevel)))
-            return 0.65 + level * 0.35
+            return 0.95 + level * 0.05
         case .processing:
             return 0.85
         }
