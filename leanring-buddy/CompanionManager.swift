@@ -2943,8 +2943,18 @@ final class CompanionManager: ObservableObject {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in
                 guard let self else { return }
+                let priorActive = self.isRealtimeModeActive
                 self.isRealtimeModeActive = state.isActive
                 self.realtimeSessionState = state
+                // v15p3bb (2026-05-11): trace flips of isRealtimeModeActive
+                // so we can debug "magenta turned blue" reports — that bug
+                // can only happen if isRealtimeModeActive went false (or
+                // suspended-by-other-mode is interfering, fixed below).
+                if priorActive != state.isActive {
+                    RealtimeConversationManager.appendDiag(
+                        "isRealtimeModeActive flip: \(priorActive) → \(state.isActive) (state=\(state))"
+                    )
+                }
                 if !state.isActive {
                     self.scheduleTransientHideIfNeeded()
                 }

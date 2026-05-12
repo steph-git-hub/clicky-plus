@@ -350,16 +350,16 @@ struct BlueCursorView: View {
             || companionManager.isPolishHotkeyModifierCaptureModeActive {
             return DS.Colors.overlayCursorCyan
         }
-        // v15p2 (2026-05-02): Realtime mode → magenta. Checked first
-        // when Marin owns the audio device.
-        // v15p2 hotfix (2026-05-03): when Marin is suspended-by-
-        // other-mode (Steph holding VTT/Typing/Polish/Capture while
-        // hands-free is active), the OTHER mode's tint should win
-        // so Steph gets visual confirmation he's hitting the right
-        // hotkey. The fallthrough below picks up that mode's color;
-        // magenta resumes once the other-mode chord releases.
-        if companionManager.isRealtimeModeActive
-            && !companionManager.isRealtimeSuspendedByOtherMode {
+        // v15p3bb (2026-05-11): magenta whenever Marin is alive. Steph
+        // explicitly wants visual confirmation Marin is listening even
+        // when other modes are technically pressed — losing magenta
+        // because of the suspended-by-other-mode check left him with
+        // no way to tell whether Marin was still active. The other
+        // modes (Polish/cyan above, others below) only win on their
+        // own active flag — this just means Marin out-prioritizes
+        // them when she's alive, except Polish (which is mid-paste
+        // visual feedback and rare).
+        if companionManager.isRealtimeModeActive {
             return DS.Colors.overlayCursorMagenta
         }
         if companionManager.isCaptureToInboxModeActive {
