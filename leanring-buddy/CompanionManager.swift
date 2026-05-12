@@ -1329,12 +1329,19 @@ final class CompanionManager: ObservableObject {
     }
 
     private func bindShortcutTransitions() {
-        shortcutTransitionCancellable = globalPushToTalkShortcutMonitor
-            .shortcutTransitionPublisher
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] transition in
-                self?.handleShortcutTransition(transition)
-            }
+        // v15p3bf (2026-05-12): Base PTT (Fn+Opt hold) subscription DISABLED.
+        // Steph stopped using Base PTT after Marin shipped — 0 transcripts in
+        // last 8 days. Hotkey events still fire from the monitor (Fn+Opt
+        // chord still detected) but nothing acts on them → keystroke is a
+        // silent no-op in Clicky+. handleShortcutTransition remains in code
+        // as dead-but-harmless; cleanup in a later pass.
+        //
+        // shortcutTransitionCancellable = globalPushToTalkShortcutMonitor
+        //     .shortcutTransitionPublisher
+        //     .receive(on: DispatchQueue.main)
+        //     .sink { [weak self] transition in
+        //         self?.handleShortcutTransition(transition)
+        //     }
 
         burstTransitionCancellable = globalPushToTalkShortcutMonitor
             .burstTransitionPublisher
@@ -1373,14 +1380,16 @@ final class CompanionManager: ObservableObject {
             }
 
         // v15p2 (2026-05-02): hotkey swap — Fn+Shift+Opt now toggles
-        // Base voice-mode instead of Realtime hands-free. Realtime
-        // hands-free moved to double-tap Option (above).
-        realtimeHandsFreeToggleCancellable = globalPushToTalkShortcutMonitor
-            .realtimeHandsFreeToggleTransitionPublisher
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] transition in
-                self?.handleFnShiftOptForBaseVoiceMode(transition)
-            }
+        // v15p3bf (2026-05-12): Base voice-mode toggle (Fn+Shift+Opt tap)
+        // DISABLED. Steph confirmed unused — same reasoning as Base PTT
+        // above. Handler code retained as dead-but-harmless.
+        //
+        // realtimeHandsFreeToggleCancellable = globalPushToTalkShortcutMonitor
+        //     .realtimeHandsFreeToggleTransitionPublisher
+        //     .receive(on: DispatchQueue.main)
+        //     .sink { [weak self] transition in
+        //         self?.handleFnShiftOptForBaseVoiceMode(transition)
+        //     }
 
         polishHotkeyTransitionCancellable = globalPushToTalkShortcutMonitor
             .polishHotkeyTransitionPublisher
