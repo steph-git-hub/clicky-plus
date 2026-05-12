@@ -194,45 +194,62 @@ enum CompanionScreenCaptureUtility {
         let displayFrame = targetNSScreen.frame
         let isCursorScreen = displayFrame.contains(mouseLocation)
 
-        // v15p3aw (2026-05-11): cursor-based window detection — picker fix.
-        // v15p3av tried .first(where:) trusting SC's content.windows to be
-        // z-ordered, but Steph reported it kept picking the focused window
-        // rather than the hovered one. Either SC isn't z-ordered the way we
-        // assumed, or the focused window bubbles to the front of the array.
-        //
-        // New picker: collect ALL candidates whose frame contains the cursor,
-        // pick the one with the SMALLEST area (smaller windows are typically
-        // more foreground / more specific — e.g., a chat window on top of a
-        // fullscreen browser). This matches the Cmd+Shift+4+Space behavior
-        // more reliably than trusting array order.
+        // v15p3ax (2026-05-11): cursor-window detection using CGWindowList.
+        // SC's content.windows array order isn't reliable (smallest-area
+        // heuristic also failed in v15p3aw). CGWindowListCopyWindowInfo IS
+        // guaranteed front-to-back per Apple docs, so we use it for the
+        // hit-test and then match the resulting CGWindowID back to an
+        // SCWindow (since SCContentFilter requires SCWindow, not raw CG id).
         let focusedWindow: SCWindow? = {
-            // Convert NSEvent.mouseLocation (NS-space, bottom-left primary
-            // screen origin) to CG-space (top-left primary screen origin)
-            // so it's comparable to SCWindow.frame.
             guard let primaryScreen = NSScreen.screens.first else { return nil }
             let cgMouse = CGPoint(
                 x: mouseLocation.x,
                 y: primaryScreen.frame.maxY - mouseLocation.y
             )
 
-            let candidates = content.windows.filter { window in
-                window.owningApplication?.bundleIdentifier != ownBundleIdentifier
-                    && window.isOnScreen
-                    && window.windowLayer == 0
-                    && window.frame.contains(cgMouse)
-                    && window.frame.width > 100
-                    && window.frame.height > 100
+            // CGWindowList: front-to-back, on-screen only.
+            let cgWindows = CGWindowListCopyWindowInfo(
+                [.optionOnScreenOnly, .excludeDesktopElements],
+                kCGNullWindowID
+            ) as? [[String: Any]] ?? []
+
+            // Find first window in z-order containing the cursor that
+            // looks like a real app window.
+            let hitID: CGWindowID? = cgWindows.first(where: { info in
+                guard let layer = info[kCGWindowLayer as String] as? Int, layer == 0 else { return false }
+                guard let boundsDict = info[kCGWindowBounds as String] as? [String: Any] else { return false }
+                guard let cgRect = CGRect(dictionaryRepresentation: boundsDict as CFDictionary) else { return false }
+                guard cgRect.width > 100, cgRect.height > 100 else { return false }
+                guard cgRect.contains(cgMouse) else { return false }
+                // Skip Clicky's own windows.
+                if let ownerName = info[kCGWindowOwnerName as String] as? String,
+                   ownerName == "Clicky" {
+                    return false
+                }
+                if let pid = info[kCGWindowOwnerPID as String] as? pid_t,
+                   pid == ProcessInfo.processInfo.processIdentifier {
+                    return false
+                }
+                return true
+            }).flatMap { $0[kCGWindowNumber as String] as? CGWindowID }
+
+            // Diag (file log so Steph can read it later).
+            let diag = "cursor-window: ns=(\(Int(mouseLocation.x)),\(Int(mouseLocation.y))) " +
+                "cg=(\(Int(cgMouse.x)),\(Int(cgMouse.y))) " +
+                "cgWindowsTotal=\(cgWindows.count) hitID=\(hitID.map(String.init) ?? "nil")"
+
+            guard let id = hitID else {
+                BuddyDictationManager.appendAudioDiag("\(diag) → no hit")
+                return nil
             }
-            // Smallest by area = most likely foreground/specific window.
-            let picked = candidates.min(by: {
-                ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height)
-            })
-            // Diag so Steph can verify what's being picked vs what's available.
-            print("🖼️  cursor-window pick: ns=(\(mouseLocation.x), \(mouseLocation.y)) " +
-                  "cg=(\(cgMouse.x), \(cgMouse.y)) candidates=\(candidates.count) " +
-                  "picked=\(picked?.owningApplication?.applicationName ?? "nil") " +
-                  "(\(Int(picked?.frame.width ?? 0))×\(Int(picked?.frame.height ?? 0)))")
-            return picked
+
+            // Match the CGWindowID back to an SCWindow.
+            let matched = content.windows.first { $0.windowID == id }
+            BuddyDictationManager.appendAudioDiag(
+                "\(diag) → matched=\(matched?.owningApplication?.applicationName ?? "nil") " +
+                "(\(Int(matched?.frame.width ?? 0))×\(Int(matched?.frame.height ?? 0)))"
+            )
+            return matched
         }()
 
         let filter: SCContentFilter
