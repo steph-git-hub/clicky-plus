@@ -1763,7 +1763,7 @@ private struct LiveVTTPreviewView: View {
             .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .frame(maxWidth: 380, alignment: .leading)
+            .frame(maxWidth: 350, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
                     .fill(Color.black.opacity(0.78))

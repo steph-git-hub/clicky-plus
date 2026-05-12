@@ -194,29 +194,33 @@ enum CompanionScreenCaptureUtility {
         let displayFrame = targetNSScreen.frame
         let isCursorScreen = displayFrame.contains(mouseLocation)
 
-        // v15p3au (2026-05-11): smart cropping for vision. If the frontmost
-        // app has a visible main window on the target display, capture
-        // JUST that window instead of the full screen. Cuts vision tokens
-        // 50-80% on Steph's Sceptre ultrawide and improves AI accuracy by
-        // removing dock/sidebar/menubar from the input. Falls back to full
-        // display if no usable window can be identified (e.g., when Clicky
-        // itself is frontmost or no window is on this display).
+        // v15p3av (2026-05-11): cursor-based window detection. Steph's idea:
+        // mimic Cmd+Shift+4+Space — capture whichever window the cursor is
+        // hovering over. Much more intuitive than "frontmost app's window"
+        // (which fails when the focused app's window isn't on the cursor's
+        // screen, causing the full-display fallback we saw earlier).
+        // Falls back to full display only when no window contains the cursor
+        // (e.g., cursor is on the desktop).
         let focusedWindow: SCWindow? = {
-            guard let frontmostApp = NSWorkspace.shared.frontmostApplication else { return nil }
-            // Don't crop to Clicky itself — fall back to full display.
-            guard frontmostApp.bundleIdentifier != ownBundleIdentifier else { return nil }
-            let bundleID = frontmostApp.bundleIdentifier
-            let appWindowsOnDisplay = content.windows.filter { window in
-                window.owningApplication?.bundleIdentifier == bundleID
+            // Convert NSEvent.mouseLocation (NS-space, bottom-left primary
+            // screen origin) to CG-space (top-left primary screen origin)
+            // so it's comparable to SCWindow.frame.
+            guard let primaryScreen = NSScreen.screens.first else { return nil }
+            let cgMouse = CGPoint(
+                x: mouseLocation.x,
+                y: primaryScreen.frame.maxY - mouseLocation.y
+            )
+
+            // Topmost on-screen normal-layer window whose frame contains
+            // the cursor. SC returns content.windows in z-order (front to
+            // back), so the first match is the topmost.
+            return content.windows.first(where: { window in
+                window.owningApplication?.bundleIdentifier != ownBundleIdentifier
                     && window.isOnScreen
-                    && window.windowLayer == 0  // skip floating panels / popovers
-                    && window.frame.intersects(displayFrame)
-                    && window.frame.width > 100  // skip tiny windows
+                    && window.windowLayer == 0
+                    && window.frame.contains(cgMouse)
+                    && window.frame.width > 100
                     && window.frame.height > 100
-            }
-            // Pick the largest visible window — almost always the main one.
-            return appWindowsOnDisplay.max(by: {
-                ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height)
             })
         }()
 
