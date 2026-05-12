@@ -2558,17 +2558,17 @@ final class CompanionManager: ObservableObject {
         // response start, only cleared after grace timer) so two Esc
         // hits in quick succession both saw isModelSpeaking=true and
         // only cancelled. Now the second press force-kills.
-        // v15p3az (2026-05-11): use realtimeSessionState == .responding
-        // as the "she's actively talking" signal instead of
-        // isModelCurrentlySpeaking() (which checked isModelSpeaking flag
-        // OR outputBuffersInFlight > 0). Both those flags can drop to
-        // false during the TTS tail-end or between sentences, so single
-        // Esc would mistakenly take the "end session" branch when Steph
-        // thought he was just cancelling mid-speech.
-        //
-        // Cleaner mental model:
-        //   - State == .responding → she's mid-turn → cancel only
-        //   - Anything else (.listening / .connecting / .idle) → end session
+        // v15p3ba (2026-05-11): combine BOTH signals so Esc never closes
+        // Marin while she's audibly talking. The two signals capture
+        // different windows:
+        //   - state == .responding: model is in mid-turn (between user
+        //     stopping speaking and response.done event)
+        //   - isModelCurrentlySpeaking(): isModelSpeaking flag OR
+        //     outputBuffersInFlight > 0 — covers TTS audio that's still
+        //     draining AFTER response.done fires (state has already gone
+        //     back to .listening but Steph still hears her speaking)
+        // Either being true means "she's making sound" → cancel only.
+        // Both false → she's truly idle/listening → end session.
         let now = Date()
         let isDoubleTap = lastEscapeKeyForRealtime.map {
             now.timeIntervalSince($0) < 3.0
@@ -2577,7 +2577,8 @@ final class CompanionManager: ObservableObject {
         if let realtimeManager, realtimeManager.state.isActive {
             if isDoubleTap {
                 realtimeManager.endSession()
-            } else if realtimeManager.state == .responding {
+            } else if realtimeManager.state == .responding
+                || realtimeManager.isModelCurrentlySpeaking() {
                 realtimeManager.cancelCurrentResponse()
                 // Don't end session — user wants to keep talking.
             } else {
