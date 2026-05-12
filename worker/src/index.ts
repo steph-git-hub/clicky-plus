@@ -669,40 +669,13 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
       // Read-only access via OAuth refresh token stored in Worker
       // secrets. Marin can search and summarize, but never send,
       // archive, label, or modify anything.
-      {
-        type: "function",
-        name: "search_gmail",
-        description: "Search Steph's Gmail. Use when he asks about emails — 'did I get anything from X', 'any new emails from the team', 'what about the email from Lukas yesterday', 'any unread emails today'. Returns up to 10-15 matching threads with sender, subject, date, and snippet. Read-only — cannot send, archive, or modify. After getting results, if Steph wants the full content of a specific thread, call read_email_thread with that thread_id.",
-        parameters: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "Gmail search query, same syntax as the Gmail search bar. Examples: 'from:lukas newer_than:7d' (recent from Lukas), 'is:unread newer_than:1d' (unread since yesterday), 'subject:Q4 budget' (subject contains), 'has:attachment from:janelle' (with attachments from Janelle). Combine with AND/OR (uppercase). Quote phrases.",
-            },
-            max_results: {
-              type: "number",
-              description: "How many threads to return (1–15). Default 10.",
-            },
-          },
-          required: ["query"],
-        },
-      },
-      {
-        type: "function",
-        name: "read_email_thread",
-        description: "Read the full content of a specific Gmail thread by ID. Use after search_gmail when Steph wants details from a particular email. Returns each message in the thread with from/to/date/subject/body. Body is truncated at 4000 chars per message.",
-        parameters: {
-          type: "object",
-          properties: {
-            thread_id: {
-              type: "string",
-              description: "The thread_id returned by search_gmail.",
-            },
-          },
-          required: ["thread_id"],
-        },
-      },
+      // v15p3be (2026-05-12): search_gmail and read_email_thread removed.
+      // Per Steph: "we can get rid of the connectors." Email content is
+      // hard for voice to surface usefully — subjective importance,
+      // long lists, lumping rather than ranking. Calendar stays (good
+      // for voice — single answer). Steph uses Gmail / Slack directly
+      // for now; if a future Marin-side helper sub-agent ships, those
+      // connectors can re-enter via it.
       // ── Calendar (v15p2, 2026-05-02) ────────────────────────
       // Read-only access to Steph's primary Google Calendar via
       // its own refresh token (separate from Gmail). Marin can
@@ -740,106 +713,12 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
           required: [],
         },
       },
-      // ── Slack (v15p2, 2026-05-03) ───────────────────────────
-      // Read-only access to Steph's Kombo Ventures workspace via
-      // a User OAuth token. Marin can search messages and read
-      // threads; she cannot post.
-      {
-        type: "function",
-        name: "search_slack",
-        description: "Search messages across Steph's Slack workspace (all channels, DMs, group DMs he has access to). Use when he asks 'did Lukas message me about X', 'what was decided in the launch channel yesterday', 'find that Slack message about Q4 budget'. Returns up to 10–20 matching messages with sender, channel, timestamp, snippet, and permalink. Read-only — cannot post or edit. IMPORTANT LIMITATIONS: (1) This is SEARCH, not an unread-inbox API. There is NO way to filter by 'is:unread' — that operator silently returns 0 matches. If Steph asks 'any unread messages' or 'what did I miss', tell him you can search recent messages but can't directly see unread state, and ask if he wants you to search a specific person/channel/timeframe. (2) Date operators ONLY accept absolute dates (`after:2026-04-26`) or named relative (`after:yesterday`, `after:Monday`). DO NOT use duration shorthand like `7d`, `1w`, `last_week` — those silently return 0 matches. For 'last week' use `after:2026-04-26` (compute the actual date from current date). (3) `from:` REQUIRES the `@` prefix: `from:@Lukas` works, `from:Lukas` returns 0. Use the person's Slack display name with `@`. Capitalization matches the user's display name. After getting results, if Steph wants the full thread, call `read_slack_thread` with that message's channel_id and ts.",
-        parameters: {
-          type: "object",
-          properties: {
-            query: {
-              type: "string",
-              description: "Slack search query. Verified-working examples: 'from:@Lukas after:2026-04-26' (messages from Lukas in the last week), 'in:#launches after:yesterday' (today and yesterday in #launches), 'has:link from:@Janelle' (Janelle's messages with links), '\"Q4 budget\" after:2026-04-01' (phrase search since April 1). Operators: `from:@DisplayName`, `in:#channel`, `after:YYYY-MM-DD` or `after:yesterday`, `before:YYYY-MM-DD`, `has:link`, `has:pin`, `has:reaction`. Quote phrases with double quotes.",
-            },
-            max_results: {
-              type: "number",
-              description: "How many messages to return (1–20). Default 10.",
-            },
-          },
-          required: ["query"],
-        },
-      },
-      {
-        type: "function",
-        name: "list_unread_slack",
-        description: "Return Steph's HIGH-SIGNAL unread Slack messages — DMs, group DMs, and channels he's starred/favorited. Use when he asks 'any unread messages', 'what did I miss', 'check my Slack inbox', 'any new DMs', 'anything important I haven't seen'. Public channel firehose is EXCLUDED by default — Steph doesn't want every announcement, just the things he's deliberately opted into via star. Returns each conversation with unread messages (sender + text + timestamp). When summarizing verbally, lead with totals ('you have 4 unreads — 2 DMs, 1 group DM, 1 in a starred channel'), then highlight DMs first, then group DMs, then starred channels. To override the default and include public/private channels too, pass `types: 'im,mpim,public_channel,private_channel'`.",
-        parameters: {
-          type: "object",
-          properties: {
-            types: {
-              type: "string",
-              description: "Comma-separated conversation types to include from users.conversations. Allowed: 'im' (DMs), 'mpim' (group DMs), 'public_channel', 'private_channel'. Default: 'im,mpim'. Note: starred channels are added separately via include_favorites regardless of this filter.",
-            },
-            include_favorites: {
-              type: "boolean",
-              description: "Whether to include channels Steph has starred / favorited in Slack. Default true. Set false to skip starred channels and only use the `types` filter.",
-            },
-            max_channels: {
-              type: "number",
-              description: "Cap on probed conversations (1-20). Default 20. Worker has a hard cap at 20 to stay within Cloudflare's per-invocation subrequest budget.",
-            },
-            messages_per_channel: {
-              type: "number",
-              description: "Max unread messages per channel (1-20). Default 5.",
-            },
-          },
-          required: [],
-        },
-      },
-      {
-        type: "function",
-        name: "compose_slack_message",
-        description: "Compose and send a Slack message AS Steph (chat:write scope). HARD-BLOCK SAFETY: this tool will NEVER auto-send. The flow is two-call: (1) FIRST call WITHOUT `confirmed`, the tool returns a DRAFT response with the channel name and message. You MUST verbally read it back to Steph in the form 'I'd post to #channel: \"message\". Say send it to confirm.' Wait for explicit affirmative (\"yes\", \"send\", \"send it\", \"go ahead\", \"do it\"). (2) SECOND call WITH `confirmed: true` actually posts the message. If Steph asks to edit the draft, call again WITHOUT confirmed:true with the updated text — never carry confirmation across edits. If he says no / cancel / nevermind, do NOT call again with confirmed:true. Use this when Steph asks 'send a Slack message to X', 'reply to that DM with...', 'tell the team in #channel that...'. For posting in a thread, pass the parent message's ts as thread_ts.",
-        parameters: {
-          type: "object",
-          properties: {
-            channel_id: {
-              type: "string",
-              description: "The channel_id to post to (e.g. 'C04XYZ...' or 'D02ABC...'). Get this from search_slack or list_unread_slack results.",
-            },
-            message: {
-              type: "string",
-              description: "The message body to post. Plain text. Slack mrkdwn supported (asterisks for bold, backticks for code). Don't include @mentions of users by name unless Steph explicitly said to — Slack mentions need <@USERID> format which is fragile.",
-            },
-            thread_ts: {
-              type: "string",
-              description: "Optional. If posting as a reply in a thread, the parent message's ts (timestamp). Otherwise omit for a top-level message.",
-            },
-            confirmed: {
-              type: "boolean",
-              description: "MUST be omitted or false on first call. Only set to true AFTER Steph has verbally confirmed the read-back. The tool will NOT send unless this is true.",
-            },
-          },
-          required: ["channel_id", "message"],
-        },
-      },
-      {
-        type: "function",
-        name: "read_slack_thread",
-        description: "Read the full reply thread for a specific Slack message. Use after `search_slack` when Steph wants the surrounding conversation. Returns each reply with sender + timestamp + text.",
-        parameters: {
-          type: "object",
-          properties: {
-            channel_id: {
-              type: "string",
-              description: "The channel_id from a search_slack match (e.g. 'C04XYZ...').",
-            },
-            thread_ts: {
-              type: "string",
-              description: "The parent message timestamp (the `ts` field from a search_slack match).",
-            },
-            max_replies: {
-              type: "number",
-              description: "How many replies to fetch (1–50). Default 20.",
-            },
-          },
-          required: ["channel_id", "thread_ts"],
-        },
-      },
+      // v15p3be (2026-05-12): all Slack tools removed (search_slack,
+      // list_unread_slack, compose_slack_message, read_slack_thread).
+      // Same rationale as Gmail above — voice can't usefully summarize
+      // a slack inbox without losing what matters to Steph. He uses
+      // Slack directly. Tool definitions retained in git history if
+      // we ever want to bring them back.
       // ── Bridge (v15p2, 2026-05-03) ───────────────────────────
       // Persistent shared channel with Cowork Claude. The bridge
       // file lives at `Bridges/Claude-Marin Channel.md` in Steph's
