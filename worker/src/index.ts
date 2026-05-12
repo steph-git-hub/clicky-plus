@@ -451,7 +451,8 @@ async function handleRealtimeSession(request: Request, env: Env): Promise<Respon
   // existing parser keeps working.
   const sessionConfig: Record<string, unknown> = {
     type: "realtime",
-    model: overrides.model ?? "gpt-realtime-2",
+    // v15p3bd (2026-05-12): rolled back to gpt-realtime (preview).
+    model: overrides.model ?? "gpt-realtime",
     instructions: overrides.instructions ?? composedInstructions,
     audio: {
       input: {

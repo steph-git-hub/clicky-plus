@@ -99,9 +99,13 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     // MARK: - Configuration
 
     private let workerSessionURL = URL(string: "https://clicky-proxy.sapierso.workers.dev/realtime-session")!
-    // v15p3e (2026-05-08): upgraded to gpt-realtime-2 (GPT-5-class reasoning,
-    // 128K context, GA). Worker side migrated to /v1/realtime/client_secrets.
-    private let openAIRealtimeURL = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime-2")!
+    // v15p3bd (2026-05-12): rolled back to gpt-realtime (preview model)
+    // on the GA endpoint. Steph reported gpt-realtime-2 feels slower /
+    // less personable / less useful than v1 in real use, despite the
+    // 128K context + GPT-5-class reasoning. Trying preview model on GA
+    // endpoint first — if GA rejects it, we'll need to roll back the
+    // endpoint too.
+    private let openAIRealtimeURL = URL(string: "wss://api.openai.com/v1/realtime?model=gpt-realtime")!
 
     // v15p3au (2026-05-11): pre-warmed ephemeral token cache. OpenAI's
     // ephemeral keys have ~60s TTL, so we re-mint every 30s in the
