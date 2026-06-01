@@ -1338,7 +1338,24 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // buffered in `audioHandoff`, then flushed in order once the session
         // is live. Without this, the first ~100–400ms of audio (the handshake
         // window) is silently dropped, clipping the first word.
-        let shouldUseVoiceProcessing = Self.defaultInputDeviceUsesBluetoothTransport()
+        // v15p4ct (2026-06-01): DISABLE voice-processing on Bluetooth.
+        // Per-channel RMS diag proved the "3-channel" AirPods buffer was just
+        // the mono mic triplicated (ch0==ch1==ch2), so VP's AEC was buying us
+        // nothing on sealed in-ear AirPods — while CAUSING the problems:
+        //   • first-words feedback every trigger = VP AEC echo-reference
+        //     leaking during per-engage convergence
+        //   • silent first 2-3 captures + multi-try freeze = VP forcing a
+        //     harsh HFP renegotiation that wasn't warm yet
+        //   • the malformed 3ch/24kHz format itself
+        // We still DETECT Bluetooth (for diag + future warm-up), but no longer
+        // enable VP for it. Flip `useVoiceProcessingForBluetooth` back to true
+        // to restore the old behavior if echo on speaker output regresses.
+        let inputIsBluetooth = Self.defaultInputDeviceUsesBluetoothTransport()
+        let useVoiceProcessingForBluetooth = false
+        let shouldUseVoiceProcessing = inputIsBluetooth && useVoiceProcessingForBluetooth
+        if inputIsBluetooth && !useVoiceProcessingForBluetooth {
+            Self.appendAudioDiag("voiceProcessing: SKIPPED for Bluetooth input (v15p4ct VP-off)")
+        }
 
         // v15p3ao (2026-05-10): rebuild ONLY on:
         //   1. Mode change (Bluetooth ↔ built-in)
@@ -1417,6 +1434,14 @@ final class BuddyDictationManager: NSObject, ObservableObject {
                 // v15p3br (2026-05-13): mark T1 in the live-preview
                 // latency diag — measures press → first audio captured.
                 VTTLatencyDiag.markFirstAudioBuffer()
+                // v15p4cr (2026-06-01): AirPods diagnostic — log per-channel
+                // RMS on the first buffer. When VP emits a multi-channel
+                // buffer we currently take channel 0 (assumed post-AEC mic),
+                // but on AirPods (HFP) channel 0 came through near-silent
+                // (power≈0.002) → empty transcripts. This tells us which
+                // channel actually carries the voice so the fix targets the
+                // right one instead of guessing. One-shot per session.
+                Self.logPerChannelRMS(buffer)
             }
             self.tapBufferCount += 1
             self.updateAudioPowerLevel(from: buffer)
@@ -1717,6 +1742,30 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         }
 
         return orderedKeyterms
+    }
+
+    /// v15p4cr (2026-06-01): one-shot per-channel RMS dump. On AirPods the VP
+    /// AU has emitted malformed multi-channel buffers (e.g. 3ch/24kHz) where
+    /// channel 0 — the channel we hand off as "the mic" — is near-silent.
+    /// Logging each channel's RMS on the first buffer reveals which channel
+    /// actually carries the user's voice, so clickyDeepCopyAsMono() can be
+    /// pointed at the right one. Float buffers only; int paths are rare here.
+    private static func logPerChannelRMS(_ buffer: AVAudioPCMBuffer) {
+        let channels = Int(buffer.format.channelCount)
+        let frames = Int(buffer.frameLength)
+        guard frames > 0, let data = buffer.floatChannelData else {
+            appendAudioDiag("perChannelRMS: no float data (ch=\(channels) frames=\(frames) fmt=\(buffer.format.commonFormat.rawValue))")
+            return
+        }
+        var parts: [String] = []
+        for ch in 0..<channels {
+            let samples = data[ch]
+            var sumSq: Float = 0
+            for i in 0..<frames { sumSq += samples[i] * samples[i] }
+            let rms = sqrt(sumSq / Float(frames))
+            parts.append(String(format: "ch%d=%.5f", ch, rms))
+        }
+        appendAudioDiag("perChannelRMS: channels=\(channels) sr=\(buffer.format.sampleRate) [\(parts.joined(separator: " "))]")
     }
 
     private func updateAudioPowerLevel(from audioBuffer: AVAudioPCMBuffer) {
