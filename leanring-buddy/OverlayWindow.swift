@@ -1460,47 +1460,78 @@ private struct CursorDotWithSonarRing: View {
 
     @State private var processingSpin: Double = 0
 
+    // v15p4cq (2026-06-01): SINGLE-DRAW CANVAS. Prior approaches (v15p3bz
+    // ZStack+frame, v15p3dg compositingGroup, v15p3he overlay-on-dot) all
+    // chased STATIC concentricity — making the ring centered on the dot at
+    // rest. But Steph reports the off-center halo is INTERMITTENT, not
+    // constant, which rules out a fixed geometry/alignment error. The real
+    // cause is a two-layer animation RACE: the dot's .position animates on
+    // one curve while the ring's frame animates on another (.spring), so in
+    // the window where both interpolate at once — fast cursor move, an audio
+    // spike mid-move, or a scale-factor change on the Sceptre — SwiftUI
+    // resolves the overlay's center against momentarily mid-flight bounds and
+    // the ring drifts a pixel or two off the dot. Subpixel rounding at high
+    // pixel density makes it visible.
+    //
+    // Fix: draw the dot + sonar ring + processing ring in ONE Canvas pass,
+    // all from the SAME center point (rect.mid). There is no second view
+    // layer, no overlay alignment, and no independent per-layer animation to
+    // desync — the three shapes are mathematically incapable of being
+    // off-center from each other because they share one CGPoint. The fixed
+    // 40x40 canvas frame keeps `.position` placement stable; animation of the
+    // ring size/spin is driven by the values feeding the draw, not by
+    // animating separate child frames.
+    private let canvasSide: CGFloat = 40
+
     var body: some View {
-        // v15p3he (2026-05-18): re-anchor on the dot. Previous ZStack +
-        // fixed-frame + compositingGroup approach (v15p3bz/dg) was still
-        // producing off-center sonar rings — Steph reports persisted into
-        // 2026-05-18 in Marin mode. Root cause hypothesis: SwiftUI's ZStack
-        // center alignment + a 50x50 frame splits responsibility for
-        // centering between the ZStack and each child's intrinsic geometry.
-        // Subpixel rounding under .compositingGroup() at Sceptre's pixel
-        // density can leave the sonar ring's geometric center drifting up
-        // to a half-pixel from the dot's. New approach: the DOT is the
-        // layout root, and the sonar ring + processing ring are .overlay()
-        // children — overlay alignment defaults to .center on the base
-        // view's bounds, which IS the dot's bounds, so the rings are
-        // concentric with the dot by construction, not by frame lockdown.
-        Circle()
-            .fill(tint)
-            .frame(width: dotDiameter, height: dotDiameter)
-            .opacity(dotOpacity)
-            .shadow(color: tint.opacity(0.6), radius: 2)
-            .overlay(
-                // Sonar ring — expands and fades with audio level.
-                // v15p3hf (2026-05-18): shadow removed. Shadow filter
-                // rendering on a stroked circle can leave subpixel
-                // asymmetry against the dot center under SwiftUI's
-                // default compositing — most likely source of the
-                // "halo off-center" Steph reports. The ring itself
-                // is concentric with the dot via overlay alignment.
-                Circle()
-                    .stroke(tint, lineWidth: 1.4)
-                    .frame(width: sonarDiameter, height: sonarDiameter)
-                    .opacity(sonarOpacity)
+        Canvas { context, size in
+            let center = CGPoint(x: size.width / 2, y: size.height / 2)
+
+            // Sonar ring — listening only. Drawn first so the dot sits on top.
+            if sonarOpacity > 0 {
+                let r = sonarDiameter / 2
+                let ringRect = CGRect(
+                    x: center.x - r, y: center.y - r,
+                    width: sonarDiameter, height: sonarDiameter
+                )
+                context.stroke(
+                    Path(ellipseIn: ringRect),
+                    with: .color(tint.opacity(sonarOpacity)),
+                    lineWidth: 1.4
+                )
+            }
+
+            // Processing ring — dashed, spinning, concentric by construction.
+            if mode == .processing {
+                let pr: CGFloat = 9 // 18pt diameter
+                let procRect = CGRect(
+                    x: center.x - pr, y: center.y - pr,
+                    width: pr * 2, height: pr * 2
+                )
+                var procCtx = context
+                procCtx.translateBy(x: center.x, y: center.y)
+                procCtx.rotate(by: .degrees(processingSpin))
+                procCtx.translateBy(x: -center.x, y: -center.y)
+                procCtx.stroke(
+                    Path(ellipseIn: procRect),
+                    with: .color(tint.opacity(0.7)),
+                    style: StrokeStyle(lineWidth: 1.2, dash: [3, 2.5])
+                )
+            }
+
+            // Dot — always, same center.
+            let dr = dotDiameter / 2
+            let dotRect = CGRect(
+                x: center.x - dr, y: center.y - dr,
+                width: dotDiameter, height: dotDiameter
             )
-            .overlay(
-                // Processing ring — fixed 18x18, dashed, slowly spinning.
-                Circle()
-                    .stroke(tint, style: StrokeStyle(lineWidth: 1.2, dash: [3, 2.5]))
-                    .frame(width: 18, height: 18)
-                    .opacity(mode == .processing ? 0.7 : 0)
-                    .rotationEffect(.degrees(processingSpin))
+            context.fill(
+                Path(ellipseIn: dotRect),
+                with: .color(tint.opacity(dotOpacity))
             )
-            .allowsHitTesting(false)
+        }
+        .frame(width: canvasSide, height: canvasSide)
+        .allowsHitTesting(false)
         .onAppear {
             withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
                 processingSpin = 360
