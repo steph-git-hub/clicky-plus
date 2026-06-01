@@ -507,64 +507,15 @@ enum BuddyPushToTalkShortcut {
         return .none
     }
 
-    // MARK: - Realtime hands-free toggle (Fn + Shift + Opt)
+    // MARK: - [REMOVED] Realtime hands-free toggle (Fn + Shift + Opt)
     //
-    // v15p2 (2026-05-02): direct toggle hotkey for hands-free Realtime
-    // tutor mode. Single tap → flip hands-free state. When ON, next
-    // Fn+Opt session starts in continuous-listening mode (server VAD
-    // turn detection, no key needed between turns). When OFF, default
-    // PTT semantics. State persists across cold-starts.
-    //
-    // Chord: Fn+Shift+Opt — reuses the old burst-mode chord (burst
-    // was disabled in v13t). The burst detector still fires on this
-    // chord but its handler is a no-op behind isBurstModeEnabled, so
-    // the two coexist harmlessly.
-    //
-    // Mutually exclusive with every other ACTIVE hotkey:
-    //   - VTT (fn+ctrl)                → excluded by `.control` forbidden
-    //   - Capture-to-inbox (fn+shift)  → excluded by `.option` (capture's
-    //                                    forbidden flags include .option)
-    //   - Typing (cmd+fn)              → excluded by `.command` forbidden
-    //                                    on capture/realtime; typing
-    //                                    itself forbids .shift+.option
-    //   - Realtime (fn+opt)            → excluded by `.shift` (Realtime's
-    //                                    forbidden flags)
-
-    static let realtimeHandsFreeToggleModifierFlags: NSEvent.ModifierFlags = [.shift, .option, .function]
-
-    static func realtimeHandsFreeToggleTransition(
-        eventType: CGEventType,
-        modifierFlagsRawValue: UInt64,
-        wasPreviouslyPressed: Bool
-    ) -> ShortcutTransition {
-        guard eventType == .flagsChanged else { return .none }
-        let flags = NSEvent.ModifierFlags(rawValue: UInt(modifierFlagsRawValue))
-            .intersection(.deviceIndependentFlagsMask)
-        return realtimeHandsFreeToggleTransition(
-            modifierFlags: flags,
-            wasPreviouslyPressed: wasPreviouslyPressed
-        )
-    }
-
-    private static func realtimeHandsFreeToggleTransition(
-        modifierFlags: NSEvent.ModifierFlags,
-        wasPreviouslyPressed: Bool
-    ) -> ShortcutTransition {
-        let hasRequired = modifierFlags.isSuperset(of: realtimeHandsFreeToggleModifierFlags)
-        // Forbidden: anything OUTSIDE Fn+Shift+Opt. We require exactly
-        // those three modifiers (not more, not fewer).
-        let hasForbidden = modifierFlags.contains(.command)
-            || modifierFlags.contains(.control)
-        let isPressed = hasRequired && !hasForbidden
-
-        if isPressed && !wasPreviouslyPressed {
-            return .pressed
-        }
-        if !isPressed && wasPreviouslyPressed {
-            return .released
-        }
-        return .none
-    }
+    // v15p3fq (2026-05-17): REMOVED. Fn+Shift+Opt is now AssemblyAI
+    // VTT (hold-only) — driven by the existing burst-mode detector on
+    // the same chord. The hands-free Marin engage is fully covered by
+    // the double-tap Option gesture; the redundant single-tap toggle
+    // here was already disabled in v15p3bf and confirmed unused.
+    // Removing it cleanly frees the chord and prevents accidental
+    // double-fire with the AssemblyAI handler.
 
     // MARK: - Polish Hotkey (⌃Fn — Tap or Hold-and-Speak)
     //
@@ -738,6 +689,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     }
 
     private let transcriptionProvider: any BuddyTranscriptionProvider
+    // v15p3bu (2026-05-13): optional per-session provider override.
+    // Set via `startPushToTalkFromKeyboardShortcut(overrideTranscriptionProvider:)`,
+    // read by `startRecognitionSession`, cleared in `resetSessionState`.
+    // Used by the Deepgram A/B test hotkey — only this engage uses
+    // Deepgram, everything else continues to use `transcriptionProvider`.
+    private var activeTranscriptionProviderOverride: (any BuddyTranscriptionProvider)?
     private var audioEngine = AVAudioEngine()
     private var audioEngineUsesVoiceProcessing = false
     private var audioEngineConfigurationObserver: NSObjectProtocol?
@@ -916,8 +873,17 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     func startPushToTalkFromKeyboardShortcut(
         currentDraftText: String,
         updateDraftText: @escaping (String) -> Void,
-        submitDraftText: @escaping (String) -> Void
+        submitDraftText: @escaping (String) -> Void,
+        overrideTranscriptionProvider: (any BuddyTranscriptionProvider)? = nil
     ) async {
+        // v15p3bu (2026-05-13): optional per-session provider override.
+        // Used by the Deepgram A/B test hotkey to run a single VTT
+        // engage against Deepgram while everything else (Fn+Ctrl VTT,
+        // typing, polish, etc.) stays on the default AssemblyAI
+        // provider. Captured BEFORE startPushToTalk's async chain so
+        // it's visible to startRecognitionSession when the audio path
+        // is set up.
+        activeTranscriptionProviderOverride = overrideTranscriptionProvider
         await startPushToTalk(
             startSource: .keyboardShortcut,
             currentDraftText: currentDraftText,
@@ -953,6 +919,22 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         cleanupAudioCapture(cancelTranscription: true)
 
         resetSessionState()
+
+        // v15p3bk (2026-05-12): re-arm warm session after cancel too,
+        // so a quick re-engage after an aborted session gets the
+        // pre-warm benefit. Same fire-and-forget semantics as the
+        // finish path.
+        prewarmTranscriptionProvider()
+    }
+
+    /// v15p3bk (2026-05-12): kick off a background pre-warm of the
+    /// transcription provider so the next engage can skip the
+    /// websocket handshake. Idempotent — each call replaces any prior
+    /// warm session. Default no-op for providers that don't override
+    /// `prewarmSession` in their protocol conformance.
+    func prewarmTranscriptionProvider() {
+        let keyterms = buildTranscriptionKeyterms()
+        transcriptionProvider.prewarmSession(keyterms: keyterms)
     }
 
     /// v14 (2026-04-30): unified audio-capture cleanup. Was duplicated across
@@ -1215,6 +1197,36 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         isRecordingFromKeyboardShortcut = false
         isFinalizingTranscript = true
 
+        // v15p3gx (2026-05-18): VAD-gated trailing-audio grace. AVAudioEngine's
+        // tap doesn't flush partial buffers on removeTap, and the hardware
+        // capture pipeline has its own latency — so removing the tap at the
+        // instant of key release drops the last ~20-100ms of audio. Providers
+        // like Deepgram whose final-transcript pipeline then truncates the
+        // trailing word advertise a `trailingAudioGraceSeconds` > 0. We hold
+        // the tap open until either (a) audio power has been below the
+        // silence threshold for `tailSilenceConfirmationSeconds`, or (b) the
+        // provider's grace window expires. Users who paused naturally before
+        // releasing pay zero added latency.
+        let trailingGraceSeconds = activeTranscriptionSession?.trailingAudioGraceSeconds ?? 0
+        if trailingGraceSeconds > 0 {
+            waitForTailSilenceOrTimeout(maxDelaySeconds: trailingGraceSeconds) { [weak self] in
+                self?.finalizeAfterTrailingGrace()
+            }
+        } else {
+            finalizeAfterTrailingGrace()
+        }
+    }
+
+    /// v15p3gx (2026-05-18): runs once the trailing-audio grace has resolved
+    /// (silence detected or grace timeout). Tears down audio capture, sends
+    /// Finalize to the provider, and schedules the post-Finalize fallback.
+    /// Safe to call when grace is 0 — the wait helper just invokes it
+    /// immediately.
+    private func finalizeAfterTrailingGrace() {
+        // If cancel/destroy ran during the grace wait, isFinalizingTranscript
+        // is already false — bail.
+        guard isFinalizingTranscript else { return }
+
         let finalTranscriptFallbackDelaySeconds = activeTranscriptionSession?.finalTranscriptFallbackDelaySeconds
             ?? Self.defaultFinalTranscriptFallbackDelaySeconds
 
@@ -1241,6 +1253,68 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             deadline: .now() + finalTranscriptFallbackDelaySeconds,
             execute: fallbackWorkItem
         )
+    }
+
+    /// v15p3gx (2026-05-18): polls `currentAudioPowerLevel` after key release
+    /// and invokes `onResolved` when audio has been below the silence threshold
+    /// for `tailSilenceConfirmationSeconds`, or when `maxDelaySeconds` elapses
+    /// — whichever comes first. Silent-at-release means near-zero delay; the
+    /// timeout is the safety cap for fast releases mid-word.
+    ///
+    /// Runs on the main queue (this class is @MainActor and
+    /// currentAudioPowerLevel is updated on main). If the dictation session
+    /// is cancelled while waiting, the wait aborts without calling onResolved.
+    private func waitForTailSilenceOrTimeout(
+        maxDelaySeconds: TimeInterval,
+        onResolved: @escaping () -> Void
+    ) {
+        // Tunables. Power level is normalized 0-1 with a 0.72 smoothing
+        // factor; the existing Bluetooth health check uses 0.001 as the
+        // "any signal" floor. 0.05 is comfortably above ambient noise and
+        // mic self-noise but well below typical speech.
+        let silenceThreshold: CGFloat = 0.05
+        let tailSilenceConfirmationSeconds: TimeInterval = 0.08
+        let pollIntervalSeconds: TimeInterval = 0.02
+
+        let waitStartedAt = Date()
+        var silenceStreakStartedAt: Date? = nil
+
+        func tick() {
+            guard self.isFinalizingTranscript else {
+                // Cancelled while waiting — abort without finalizing.
+                print("🎙️ trailing-grace: aborted (session no longer finalizing)")
+                return
+            }
+
+            let elapsedSeconds = Date().timeIntervalSince(waitStartedAt)
+            let powerLevel = self.currentAudioPowerLevel
+            let isQuiet = powerLevel < silenceThreshold
+
+            if isQuiet {
+                if silenceStreakStartedAt == nil {
+                    silenceStreakStartedAt = Date()
+                } else if let streakStart = silenceStreakStartedAt,
+                          Date().timeIntervalSince(streakStart) >= tailSilenceConfirmationSeconds {
+                    print("🎙️ trailing-grace: silence confirmed at +\(Int(elapsedSeconds * 1000))ms (power=\(String(format: "%.3f", powerLevel)))")
+                    onResolved()
+                    return
+                }
+            } else {
+                silenceStreakStartedAt = nil
+            }
+
+            if elapsedSeconds >= maxDelaySeconds {
+                print("🎙️ trailing-grace: timeout at +\(Int(elapsedSeconds * 1000))ms (power=\(String(format: "%.3f", powerLevel)))")
+                onResolved()
+                return
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + pollIntervalSeconds) {
+                tick()
+            }
+        }
+
+        tick()
     }
 
     private func startRecognitionSession() async throws {
@@ -1340,6 +1414,9 @@ final class BuddyDictationManager: NSObject, ObservableObject {
                 self.firstTapBufferReceivedAt = Date()
                 let warmupMs = Int(Date().timeIntervalSince(phaseStartTime) * 1000)
                 print("🎙️ T+\(warmupMs)ms: FIRST tap buffer received (engine warm-up)")
+                // v15p3br (2026-05-13): mark T1 in the live-preview
+                // latency diag — measures press → first audio captured.
+                VTTLatencyDiag.markFirstAudioBuffer()
             }
             self.tapBufferCount += 1
             self.updateAudioPowerLevel(from: buffer)
@@ -1376,7 +1453,14 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         // and we're VP'd, the AU is silent and we'll rebuild on next engage.
         scheduleHealthCheckIfBluetooth()
 
-        let session = try await transcriptionProvider.startStreamingSession(
+        // v15p3bu (2026-05-13): consult per-session override before
+        // falling back to the default provider. The override is set
+        // by startPushToTalkFromKeyboardShortcut and cleared in
+        // resetSessionState below — meaning only the engage that
+        // requested the override uses the alternative provider.
+        let activeProvider: any BuddyTranscriptionProvider =
+            activeTranscriptionProviderOverride ?? transcriptionProvider
+        let session = try await activeProvider.startStreamingSession(
             keyterms: buildTranscriptionKeyterms(),
             onTranscriptUpdate: { [weak self] transcriptText in
                 Task { @MainActor in
@@ -1462,6 +1546,15 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
         resetSessionState()
 
+        // v15p3bk (2026-05-12): re-arm the AssemblyAI warm session for
+        // the next engage. Most users (especially Steph at ~120 VTT
+        // engages/day) re-engage within seconds of the prior session
+        // ending, so pre-opening here catches the next press with the
+        // websocket already through its "Begin" handshake. The
+        // operation is fire-and-forget — errors silently fall through
+        // to the existing cold-start path next time.
+        prewarmTranscriptionProvider()
+
         guard shouldSubmitFinalDraft else { return }
         guard !finalTranscriptText.isEmpty else {
             // v15p3 (2026-05-06): surface "no output" to the diagnostic log
@@ -1505,6 +1598,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         audioHandoff.reset()
         draftCallbacks = nil
         activeStartSource = nil
+        // v15p3bu (2026-05-13): clear the per-session provider
+        // override so the next engage falls back to the default
+        // provider unless a new override is explicitly requested.
+        activeTranscriptionProviderOverride = nil
         draftTextBeforeCurrentDictation = ""
         latestRecognizedText = ""
         // v15p3v (2026-05-09): clear the live-preview mirror so the

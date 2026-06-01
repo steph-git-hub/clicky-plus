@@ -170,6 +170,20 @@ final class MenuBarPanelManager: NSObject {
         menuBarPanel.isMovableByWindowBackground = false
         menuBarPanel.titleVisibility = .hidden
         menuBarPanel.titlebarAppearsTransparent = true
+        // v15p3i (2026-05-19): give the panel a stable, recognizable
+        // window title so Marin's screenshot pipeline can include it
+        // when otherwise filtering out Clicky-owned windows. The title
+        // is not visually rendered (titleVisibility = .hidden, borderless
+        // style), but it propagates to SCWindow.title which the capture
+        // utility uses as an explicit allowlist.
+        menuBarPanel.title = "Clicky Settings Panel"
+        // v15p4e (2026-05-22): mouse-moved events must be enabled for
+        // SwiftUI `.help()` tooltips (which call NSView.toolTip
+        // underneath) to fire on hover. Non-activating panels default
+        // this off; turning it on for the panel only — not the app —
+        // means tooltips work inside the panel without changing how
+        // the rest of Clicky behaves.
+        menuBarPanel.acceptsMouseMovedEvents = true
 
         menuBarPanel.contentView = hostingView
         panel = menuBarPanel

@@ -96,6 +96,69 @@ struct ClickyInteractionLog: Codable {
     /// "failed:<reason>" = errored or timed out; final output is the
     ///                     fallback (punctuated raw or unpunctuated raw).
     let polishStatus: String?
+
+    // v15p3gw (2026-05-18): shadow A/B fields. When a secondary
+    // transcription provider runs in parallel with the primary (e.g.
+    // AssemblyAI shadowing Deepgram during VTT), the parallel
+    // transcript + metadata are captured here so we can compare
+    // empirically. All optional so legacy log rows decode fine and
+    // non-VTT modes don't need to populate them.
+    /// Name of the shadow provider that ran in parallel. "assemblyai"
+    /// is the only value used today; future could be "openai", etc.
+    let shadowProvider: String?
+    /// Raw transcript from the shadow provider, pre-/repunctuate.
+    /// nil = shadow didn't run or failed to deliver before timeout.
+    let shadowRawTranscript: String?
+    /// Shadow transcript after running through the same /repunctuate
+    /// pass the primary path used. Lets us compare apples-to-apples
+    /// (both providers' final output, not raw-vs-finalized).
+    let shadowFinalOutput: String?
+    /// Latency from VTT key release to shadow's final transcript
+    /// being available. Useful for "is AssemblyAI faster or slower?"
+    let shadowTranscriptionLatencyMs: Int?
+    /// Short error string if shadow failed (token fetch, WS open,
+    /// mid-session error, timeout). nil = shadow succeeded or wasn't
+    /// configured.
+    let shadowError: String?
+
+    // v15p3gw (2026-05-18): convenience init defaulting the shadow
+    // fields to nil so the existing 8+ call sites that construct
+    // ClickyInteractionLog don't all need to thread nil arguments
+    // through. Only the VTT call site (which adds shadow data) uses
+    // the full memberwise init explicitly.
+    init(
+        id: String,
+        timestamp: Date,
+        mode: ClickyInteractionMode,
+        rawTranscript: String?,
+        finalOutput: String?,
+        claudeResponse: String?,
+        polishModifier: String?,
+        appName: String?,
+        screenshotPaths: [String],
+        polishStatus: String?,
+        shadowProvider: String? = nil,
+        shadowRawTranscript: String? = nil,
+        shadowFinalOutput: String? = nil,
+        shadowTranscriptionLatencyMs: Int? = nil,
+        shadowError: String? = nil
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.mode = mode
+        self.rawTranscript = rawTranscript
+        self.finalOutput = finalOutput
+        self.claudeResponse = claudeResponse
+        self.polishModifier = polishModifier
+        self.appName = appName
+        self.screenshotPaths = screenshotPaths
+        self.polishStatus = polishStatus
+        self.shadowProvider = shadowProvider
+        self.shadowRawTranscript = shadowRawTranscript
+        self.shadowFinalOutput = shadowFinalOutput
+        self.shadowTranscriptionLatencyMs = shadowTranscriptionLatencyMs
+        self.shadowError = shadowError
+    }
 }
 
 /// Singleton logger that writes interactions to disk + Obsidian.
@@ -365,6 +428,38 @@ final class CompanionManager: ObservableObject {
     private var onboardingMusicFadeTimer: Timer?
 
     let buddyDictationManager = BuddyDictationManager()
+    // v15p3bu (2026-05-13): Deepgram provider for the Fn+Opt A/B test
+    // hotkey. Same shape as the default AssemblyAI provider — used as
+    // a per-session override when handleVoiceToTextDeepgramTransition
+    // fires, otherwise dormant. No bandwidth/token cost when unused.
+    private let deepgramTranscriptionProvider = DeepgramStreamingTranscriptionProvider()
+    // v15p3hx (2026-05-19): unified VTT provider switching — AssemblyAI
+    // joins Deepgram on the same Fn+Ctrl hotkey, selectable from the
+    // panel. Old Fn+Shift+Opt AssemblyAI-hold path retired.
+    // v15p3hy (2026-05-19): Parakeet parked — OSS WhisperKit didn't
+    // ship Parakeet TDT.
+    // v15p4bm (2026-05-29): UNPARKED via FluidAudio Swift SDK.
+    // Parakeet TDT v2 (English-only, highest recall) runs fully local
+    // on the Apple Neural Engine. ~600MB model downloaded on first
+    // use, cached forever after. Zero API cost.
+    private let assemblyAITranscriptionProvider = AssemblyAIStreamingTranscriptionProvider()
+    private let parakeetTranscriptionProvider = ParakeetStreamingTranscriptionProvider()
+
+    /// User-selected VTT provider. Persisted to UserDefaults. Reads
+    /// the key on every call so panel toggles take effect immediately.
+    /// Default "deepgram" preserves prior behavior. Values: "deepgram"
+    /// / "assemblyai" / "parakeet".
+    @AppStorage("clicky.vtt.provider") private(set) var selectedVTTProvider: String = "deepgram"
+
+    /// Returns the provider instance matching the current selection.
+    /// Falls back to Deepgram if the stored value is unrecognized.
+    fileprivate var activeVTTProvider: any BuddyTranscriptionProvider {
+        switch selectedVTTProvider {
+        case "assemblyai": return assemblyAITranscriptionProvider
+        case "parakeet": return parakeetTranscriptionProvider
+        default: return deepgramTranscriptionProvider
+        }
+    }
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
     // Response text is now displayed inline on the cursor overlay via
@@ -423,6 +518,26 @@ final class CompanionManager: ObservableObject {
         let line = "[\(timestamp)] \(message)\n"
         guard let data = line.data(using: .utf8) else { return }
         let path = "/tmp/clicky_vtt_timing.log"
+        if FileManager.default.fileExists(atPath: path) {
+            if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
+                defer { try? handle.close() }
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            }
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
+
+    /// v15p4ck (2026-05-30): unified VTT output log — one line per paste
+    /// from EVERY provider (Parakeet/Deepgram/AssemblyAI), so engine A/B
+    /// runs are gradeable from a single file regardless of which engine
+    /// produced the text. Tail with: tail -f /tmp/clicky_vtt_output.log
+    static func appendVTTOutputDiag(provider: String, text: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] provider=\(provider)\n  OUT: \(text)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        let path = "/tmp/clicky_vtt_output.log"
         if FileManager.default.fileExists(atPath: path) {
             if let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
                 defer { try? handle.close() }
@@ -568,13 +683,48 @@ final class CompanionManager: ObservableObject {
     /// speaks again so a new response can begin immediately.
     private var currentResponseTask: Task<Void, Never>?
 
+    // v15p3fr (2026-05-17): Watch mode frame-capture timer.
+    // Fires every 0.5s while Fn+Opt is held — captures the primary
+    // display as JPEG and forwards to GeminiRealtimeConversationManager
+    // .sendVideoFrame. Reset on release.
+    private var videoWatchFrameTimer: Timer?
+    /// v15p3fr (2026-05-17): set to true at Watch-mode .pressed and
+    /// cleared at the END of the response delivery (callback runs).
+    /// Used to suppress duplicate engages if the user presses again
+    /// mid-response (Watch is single-turn).
+    /// v15p3fw (2026-05-17): @Published so OverlayWindow can observe
+    /// it and keep the red cursor tint through the post-release
+    /// response phase (otherwise magenta wins for 1-2s).
+    @Published private(set) var isVideoWatchResponseInFlight: Bool = false
+    /// v15p3fs (2026-05-17): safety net — if Gemini never returns
+    /// turnComplete after activity_end (WS hang, server error, malformed
+    /// setup), we'd otherwise be stuck with isVideoWatchResponseInFlight
+    /// true and the next press blocked. This task fires 15s after the
+    /// hotkey release and force-clears state.
+    private var videoWatchResponseTimeoutTask: Task<Void, Never>?
+    /// v15p3fy (2026-05-17): tap-vs-hold detection state.
+    /// Press timestamp lets .released compute elapsed-since-press and
+    /// classify the gesture as tap (<350ms) or hold (≥350ms). Toggle-
+    /// locked flag tracks whether a prior tap engaged the session;
+    /// while it's true, a subsequent press is the start of a disengage
+    /// gesture rather than a new engage.
+    private var videoWatchPressTimestamp: Date?
+    @Published private(set) var isVideoWatchToggleLocked: Bool = false
+    private static let videoWatchTapThresholdSeconds: TimeInterval = 0.35
+
     private var shortcutTransitionCancellable: AnyCancellable?
     private var burstTransitionCancellable: AnyCancellable?
     private var typingTransitionCancellable: AnyCancellable?
     private var voiceToTextTransitionCancellable: AnyCancellable?
     private var captureToInboxTransitionCancellable: AnyCancellable?
     private var realtimeTransitionCancellable: AnyCancellable?
-    private var realtimeHandsFreeToggleCancellable: AnyCancellable?
+    // v15p3fq (2026-05-17): realtimeHandsFreeToggleCancellable removed.
+    // The Fn+Shift+Opt single-tap hands-free Marin engage was already
+    // disabled in v15p3bf (Steph confirmed unused). The chord is now
+    // repurposed for AssemblyAI VTT hold-only (driven by the existing
+    // burstTransitionPublisher, which also fires on Fn+Shift+Opt).
+    // Double-tap Option remains the primary Marin hands-free engage —
+    // unchanged by this swap.
     private var polishHotkeyTransitionCancellable: AnyCancellable?
 
     /// v15p2 (2026-05-02): hands-free Realtime toggle state, persisted
@@ -596,11 +746,53 @@ final class CompanionManager: ObservableObject {
     private var realtimeManager: RealtimeConversationManager?
     private var realtimeManagerStateCancellable: AnyCancellable?
 
+    /// v15p3di (2026-05-16): parallel Gemini Live provider for Marin.
+    /// User-selectable via the "Marin provider" panel toggle. Lazily
+    /// created the first time a Realtime session opens AFTER the
+    /// toggle has been set to .gemini. Lifecycle mirrors the OpenAI
+    /// manager — same startSession/endSession surface, same state
+    /// enum, same Published property names so binding code can be
+    /// reused with minimal branching.
+    private var geminiRealtimeManager: GeminiRealtimeConversationManager?
+    private var geminiRealtimeManagerStateCancellable: AnyCancellable?
+    private var geminiRealtimeInputAudioLevelCancellable: AnyCancellable?
+
+    // v15p3gv (2026-05-18): listen-only-when-Marin-active monitor that
+    // captures mouse side button presses (any button >= 3) AND caps
+    // lock as "advance to the next step" cues during a guidance flow.
+    // Lets Steph progress through Marin's step-by-step instructions
+    // without having to say "done" or "next" every time. Owned for
+    // the lifetime of CompanionManager; gated by setMarinActive().
+    private var marinAdvanceInputMonitor: MouseSideButtonMonitor?
+    private var marinAdvanceInputCancellable: AnyCancellable?
+
+    /// Persisted picker value. "openai" or "gemini". Defaults to OpenAI
+    /// so existing users see no behavior change on upgrade.
+    @AppStorage("marin.provider") private(set) var marinProvider: String = "openai"
+    var marinUsingGemini: Bool { marinProvider == "gemini" }
+
     /// v15p2 (2026-05-03): Marin's input audio level mirrored into
     /// CompanionManager so indicators can be voice-reactive while
     /// she's listening. Replaces the pink-flat-line bug.
     @Published private(set) var realtimeInputAudioLevel: CGFloat = 0
     private var realtimeInputAudioLevelCancellable: AnyCancellable?
+    // v15p3fa (2026-05-17): mirror the output audio level into a
+    // @Published property so the OverlayWindow can detect whether
+    // Marin is currently audibly speaking (vs just generating).
+    // Used to hide the "spinner stuck on" visual during her playback —
+    // the dot pulses with her voice instead.
+    @Published private(set) var realtimeOutputAudioLevel: CGFloat = 0
+    private var realtimeOutputAudioLevelCancellable: AnyCancellable?
+    private var geminiOutputAudioLevelCancellable: AnyCancellable?
+
+    /// v15p3ff (2026-05-17): sticky "Marin started audibly speaking
+    /// this turn" flag, bound from the Gemini manager. OverlayWindow
+    /// uses this to hide the spinner during her speech without the
+    /// oscillation problem of comparing instantaneous output level
+    /// to a threshold (her audio fluctuates above/below every frame).
+    /// True from first audio chunk per turn until turn end.
+    @Published private(set) var realtimeMarinAudioStarted: Bool = false
+    private var geminiMarinAudioStartedCancellable: AnyCancellable?
 
     /// v15p2 (2026-05-03): Marin's session state, exposed so the
     /// indicator can pick `.listening` mode (audio-reactive halo)
@@ -647,6 +839,11 @@ final class CompanionManager: ObservableObject {
     private var controlDoubleTapCancellable: AnyCancellable?
     private var commandDoubleTapCancellable: AnyCancellable?
     private var optionDoubleTapCancellable: AnyCancellable?
+    /// v15p3gt (2026-05-18): double-tap Shift engages speed-read mode.
+    private var shiftDoubleTapCancellable: AnyCancellable?
+    /// Speed-read overlay manager. Lazily created on first use so the
+    /// NSPanel isn't allocated for users who never invoke speed-read.
+    private var speedReadOverlayManager: SpeedReadOverlayManager?
     private var controlSingleTapCancellable: AnyCancellable?
     private var commandSingleTapCancellable: AnyCancellable?
     private var optionSingleTapCancellable: AnyCancellable?
@@ -670,6 +867,16 @@ final class CompanionManager: ObservableObject {
     /// disengages and sends the captured frames + transcript to Claude.
     private var isVoiceModeToggleLocked: Bool = false
     private var nativeScreenshotSessionCancellable: AnyCancellable?
+    /// v15p4p (2026-05-23): subscriber for Cmd+Shift+2 screenshot-and-paste.
+    private var screenshotPasteCancellable: AnyCancellable?
+    /// v15p4t (2026-05-23): tracks whether Marin has an active helper
+    /// sub-agent running. Set true on `.marinHelperStateChanged` notification
+    /// (active=true) and false on (active=false). Used by NotchPanelManager
+    /// to flip the pill to "Researching" (blue) so Steph can visually
+    /// distinguish "Marin is thinking" from "Marin spun off a sub-agent
+    /// that's doing real multi-step work."
+    @Published private(set) var isHelperSubAgentActive: Bool = false
+    private var helperStateObserver: NSObjectProtocol?
     private var voiceStateCancellable: AnyCancellable?
     private var audioPowerCancellable: AnyCancellable?
     private var vttLiveTranscriptCancellable: AnyCancellable?
@@ -678,6 +885,10 @@ final class CompanionManager: ObservableObject {
     private var pendingBurstShortcutStartTask: Task<Void, Never>?
     private var pendingTypingShortcutStartTask: Task<Void, Never>?
     private var pendingVoiceToTextShortcutStartTask: Task<Void, Never>?
+    /// v15p3bu (2026-05-13): pending start task for the Deepgram A/B
+    /// test mode (Fn+Opt). Parallel to pendingVoiceToTextShortcutStartTask
+    /// so the two modes never interfere with each other's lifecycle.
+    private var pendingDeepgramVTTShortcutStartTask: Task<Void, Never>?
     /// Screenshot captured at VTT toggle engage time (v12). Used as vision
     /// input to polish for tone-matching the destination app, and saved to
     /// the transcript log for memory-scan visual context. Cleared on submit.
@@ -813,6 +1024,22 @@ final class CompanionManager: ObservableObject {
     /// no conversation history. Fully isolated from normal PTT,
     /// burst, and typing modes.
     @Published private(set) var isVoiceToTextModeActive: Bool = false
+    /// v15p3bu (2026-05-13): true while the Deepgram VTT chord is held.
+    /// Same paste-only semantics as the AssemblyAI VTT path but the
+    /// transcription provider is Deepgram Nova-3 instead.
+    /// v15p3fq (2026-05-17): chord is Fn+Ctrl (since v15p3bw); cursor
+    /// indicator color changed from red → purple as part of the Watch
+    /// mode rollout that took the red slot for Fn+Opt.
+    @Published private(set) var isVoiceToTextDeepgramModeActive: Bool = false
+    /// v15p3fq (2026-05-17): true while Fn+Opt is held in the new
+    /// Watch mode — screen-frame streaming sub-mode of Marin Gemini.
+    /// User holds, narrates what they want described; ScreenCaptureKit
+    /// frames pipe into Gemini Live's WS alongside audio at ~2 fps;
+    /// on release, Gemini returns a paragraph-level description
+    /// focused on whatever the user pointed at (or the most salient
+    /// content if no narration). Drives the red cursor indicator so
+    /// it's visually obvious this is the video mode, not a VTT mode.
+    @Published private(set) var isVideoWatchModeActive: Bool = false
     /// True while Fn+Opt is held. Capture-to-inbox is pure transcription
     /// that appends directly to the user's Obsidian Idea Inbox — no paste,
     /// no Claude, no TTS, no focused-field interaction. Fully isolated
@@ -821,7 +1048,57 @@ final class CompanionManager: ObservableObject {
     /// True while a Realtime conversation session is active (Fn+Opt held
     /// or warm session window). Drives the magenta cursor indicator.
     /// v15p2 (2026-05-02).
-    @Published private(set) var isRealtimeModeActive: Bool = false
+    /// v15p3he (2026-05-18): didSet propagates the flag to
+    /// MouseSideButtonMonitor's gate. Previously gate-flipping only
+    /// happened inside the bind*ManagerState closures, so the three
+    /// eager `isRealtimeModeActive = true` engagement sites (PTT press,
+    /// double-tap-Opt continuous, hands-free toggle) flipped the
+    /// magenta cursor but never opened the advance-input gate — middle
+    /// click + Left Cmd tap fired with `marinActive=false` every time.
+    @Published private(set) var isRealtimeModeActive: Bool = false {
+        didSet {
+            if oldValue != isRealtimeModeActive {
+                MouseSideButtonMonitor.setMarinActive(isRealtimeModeActive)
+            }
+        }
+    }
+
+    /// v15p3bx (2026-05-13): true whenever Clicky+ has any active
+    /// mode/state that Esc should cancel. Consulted by the
+    /// GlobalPushToTalkShortcutMonitor.shouldConsumeEscapeWhenPressed
+    /// closure to decide whether Esc should be eaten at the event tap
+    /// (preventing leak to foreground apps like Cowork) or passed
+    /// through (so unrelated Esc workflows keep working).
+    ///
+    /// Conditions covered: any Realtime/Marin state, any VTT mode
+    /// (AssemblyAI or Deepgram, hold or toggle), Typing mode, Capture-
+    /// to-inbox, any locked toggle, Polish modifier capture, and the
+    /// voiceState .responding/.processing windows that signal the
+    /// Claude/repunctuate/paste pipeline is mid-flight. If none of
+    /// these are true, Esc is none of Clicky's business.
+    var clickyHasActiveAction: Bool {
+        if isRealtimeModeActive { return true }
+        if isVoiceToTextModeActive { return true }
+        if isVoiceToTextDeepgramModeActive { return true }
+        // v15p3fq (2026-05-17): Watch mode (Fn+Opt) holds Clicky's
+        // attention — Esc should cancel it just like other active modes.
+        if isVideoWatchModeActive { return true }
+        if isTypingModeActive { return true }
+        if isCaptureToInboxModeActive { return true }
+        if isVoiceToTextToggleLocked { return true }
+        if isTypingToggleLocked { return true }
+        if isVoiceModeToggleLocked { return true }
+        if isPolishHotkeyHeld { return true }
+        if isPolishHotkeyModifierCaptureModeActive { return true }
+        switch voiceState {
+        case .responding, .processing, .listening:
+            return true
+        default:
+            break
+        }
+        return false
+    }
+
     /// Transcript of the most recent capture-to-inbox append. Drives the
     /// yellow confirmation toast in the overlay. Nil when no toast is
     /// showing; set to the last transcript at write time; cleared ~3s
@@ -884,10 +1161,21 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// v15p3de (2026-05-15): always returns true so onboarding never
+    /// auto-triggers. Steph asked to "get rid of the onboarding" —
+    /// rather than ripping out the entire flow (which we may want for
+    /// future external users), the getter short-circuits to "completed"
+    /// state. The video, music, and demo paths still exist and can be
+    /// replayed via "Watch Onboarding Again" in the panel footer.
+    /// The setter still writes to UserDefaults so any code that depends
+    /// on the persisted value (e.g., welcome-music gates) continues to
+    /// work, but no reader of the getter will see false anymore.
+    ///
+    /// Original docstring:
     /// Whether the user has completed onboarding at least once. Persisted
     /// to UserDefaults so the Start button only appears on first launch.
     var hasCompletedOnboarding: Bool {
-        get { UserDefaults.standard.bool(forKey: "hasCompletedOnboarding") }
+        get { true }  // v15p3de: always true — onboarding removed
         set { UserDefaults.standard.set(newValue, forKey: "hasCompletedOnboarding") }
     }
 
@@ -946,6 +1234,17 @@ final class CompanionManager: ObservableObject {
         // the first real VTT after launch (saves ~200-400ms). Fires on
         // a background task so it doesn't block app boot.
         Self.warmUpHaikuModelIfNeeded()
+
+        // v15p3bk (2026-05-12): pre-open an AssemblyAI streaming
+        // session so the first VTT/polish-modifier engage after
+        // launch skips the ~1-1.5s websocket handshake (the biggest
+        // single latency item from audit §8). Subsequent engages get
+        // re-warmed in BuddyDictationManager.finishCurrentDictationSessionIfNeeded.
+        // 1.5s delay so this doesn't compete with the TLS warm + Haiku
+        // warm above for network bandwidth during app boot.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.buddyDictationManager.prewarmTranscriptionProvider()
+        }
 
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions
@@ -1122,8 +1421,12 @@ final class CompanionManager: ObservableObject {
 
         if currentlyHasAccessibility {
             globalPushToTalkShortcutMonitor.start()
+            installMarinAdvanceInputMonitorIfNeeded()
         } else {
             globalPushToTalkShortcutMonitor.stop()
+            marinAdvanceInputMonitor?.stopMonitoring()
+            marinAdvanceInputMonitor = nil
+            marinAdvanceInputCancellable = nil
         }
 
         hasScreenRecordingPermission = WindowPositionManager.hasScreenRecordingPermission()
@@ -1252,6 +1555,17 @@ final class CompanionManager: ObservableObject {
                 guard let self else { return }
                 if self.vttLiveTranscript != transcript {
                     self.vttLiveTranscript = transcript
+                    // v15p3br (2026-05-13): mark T3 in the live-preview
+                    // latency diag — measures press → first user-visible
+                    // pixel update. NOTE: there's a .throttle(100ms)
+                    // upstream of this sink, which adds up to 100ms to
+                    // this measurement. That throttle exists to cap
+                    // SwiftUI re-render churn at 10Hz; relaxing it is
+                    // one of the levers we have if the latency data
+                    // shows this segment dominating.
+                    if !transcript.isEmpty {
+                        VTTLatencyDiag.markFirstUiUpdate(text: transcript)
+                    }
                 }
             }
     }
@@ -1330,25 +1644,31 @@ final class CompanionManager: ObservableObject {
 
     private func bindShortcutTransitions() {
         // v15p3bf (2026-05-12): Base PTT (Fn+Opt hold) subscription DISABLED.
-        // Steph stopped using Base PTT after Marin shipped — 0 transcripts in
-        // last 8 days. Hotkey events still fire from the monitor (Fn+Opt
-        // chord still detected) but nothing acts on them → keystroke is a
-        // silent no-op in Clicky+. handleShortcutTransition remains in code
-        // as dead-but-harmless; cleanup in a later pass.
-        //
-        // shortcutTransitionCancellable = globalPushToTalkShortcutMonitor
-        //     .shortcutTransitionPublisher
-        //     .receive(on: DispatchQueue.main)
-        //     .sink { [weak self] transition in
-        //         self?.handleShortcutTransition(transition)
-        //     }
-
-        burstTransitionCancellable = globalPushToTalkShortcutMonitor
-            .burstTransitionPublisher
+        // v15p3bu (2026-05-13): re-enabled, initially wired to Deepgram.
+        // v15p3bw (2026-05-13): wired to AssemblyAI VTT after the
+        // Deepgram-primary swap to Fn+Ctrl.
+        // v15p3fq (2026-05-17): Fn+Opt is now the new Watch mode —
+        // screen-frame streaming sub-mode of Marin Gemini for the
+        // "describe what I'm pointing at" workflow. AssemblyAI VTT
+        // moved down to Fn+Shift+Opt (see burstTransitionCancellable
+        // repurpose below). The publisher name (shortcutTransition…)
+        // is historical; it still fires on Fn+Opt — only the handler
+        // changes.
+        shortcutTransitionCancellable = globalPushToTalkShortcutMonitor
+            .shortcutTransitionPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] transition in
-                self?.handleBurstTransition(transition)
+                self?.handleVideoWatchTransition(transition)
             }
+
+        // v15p3hx (2026-05-19): Fn+Shift+Opt (burst chord) RETIRED.
+        // AssemblyAI VTT is now selectable from the panel's Modes tab
+        // alongside Deepgram and Parakeet — Fn+Ctrl is the single VTT
+        // hotkey, the active provider follows the picker. The chord
+        // itself is freed up for a future repurpose.
+        // burstTransitionCancellable left unbound — handleBurstTransition
+        // is gated on isBurstModeEnabled = false so it's a no-op even
+        // if some future code path resubscribes accidentally.
 
         typingTransitionCancellable = globalPushToTalkShortcutMonitor
             .typingTransitionPublisher
@@ -1357,11 +1677,14 @@ final class CompanionManager: ObservableObject {
                 self?.handleTypingTransition(transition)
             }
 
+        // v15p3bw (2026-05-13): voiceToTextTransitionPublisher (Fn+Ctrl)
+        // now routes to the Deepgram handler. See bindShortcutTransitions
+        // comment above for the full swap rationale.
         voiceToTextTransitionCancellable = globalPushToTalkShortcutMonitor
             .voiceToTextTransitionPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] transition in
-                self?.handleVoiceToTextTransition(transition)
+                self?.handleVoiceToTextDeepgramTransition(transition)
             }
 
         captureToInboxTransitionCancellable = globalPushToTalkShortcutMonitor
@@ -1371,7 +1694,11 @@ final class CompanionManager: ObservableObject {
                 self?.handleCaptureToInboxTransition(transition)
             }
 
-        // v15p2 (2026-05-02): Realtime conversation hotkey (Fn + Opt).
+        // v15p2 (2026-05-02): Realtime conversation hotkey (Ctrl + Opt).
+        // (Earlier comment said Fn+Opt — incorrect. Per
+        // BuddyPushToTalkShortcut.realtimeTransition the actual chord
+        // is Ctrl+Opt with .function forbidden. Fn+Opt is the disabled
+        // Base PTT chord, now reused by Deepgram VTT in v15p3bu.)
         realtimeTransitionCancellable = globalPushToTalkShortcutMonitor
             .realtimeTransitionPublisher
             .receive(on: DispatchQueue.main)
@@ -1379,17 +1706,13 @@ final class CompanionManager: ObservableObject {
                 self?.handleRealtimeTransition(transition)
             }
 
-        // v15p2 (2026-05-02): hotkey swap — Fn+Shift+Opt now toggles
-        // v15p3bf (2026-05-12): Base voice-mode toggle (Fn+Shift+Opt tap)
-        // DISABLED. Steph confirmed unused — same reasoning as Base PTT
-        // above. Handler code retained as dead-but-harmless.
-        //
-        // realtimeHandsFreeToggleCancellable = globalPushToTalkShortcutMonitor
-        //     .realtimeHandsFreeToggleTransitionPublisher
-        //     .receive(on: DispatchQueue.main)
-        //     .sink { [weak self] transition in
-        //         self?.handleFnShiftOptForBaseVoiceMode(transition)
-        //     }
+        // v15p3fq (2026-05-17): the Fn+Shift+Opt single-tap hands-free
+        // Marin engage subscription was already commented out in
+        // v15p3bf and confirmed unused by Steph. Now formally removed
+        // since the chord is repurposed for AssemblyAI VTT above. The
+        // monitor's realtimeHandsFreeToggleTransitionPublisher firing
+        // logic is yanked at the same time (see
+        // GlobalPushToTalkShortcutMonitor).
 
         polishHotkeyTransitionCancellable = globalPushToTalkShortcutMonitor
             .polishHotkeyTransitionPublisher
@@ -1423,6 +1746,13 @@ final class CompanionManager: ObservableObject {
             .sink { [weak self] in
                 self?.handleOptionDoubleTapForRealtimeHandsFree()
             }
+        // v15p3gt (2026-05-18): double-tap Shift engages speed-read mode.
+        shiftDoubleTapCancellable = globalPushToTalkShortcutMonitor
+            .shiftDoubleTapPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] in
+                self?.handleShiftDoubleTapForSpeedRead()
+            }
         controlSingleTapCancellable = globalPushToTalkShortcutMonitor
             .controlSingleTapPublisher
             .receive(on: DispatchQueue.main)
@@ -1450,6 +1780,17 @@ final class CompanionManager: ObservableObject {
                 self?.handleEscapeKeyForToggleUnlock()
             }
 
+        // v15p3bx (2026-05-13): tell the monitor whether to consume Esc
+        // at the event tap. When any Clicky+ mode/state is active, Esc
+        // is "ours" to act on, so we eat it before it reaches the
+        // foreground app (Cowork, etc.). When Clicky+ is idle, the
+        // closure returns false and Esc passes through normally so
+        // other apps' Esc workflows aren't disrupted.
+        globalPushToTalkShortcutMonitor.shouldConsumeEscapeWhenPressed = { [weak self] in
+            guard let self else { return false }
+            return self.clickyHasActiveAction
+        }
+
         // Native macOS screenshot session (Cmd+Shift+3/4/5) — delivered
         // synchronously (no .receive(on:)) so the overlay hides on the same
         // run-loop tick as the keyDown, before screencaptureui grabs the
@@ -1464,6 +1805,108 @@ final class CompanionManager: ObservableObject {
                 } else {
                     self.overlayWindowManager.resumeAfterNativeScreenshot()
                 }
+            }
+
+        // v15p4t (2026-05-23): listen for Marin helper sub-agent state
+        // changes so the notch can flip to "Researching" while a helper
+        // is running. Notification posted by MarinHelperSubAgent.
+        helperStateObserver = NotificationCenter.default.addObserver(
+            forName: .marinHelperStateChanged,
+            object: nil,
+            queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let active = (note.userInfo?["active"] as? Bool) ?? false
+            self.isHelperSubAgentActive = active
+        }
+
+        // v15p4u (2026-05-23): install the floating helper-task column
+        // window. Lives top-right of the screen, owned by its own
+        // manager. Reads from HelperTaskStore.
+        FloatingHelperColumnManager.shared.install()
+
+        // v15p4ah (2026-05-24): ensure the canonical Helper Outputs
+        // directory exists at ~/Desktop/Claude Cowork/Helper Outputs/
+        // so the helper's first write doesn't fail on missing dir.
+        MarinHelperSubAgent.ensureHelperOutputsDirectory()
+
+        // v15p4p (2026-05-23): Cmd+Shift+2 → screenshot-and-paste.
+        // v15p4q (2026-05-23): switched from spawning `screencapture -ci`
+        // to posting the native Cmd+Ctrl+Shift+4 keystroke (selection
+        // screenshot → clipboard). Why: when screencapture is launched
+        // as our child process, it's not in loginwindow's mach bootstrap
+        // hierarchy, and the Space-toggle-to-window-selection-mode
+        // doesn't fire (the man page hints at this with its
+        // `launchctl bsexec` workaround). Posting the native shortcut
+        // lets macOS launch the screencaptureui in the right context,
+        // and Space works exactly like it does on real Cmd+Shift+4.
+        //
+        // Detection of completion: poll NSPasteboard.changeCount every
+        // 150 ms. When it incremented vs. our snapshot at trigger time,
+        // post Cmd+V. Time out after 30 s if the user never captures.
+        screenshotPasteCancellable = globalPushToTalkShortcutMonitor
+            .screenshotPasteShortcutPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { _ in
+                let pasteboard = NSPasteboard.general
+                let priorChangeCount = pasteboard.changeCount
+
+                // 100 ms delay before posting the native shortcut — gives
+                // Steph time to release Cmd+Shift+2 so the synthesized
+                // Cmd+Ctrl+Shift+4 isn't merged with physical modifier
+                // state still being held down. v15p4r: trimmed from 200 ms.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                    let src = CGEventSource(stateID: .hidSystemState)
+                    // virtualKey 21 = '4' on ANSI layout.
+                    let down = CGEvent(keyboardEventSource: src, virtualKey: 21, keyDown: true)
+                    down?.flags = [.maskCommand, .maskControl, .maskShift]
+                    let up = CGEvent(keyboardEventSource: src, virtualKey: 21, keyDown: false)
+                    up?.flags = [.maskCommand, .maskControl, .maskShift]
+                    down?.post(tap: .cghidEventTap)
+                    up?.post(tap: .cghidEventTap)
+                }
+
+                // Poll clipboard for the new image. On change, post Cmd+V
+                // after a small focus-settle delay. Cap at 30 s.
+                //
+                // v15p4s (2026-05-23): also require the clipboard to
+                // actually contain image data before firing Cmd+V. The
+                // raw changeCount check was firing on any clipboard
+                // write — which caused a duplicate paste on first
+                // launch when something else wrote text to the
+                // clipboard mid-poll. With this guard we wait for a
+                // change that's an image, ignore everything else.
+                let startTime = Date()
+                var pollTimer: Timer?
+                pollTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { t in
+                    if pasteboard.changeCount != priorChangeCount {
+                        let types = pasteboard.types ?? []
+                        let hasImage = types.contains(.tiff)
+                            || types.contains(.png)
+                            || types.contains(NSPasteboard.PasteboardType("public.png"))
+                            || types.contains(NSPasteboard.PasteboardType("public.tiff"))
+                        guard hasImage else {
+                            // Non-image clipboard change — keep polling.
+                            // Don't update priorChangeCount; we want to
+                            // notice the eventual image write too.
+                            return
+                        }
+                        t.invalidate()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            let src = CGEventSource(stateID: .hidSystemState)
+                            // virtualKey 9 = 'v' on ANSI layout.
+                            let down = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: true)
+                            down?.flags = .maskCommand
+                            let up = CGEvent(keyboardEventSource: src, virtualKey: 9, keyDown: false)
+                            up?.flags = .maskCommand
+                            down?.post(tap: .cghidEventTap)
+                            up?.post(tap: .cghidEventTap)
+                        }
+                    } else if Date().timeIntervalSince(startTime) > 30 {
+                        t.invalidate()
+                    }
+                }
+                _ = pollTimer  // silence unused warning; timer retains itself via RunLoop
             }
     }
 
@@ -1486,15 +1929,21 @@ final class CompanionManager: ObservableObject {
 
     /// Mark an other-mode chord as currently pressed. Suspends Marin
     /// on the 0→1 transition.
+    /// v15p3gv (2026-05-18): also suspends the Gemini Marin provider —
+    /// previously only the OpenAI provider was muted, so VTT dictation
+    /// bled through into Gemini Marin's mic stream and she'd respond
+    /// to whatever Steph said into Deepgram.
     private func markOtherModePressed(_ modeKey: String) {
         let wasEmpty = otherModeChordsHeld.isEmpty
         otherModeChordsHeld.insert(modeKey)
         let marinAlive = realtimeManager != nil
+        let geminiAlive = geminiRealtimeManager != nil
         RealtimeConversationManager.appendDiag(
-            "markOtherModePressed mode=\(modeKey) wasEmpty=\(wasEmpty) marinAlive=\(marinAlive) heldCount=\(otherModeChordsHeld.count)"
+            "markOtherModePressed mode=\(modeKey) wasEmpty=\(wasEmpty) marinAlive=\(marinAlive) geminiAlive=\(geminiAlive) heldCount=\(otherModeChordsHeld.count)"
         )
         if wasEmpty {
             realtimeManager?.suspendForOtherMode()
+            geminiRealtimeManager?.suspendForOtherMode()
             isRealtimeSuspendedByOtherMode = true
         }
     }
@@ -1504,11 +1953,13 @@ final class CompanionManager: ObservableObject {
     private func markOtherModeReleased(_ modeKey: String) {
         otherModeChordsHeld.remove(modeKey)
         let marinAlive = realtimeManager != nil
+        let geminiAlive = geminiRealtimeManager != nil
         RealtimeConversationManager.appendDiag(
-            "markOtherModeReleased mode=\(modeKey) nowEmpty=\(otherModeChordsHeld.isEmpty) marinAlive=\(marinAlive)"
+            "markOtherModeReleased mode=\(modeKey) nowEmpty=\(otherModeChordsHeld.isEmpty) marinAlive=\(marinAlive) geminiAlive=\(geminiAlive)"
         )
         if otherModeChordsHeld.isEmpty {
             realtimeManager?.resumeFromOtherMode()
+            geminiRealtimeManager?.resumeFromOtherMode()
             isRealtimeSuspendedByOtherMode = false
         }
     }
@@ -2204,10 +2655,24 @@ final class CompanionManager: ObservableObject {
     private func handleTypingTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
+            // v15p3bg (2026-05-12): targeted diag to root-cause typing-mode
+            // empty-transcript regression. VTT works in the same session
+            // with the same audio engine, so the bug is typing-specific.
+            // Tags every press/release/submit so we can correlate against
+            // EMPTY_TRANSCRIPT_ON_FINALIZE entries and identify whether
+            // the start task got cancelled before callbacks were stored,
+            // whether submitDraftText was ever invoked, etc.
+            BuddyDictationManager.appendAudioDiag("TYPING_PRESS")
             // v15p2 (2026-05-03): suspend Marin if she's running.
             markOtherModePressed("typing")
-            guard ensureDictationReady() else { return }
-            guard !showOnboardingVideo else { return }
+            guard ensureDictationReady() else {
+                BuddyDictationManager.appendAudioDiag("TYPING_BAIL_ensureDictationReady=false")
+                return
+            }
+            guard !showOnboardingVideo else {
+                BuddyDictationManager.appendAudioDiag("TYPING_BAIL_onboardingVideo")
+                return
+            }
 
             // Bring the overlay forward if it's currently hidden
             transientHideTask?.cancel()
@@ -2225,6 +2690,9 @@ final class CompanionManager: ObservableObject {
             clearDetectedElementLocation()
 
             ClickyAnalytics.trackPushToTalkStarted()
+
+            // v15p3dd (2026-05-15): typing mode start sound cue.
+            ClickySoundEngine.shared.play(.vttStart)
 
             isTypingModeActive = true
             typingModeScreenshot = nil
@@ -2262,6 +2730,14 @@ final class CompanionManager: ObservableObject {
                     updateDraftText: { _ in },
                     submitDraftText: { [weak self] finalTranscript in
                         guard let self else { return }
+                        // v15p3bg diag: confirm typing's submit closure ran
+                        // and capture what AssemblyAI actually returned.
+                        let preview = finalTranscript
+                            .replacingOccurrences(of: "\n", with: "\\n")
+                            .prefix(60)
+                        BuddyDictationManager.appendAudioDiag(
+                            "TYPING_SUBMIT len=\(finalTranscript.count) preview=\(preview)"
+                        )
                         self.lastTranscript = finalTranscript
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
                         let screenshot = self.typingModeScreenshot
@@ -2289,6 +2765,13 @@ final class CompanionManager: ObservableObject {
             }
 
         case .released:
+            // v15p3bg diag — capture whether start task was still pending
+            // (i.e. release happened before startPushToTalk's await chain
+            // completed, which would leave draftCallbacks unset).
+            let startTaskStillPending = pendingTypingShortcutStartTask != nil
+            BuddyDictationManager.appendAudioDiag(
+                "TYPING_RELEASE startTaskStillPending=\(startTaskStillPending)"
+            )
             // v15p2 (2026-05-03): release Marin suspension for typing.
             markOtherModeReleased("typing")
             ClickyAnalytics.trackPushToTalkReleased()
@@ -2339,6 +2822,13 @@ final class CompanionManager: ObservableObject {
     private func handleVoiceToTextTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
+            // v15p3br (2026-05-13): mark T0 for the latency diag log.
+            // Must be the very first thing in the handler so all
+            // downstream timestamps measure against the actual press
+            // event, not whatever bookkeeping ran first.
+            // v15p3bv: tag with provider so AssemblyAI vs Deepgram
+            // engages can be filtered apart in the diag file.
+            VTTLatencyDiag.markPress(provider: "assemblyai")
             // v15p2 (2026-05-03): suspend Marin if she's running.
             markOtherModePressed("vtt")
             // v15p3c (2026-05-07): the inline if+cancel+guard pattern
@@ -2369,6 +2859,9 @@ final class CompanionManager: ObservableObject {
             clearDetectedElementLocation()
 
             ClickyAnalytics.trackPushToTalkStarted()
+
+            // v15p3cu (2026-05-14): VTT start sound cue.
+            ClickySoundEngine.shared.play(.vttStart)
 
             isVoiceToTextModeActive = true
 
@@ -2446,6 +2939,404 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    // MARK: - Voice-to-Text Mode (Deepgram) — A/B test (v15p3bu, 2026-05-13)
+    //
+    // Fn+Opt triggers the same paste-only VTT flow as Fn+Ctrl, but
+    // with Deepgram Nova-3 as the transcription provider instead of
+    // AssemblyAI u3-rt-pro. Designed as a side-by-side feel test —
+    // Steph holds Fn+Opt for Deepgram, Fn+Ctrl for AssemblyAI, with
+    // a red cursor indicator on this mode (vs purple for AssemblyAI
+    // VTT) so the active provider is visually obvious. The repunctuate
+    // / polish / paste pipeline downstream is identical for both
+    // modes; only the streaming transcription provider differs.
+    //
+    // Reuses the previously disabled Base PTT chord (Fn+Opt).
+    // Mutually exclusive with everything else by the existing
+    // shortcutTransition rules in BuddyPushToTalkShortcut.
+    private func handleVoiceToTextDeepgramTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
+        switch transition {
+        case .pressed:
+            // Mark T0 for the latency diag — same diag used by the
+            // AssemblyAI VTT path, so head-to-head numbers land in
+            // the same file and are directly comparable. v15p3bv:
+            // tagged with provider for unambiguous filter.
+            // v15p4bs (2026-05-29): use selectedVTTProvider so
+            // Parakeet runs get tagged "parakeet" not "deepgram".
+            VTTLatencyDiag.markPress(provider: selectedVTTProvider)
+            markOtherModePressed("vtt-deepgram")
+            guard ensureDictationReady() else { return }
+            guard !showOnboardingVideo else { return }
+
+            transientHideTask?.cancel()
+            transientHideTask = nil
+            if !isClickyCursorEnabled && !isOverlayVisible {
+                overlayWindowManager.hasShownOverlayBefore = true
+                overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+                isOverlayVisible = true
+            }
+
+            NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+
+            currentResponseTask?.cancel()
+            ttsClient.stopPlayback()
+            clearDetectedElementLocation()
+
+            ClickyAnalytics.trackPushToTalkStarted()
+
+            // v15p3cu (2026-05-14): VTT start sound cue.
+            ClickySoundEngine.shared.play(.vttStart)
+
+            isVoiceToTextDeepgramModeActive = true
+
+            stuckSpinnerSafetyNetTask?.cancel()
+            stuckSpinnerSafetyNetTask = nil
+
+            // v15p3bw (2026-05-13): Deepgram now supports toggle mode
+            // since the hotkey swap made it the primary VTT (Fn+Ctrl
+            // + double-tap Ctrl). Mirror the AssemblyAI handler's
+            // toggle behavior: capture engagement screenshot for polish
+            // context, route polish after repunctuate for long-form
+            // dictation, etc. isVoiceToTextToggleLocked is shared with
+            // AssemblyAI VTT since only one VTT toggle is active at a
+            // time (mutually exclusive hotkeys).
+            let isToggleSession = isVoiceToTextToggleLocked
+
+            vttToggleEngagementScreenshot = nil
+            if isToggleSession {
+                Task { @MainActor [weak self] in
+                    do {
+                        let captures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
+                        let primary = captures.first(where: { $0.label.localizedCaseInsensitiveContains("primary") })
+                            ?? captures.first
+                        self?.vttToggleEngagementScreenshot = primary
+                    } catch {
+                        print("⚠️ Deepgram VTT toggle screenshot error: \(error)")
+                    }
+                }
+            }
+
+            pendingDeepgramVTTShortcutStartTask?.cancel()
+            pendingDeepgramVTTShortcutStartTask = Task { [weak self] in
+                guard let self else { return }
+                await self.buddyDictationManager.startPushToTalkFromKeyboardShortcut(
+                    currentDraftText: "",
+                    updateDraftText: { _ in },
+                    submitDraftText: { [weak self] finalTranscript in
+                        guard let self else { return }
+                        self.lastTranscript = finalTranscript
+                        ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
+                        let toggleScreenshot = self.vttToggleEngagementScreenshot
+                        self.vttToggleEngagementScreenshot = nil
+                        self.pasteVoiceToTextTranscript(
+                            finalTranscript,
+                            polishAfterRepunctuate: isToggleSession,
+                            contextScreenshot: toggleScreenshot
+                        )
+                    },
+                    overrideTranscriptionProvider: self.activeVTTProvider
+                )
+            }
+
+        case .released:
+            markOtherModeReleased("vtt-deepgram")
+            ClickyAnalytics.trackPushToTalkReleased()
+            Self.lastVTTReleaseTimestamp = Date()
+            isVoiceToTextDeepgramModeActive = false
+            pendingDeepgramVTTShortcutStartTask?.cancel()
+            pendingDeepgramVTTShortcutStartTask = nil
+            buddyDictationManager.stopPushToTalkFromKeyboardShortcut()
+
+        case .none:
+            break
+        }
+    }
+
+    // MARK: - Watch Mode (Fn+Opt) — video sub-mode of Marin Gemini
+    //
+    // v15p3fq (2026-05-17): NEW. The "I see something I can't describe"
+    // mode. Hold Fn+Opt; ScreenCaptureKit frames are streamed into
+    // Marin Gemini's Live WS at ~2 fps alongside audio; user narrates
+    // what they want described ("watch the halo while I switch modes")
+    // or just holds silently for a full-screen description; on release,
+    // Gemini returns a paragraph-level description of what it saw.
+    //
+    // Designed specifically to unblock cases where Steph can SEE a
+    // visual issue (halo modulation, animation timing, UI glitch) but
+    // can't put the right words on it. The system instruction tells
+    // Gemini to prioritize whatever the user calls out; otherwise it
+    // narrates the most salient screen content.
+    //
+    // This commit (v15p3fq) is the SKELETON ONLY — hotkey, state flag,
+    // and indicator color. The actual frame-streaming + system-instruction
+    // wiring lands in v15p3fr once we've validated the chord + indicator
+    // don't regress other modes.
+    private func handleVideoWatchTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
+        switch transition {
+        case .pressed:
+            // v15p3fy (2026-05-17): tap-vs-hold support. Record press
+            // time so .released can classify the gesture. If we're
+            // already toggle-locked, this press is the START of the
+            // disengage tap — don't restart the session, just record
+            // the timestamp and exit. The .released branch decides
+            // whether to disengage.
+            videoWatchPressTimestamp = Date()
+            if isVideoWatchToggleLocked {
+                print("👁️ Watch mode → tap detected mid-toggle (deciding disengage on release)")
+                return
+            }
+            // Refuse to engage if anything else is active. Watch mode
+            // opens a fresh Gemini Live WS with a different setup
+            // payload — sharing with an active Marin session would
+            // require tearing it down, which is rude if Marin is
+            // mid-conversation.
+            // v15p3fr (2026-05-17): also refuse if a prior watch
+            // response is still in flight — Watch is single-turn,
+            // double-press would race the callback.
+            guard !clickyHasActiveAction else {
+                print("⚠️ Watch mode press ignored — another mode is active")
+                return
+            }
+            guard !isVideoWatchResponseInFlight else {
+                print("⚠️ Watch mode press ignored — waiting on prior response")
+                return
+            }
+            print("👁️ Watch mode → PRESSED (Fn+Opt)")
+            isVideoWatchModeActive = true
+            isVideoWatchResponseInFlight = true
+
+            // v15p3fv (2026-05-17): press cue. Steph needs an audible
+            // confirmation that the hold registered — without this,
+            // the red dot + halo aren't sufficient feedback (he was
+            // narrating into thin air thinking nothing was working).
+            // visionCapture is the contextually right tone: "I'm
+            // looking at the screen."
+            ClickySoundEngine.shared.play(.visionCapture)
+
+            // Bring the overlay forward so the red indicator is visible
+            // even when the cursor was hidden.
+            transientHideTask?.cancel()
+            transientHideTask = nil
+            if !isClickyCursorEnabled && !isOverlayVisible {
+                overlayWindowManager.hasShownOverlayBefore = true
+                overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+                isOverlayVisible = true
+            }
+
+            // Lazy-instantiate the Gemini manager. Matches the pattern
+            // used by every other Marin Gemini entry point in this file.
+            // v15p3fv (2026-05-17): also call bindGeminiRealtimeManagerState
+            // explicitly. If this is the first Gemini-related action of
+            // the session (no Marin engage yet), the state binding
+            // hasn't been wired up — without it, isRealtimeModeActive
+            // never reflects the watch session's connecting/listening
+            // state and the audio level publisher isn't subscribed.
+            let needsBinding = (geminiRealtimeManager == nil)
+            if geminiRealtimeManager == nil {
+                geminiRealtimeManager = GeminiRealtimeConversationManager()
+            }
+            if needsBinding {
+                bindGeminiRealtimeManagerState()
+            }
+
+            // Open the watch session. The response handler fires once
+            // when Gemini finishes generating the description text.
+            // Capture self weakly so a long response doesn't keep us
+            // alive past a sensible window.
+            geminiRealtimeManager?.startWatchSession { [weak self] description in
+                Task { @MainActor in
+                    self?.handleVideoWatchResponseText(description)
+                }
+            }
+
+            // Start the 2 fps frame capture loop. Timer fires on the
+            // main run loop, kicks off an async capture task each
+            // tick. Capture+encode takes longer than the 0.5s tick
+            // in some cases — we drop frames when that happens (no
+            // queueing) so we don't pile up stale frames behind a
+            // slow capture.
+            // v15p3fx (2026-05-17): bumped from 2 fps → 4 fps. The
+            // halo / spinning-cursor test case showed 2 fps was too
+            // slow to catch fast motion — a cursor circling at ~1Hz
+            // landed in nearly the same screen position at each
+            // 500ms tick, so the model reported "stationary". 250ms
+            // intervals catch sub-second motion. Cost is ~2x bandwidth
+            // (4 × 300KB/s vs 2 × 300KB/s) — acceptable for the
+            // typical 2-3s hold.
+            videoWatchFrameTimer?.invalidate()
+            videoWatchFrameTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                self.captureAndSendVideoWatchFrame()
+            }
+            // Fire one frame immediately so Gemini has visual context
+            // before the user starts talking (otherwise the first
+            // ~500ms of audio arrives with no frame to attach to).
+            captureAndSendVideoWatchFrame()
+
+        case .released:
+            // v15p3fy (2026-05-17): tap-vs-hold gesture classification.
+            // The same hotkey now supports two engagement patterns:
+            //   • Tap (release in <350ms): toggle-engage / toggle-disengage
+            //   • Hold (release in ≥350ms): conventional press-and-hold
+            // Lets Steph hold for a quick observation OR tap-on, do
+            // other things (VTT, Marin, polish) that need their own
+            // hotkeys, then tap-off to get the response.
+            let elapsed: TimeInterval
+            if let pressedAt = videoWatchPressTimestamp {
+                elapsed = Date().timeIntervalSince(pressedAt)
+            } else {
+                elapsed = .infinity
+            }
+            videoWatchPressTimestamp = nil
+            let wasTap = elapsed < Self.videoWatchTapThresholdSeconds
+
+            // Case 1: already toggle-locked → this release ends the toggle.
+            // Any release (tap or hold) while locked disengages.
+            if isVideoWatchToggleLocked {
+                print("👁️ Watch mode → TOGGLE DISENGAGE (was tap-locked, elapsed=\(String(format: "%.2f", elapsed))s)")
+                isVideoWatchToggleLocked = false
+                endActiveWatchSession()
+                return
+            }
+
+            // Case 2: not locked, gesture was a tap → engage the toggle.
+            // Session is already running (started in .pressed). Just
+            // flip the lock and leave it streaming. Don't end yet.
+            if wasTap && isVideoWatchModeActive {
+                print("👁️ Watch mode → TOGGLE ENGAGED via tap (elapsed=\(String(format: "%.2f", elapsed))s) — tap Fn+Opt again to disengage")
+                isVideoWatchToggleLocked = true
+                // Audible confirmation that tap-engage worked so Steph
+                // knows the indicator is going to stay on. Different
+                // cue from press so the two are distinguishable.
+                ClickySoundEngine.shared.play(.vttSuccess)
+                return
+            }
+
+            // Case 3: not locked, gesture was a hold → end normally.
+            print("👁️ Watch mode → RELEASED (hold, elapsed=\(String(format: "%.2f", elapsed))s)")
+            endActiveWatchSession()
+
+        case .none:
+            break
+        }
+    }
+
+    /// v15p3fy (2026-05-17): shared teardown path for both hold-release
+    /// and toggle-disengage. Stops the frame timer, sends activity_end
+    /// to Gemini, and arms the 15s response-timeout safety net.
+    private func endActiveWatchSession() {
+        isVideoWatchModeActive = false
+
+        videoWatchFrameTimer?.invalidate()
+        videoWatchFrameTimer = nil
+
+        // Signal end-of-activity so Gemini segments the turn and
+        // starts generating. The response callback fires when
+        // turnComplete arrives and clears isVideoWatchResponseInFlight
+        // via handleVideoWatchResponseText.
+        geminiRealtimeManager?.endWatchSession()
+
+        // v15p3fs (2026-05-17): safety net. If the WS hangs or the
+        // server never sends turnComplete (we saw this happen with
+        // code 1000 — server closes cleanly but no response arrives),
+        // the callback never fires and isVideoWatchResponseInFlight
+        // stays true — blocking every future Watch press. Force-clear
+        // after 15s. The callback (if it eventually arrives) is
+        // idempotent: it just sets the flag false a second time.
+        // v15p3fy (2026-05-17): also call forceEndWatchSession (instead
+        // of endSession) so the Marin disengage tone doesn't play
+        // when the timeout fires — that cue should stay suppressed
+        // for the entire watch teardown, not just the first endSession.
+        videoWatchResponseTimeoutTask?.cancel()
+        videoWatchResponseTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self else { return }
+                if self.isVideoWatchResponseInFlight {
+                    print("⚠️ Watch mode response timeout — force-clearing state")
+                    self.isVideoWatchResponseInFlight = false
+                    self.geminiRealtimeManager?.forceEndWatchSession()
+                    // Audible signal that the response failed so Steph
+                    // doesn't sit there expecting a paste that never
+                    // comes. The clipboard is whatever it was before
+                    // the Watch attempt — we don't overwrite with an
+                    // error string because that'd surprise him.
+                    ClickySoundEngine.shared.play(.vttError)
+                }
+            }
+        }
+    }
+
+    /// v15p3fr (2026-05-17): captures the primary display as JPEG and
+    /// forwards to the Gemini Watch session. Defensive guards: if the
+    /// hotkey was released between the timer firing and this method
+    /// running, drop the frame; if capture fails, log and continue.
+    /// Runs every 250ms while Fn+Opt is held / toggled on.
+    ///
+    /// v15p4bh (2026-05-26): switched from captureAllScreensAsJPEG to
+    /// captureActiveScreenAsJPEG(maxDimension: 1280). Before: every
+    /// tick captured every connected display (MacBook + Sceptre) at
+    /// 1920px, JPEG-encoded both, discarded the non-primary. After:
+    /// single capture of the cursor screen at 1280px. Effective FPS
+    /// goes from ~1 to ~4 (the timer ceiling) on dual-display setups
+    /// and per-frame token cost drops ~4× since the JPEG is roughly
+    /// 6× smaller. This is Phase 1 of the "true video Watch Mode"
+    /// upgrade — Phase 2 is the SCStream-based continuous capture
+    /// path that lets us push past 4 FPS.
+    private func captureAndSendVideoWatchFrame() {
+        guard isVideoWatchModeActive else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let frame = try await CompanionScreenCaptureUtility.captureActiveScreenAsJPEG(maxDimension: 1280)
+                // Belt-and-suspenders: re-check the mode flag after
+                // the async capture in case release fired during the
+                // capture window. Stale frames after release would
+                // confuse Gemini's frame-vs-audio alignment.
+                guard self.isVideoWatchModeActive else { return }
+                self.geminiRealtimeManager?.sendVideoFrame(frame.imageData)
+            } catch {
+                print("⚠️ Watch mode frame capture failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// v15p3fr (2026-05-17): runs when the Gemini Watch turn completes
+    /// and the response text is ready. Copies the description to the
+    /// clipboard so Steph can paste it straight into chat without
+    /// reformatting, prints a preview to the console so he can
+    /// confirm the response landed, and clears the in-flight flag so
+    /// the next press is unblocked.
+    @MainActor
+    private func handleVideoWatchResponseText(_ description: String) {
+        // v15p3fs (2026-05-17): cancel the response timeout — we got
+        // a real response in time.
+        videoWatchResponseTimeoutTask?.cancel()
+        videoWatchResponseTimeoutTask = nil
+
+        let trimmed = description.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            print("⚠️ Watch mode response was empty")
+            // v15p3fv (2026-05-17): error cue so Steph hears that
+            // something went wrong even when there's nothing on the
+            // clipboard to paste.
+            ClickySoundEngine.shared.play(.vttError)
+        } else {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(trimmed, forType: .string)
+            let preview = trimmed
+                .replacingOccurrences(of: "\n", with: " ")
+                .prefix(140)
+            print("👁️ Watch mode response (copied to clipboard, \(trimmed.count) chars): \(preview)")
+            // v15p3fv (2026-05-17): success cue so Steph knows the
+            // description landed on his clipboard and is ready to
+            // paste. Without this, watch mode felt like "release and
+            // hope" — no signal at all that the response had arrived.
+            ClickySoundEngine.shared.play(.vttSuccess)
+        }
+        isVideoWatchResponseInFlight = false
+    }
+
     // MARK: - Double-tap toggles (v11f, 2026-04-27)
     //
     // Steph wanted hotkeys for VTT and typing-mode that he doesn't have to
@@ -2462,12 +3353,14 @@ final class CompanionManager: ObservableObject {
     /// (single-tap is the disengage path now). If typing is locked, swap.
     private func handleVoiceToTextDoubleTapEngage() {
         guard !isVoiceToTextToggleLocked else { return }
-        print("🔒 VTT toggle: engaging (double-tap Ctrl)")
+        print("🔒 VTT toggle: engaging (double-tap Ctrl) — provider=Deepgram")
         if isTypingToggleLocked {
             disengageTypingToggle()
         }
         isVoiceToTextToggleLocked = true
-        handleVoiceToTextTransition(.pressed)
+        // v15p3bw (2026-05-13): post-swap, double-tap Ctrl engages the
+        // Deepgram VTT toggle (Deepgram is now primary on Fn+Ctrl).
+        handleVoiceToTextDeepgramTransition(.pressed)
     }
 
     /// Double-tap Cmd alone → engage typing-mode lock.
@@ -2553,6 +3446,26 @@ final class CompanionManager: ObservableObject {
         if isVoiceModeToggleLocked {
             disengageVoiceModeToggle()
         }
+        // v15p3fy (2026-05-17): cancel an active Watch-mode toggle. Esc
+        // is the only way out of a stuck toggle session (next tap of
+        // Fn+Opt would generate a response, which the user may not
+        // want — Esc is the explicit "cancel, no response" gesture).
+        // We force-end the Gemini session via forceEndWatchSession so
+        // the disengage cue stays suppressed and the WS tears down
+        // cleanly without waiting on a turnComplete that may never
+        // come.
+        if isVideoWatchToggleLocked || isVideoWatchModeActive {
+            print("🛑 Esc: cancelling Watch mode")
+            isVideoWatchToggleLocked = false
+            isVideoWatchModeActive = false
+            isVideoWatchResponseInFlight = false
+            videoWatchFrameTimer?.invalidate()
+            videoWatchFrameTimer = nil
+            videoWatchResponseTimeoutTask?.cancel()
+            videoWatchResponseTimeoutTask = nil
+            videoWatchPressTimestamp = nil
+            geminiRealtimeManager?.forceEndWatchSession()
+        }
 
         // v15p2 (2026-05-02): Realtime emergency stop, smart-split.
         //   • If Marin is currently speaking → interrupt only.
@@ -2594,6 +3507,44 @@ final class CompanionManager: ObservableObject {
                 realtimeManager.endSession()
             }
         }
+        // v15p3eh + v15p3eu: smart-split Escape for Gemini Marin.
+        //
+        // v15p3eu refines hands-free behavior. Previous v15p3eh sent
+        // ALL Escape presses in hands-free straight to disengage,
+        // which ended the session entirely (state=.idle, indicator
+        // turned off, you had to re-engage). Steph wanted Escape to
+        // just stop her current speech and stay engaged so he could
+        // immediately keep talking. Refined behavior:
+        //
+        //   - Hands-free + she's speaking: cancel response, stay engaged
+        //   - Hands-free + she's idle:    disengage (you're done)
+        //   - Hands-free + double-tap:    disengage (explicit "done")
+        //   - PTT + she's speaking:       cancel response, session stays
+        //   - PTT + idle:                 end session
+        //   - PTT + double-tap:           end session (explicit)
+        //
+        // Disengage path uses single-tap-Opt handler so the persisted
+        // isRealtimeHandsFreeEnabled flag and sound cues fire correctly.
+        if let gemini = geminiRealtimeManager, gemini.state.isActive {
+            let isSpeaking = gemini.state == .responding || gemini.isModelCurrentlySpeaking()
+            if isRealtimeHandsFreeEnabled {
+                if isDoubleTap {
+                    handleOptionSingleTapForRealtimeHandsFree()
+                } else if isSpeaking {
+                    // Stop her current speech, stay in hands-free.
+                    gemini.cancelCurrentResponse()
+                } else {
+                    // Quiet press in hands-free = "we're done."
+                    handleOptionSingleTapForRealtimeHandsFree()
+                }
+            } else if isDoubleTap {
+                gemini.endSession()
+            } else if isSpeaking {
+                gemini.cancelCurrentResponse()
+            } else {
+                gemini.endSession()
+            }
+        }
 
         // v15p3l (2026-05-08): force-cancel any in-flight dictation BEFORE
         // touching voiceState. Esc has been theatrical for a class of
@@ -2627,8 +3578,10 @@ final class CompanionManager: ObservableObject {
     private func disengageVoiceToTextToggle() {
         guard isVoiceToTextToggleLocked else { return }
         isVoiceToTextToggleLocked = false
-        // Synthesize .released — same path as releasing a hold.
-        handleVoiceToTextTransition(.released)
+        // v15p3bw (2026-05-13): post-swap, the toggle drives the Deepgram
+        // handler (since Fn+Ctrl is now Deepgram primary). Synthesize
+        // .released so the dictation manager finalizes cleanly.
+        handleVoiceToTextDeepgramTransition(.released)
     }
 
     // MARK: - v12s: Hands-free base voice mode (double-tap Option)
@@ -2688,6 +3641,11 @@ final class CompanionManager: ObservableObject {
     /// Double-tap Option → engage Realtime hands-free (was Base voice-
     /// mode pre-swap). Same effect as Fn+Cmd+Opt before this swap, just
     /// with easier ergonomics.
+    ///
+    /// v15p3ed (2026-05-16): dispatches to the active provider (Marin
+    /// OpenAI Realtime vs Gemini Live) based on the marinUsingGemini
+    /// flag. Same hotkey, same hands-free UX, runtime-swappable via
+    /// the panel toggle.
     private func handleOptionDoubleTapForRealtimeHandsFree() {
         guard ensureDictationReady() else { return }
         guard !showOnboardingVideo else { return }
@@ -2696,7 +3654,14 @@ final class CompanionManager: ObservableObject {
         // only checked the flag, which got out of sync when sessions
         // ended for other reasons (Esc, error, race) — leaving Steph
         // unable to re-engage without first toggling something else.
-        let actuallyActive = realtimeManager?.state.isActive ?? false
+        // v15p3ed: check the active provider's state, not just Marin's.
+        let actuallyActive: Bool = {
+            if marinUsingGemini {
+                return geminiRealtimeManager?.state.isActive ?? false
+            } else {
+                return realtimeManager?.state.isActive ?? false
+            }
+        }()
         if isRealtimeHandsFreeEnabled && actuallyActive {
             return
         }
@@ -2714,21 +3679,217 @@ final class CompanionManager: ObservableObject {
             isOverlayVisible = true
         }
         isRealtimeModeActive = true
-        if realtimeManager == nil {
-            realtimeManager = RealtimeConversationManager()
-            bindRealtimeManagerState()
+        // v15p3ez (2026-05-17): play the engage cue for hands-free
+        // toggle too. PTT got this via v15p3eq's hotkey-press hook,
+        // but the double-tap-Opt continuous path was missing it
+        // entirely — Steph reported "no sound when I trigger
+        // continuous mode."
+        ClickySoundEngine.shared.play(.marinEngage)
+        // v15p3ez: initial halo flare so the indicator pulses
+        // visibly on engage, then settles — matches the behavior
+        // other modes get naturally from their startup audio
+        // burst. Marin's audio path is too quiet at engage to
+        // produce the flare on its own, so we trigger it explicitly.
+        triggerInitialHaloFlare()
+        if marinUsingGemini {
+            if geminiRealtimeManager == nil {
+                geminiRealtimeManager = GeminiRealtimeConversationManager()
+                bindGeminiRealtimeManagerState()
+            }
+            geminiRealtimeManager?.engageContinuousListening()
+            print("🎙️ Gemini hands-free → ENGAGED (double-tap Opt)")
+        } else {
+            if realtimeManager == nil {
+                realtimeManager = RealtimeConversationManager()
+                bindRealtimeManagerState()
+            }
+            realtimeManager?.engageContinuousListening()
+            print("🎙️ Marin hands-free → ENGAGED (double-tap Opt)")
         }
-        realtimeManager?.engageContinuousListening()
-        print("🎙️ Realtime hands-free → ENGAGED (double-tap Opt)")
+    }
+
+    /// v15p3ez (2026-05-17): trigger a brief halo flare visible on
+    /// Marin engage. Other modes get this naturally from mic startup
+    /// transients; Marin's path is too quiet at engage. Set the
+    /// realtimeInputAudioLevel briefly; the existing smoothing in
+    /// the binding (max with prev * 0.72) decays it over ~10 frames.
+    ///
+    /// v15p3fd (2026-05-17): 0.15 still too loud per Steph. Down to 0.1.
+    private func triggerInitialHaloFlare() {
+        realtimeInputAudioLevel = 0.1
+    }
+
+    // MARK: - Speed-read (v15p3gt, 2026-05-18)
+    //
+    // Double-tap Shift triggers RSVP playback of the user's selected
+    // text (with clipboard fallback). Flow:
+    //   1. Snapshot the user's existing clipboard items.
+    //   2. Synth Cmd+C to capture selected text (no-op if nothing selected).
+    //   3. Poll the pasteboard change count for ~200ms.
+    //   4. If we captured a selection, use it. Otherwise fall back to
+    //      whatever was already on the clipboard (which the user may
+    //      have just copied from a different app).
+    //   5. Restore the original clipboard items so the user's clipboard
+    //      isn't clobbered.
+    //   6. If "AI compress" setting is on, route the text through
+    //      Haiku to strip filler, then load the compressed result into
+    //      the overlay. Otherwise load the raw text immediately.
+
+    private func handleShiftDoubleTapForSpeedRead() {
+        // Don't engage while another mode owns Clicky's attention.
+        if clickyHasActiveAction {
+            print("👀 Speed-read: ignored — another mode is active")
+            return
+        }
+        print("👀 Speed-read → engaged (double-tap Shift)")
+        ClickyAnalytics.trackPushToTalkStarted()
+
+        let wpm = max(100, min(900, UserDefaults.standard.object(forKey: "clicky.speedRead.wpm") as? Int ?? 400))
+        let compressEnabled = UserDefaults.standard.bool(forKey: "clicky.speedRead.aiCompress")
+
+        Task { @MainActor in
+            let capturedText = await self.captureSelectionOrClipboardText()
+            guard let text = capturedText,
+                  !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                print("⚠️ Speed-read: no text captured (no selection, empty clipboard)")
+                ClickySoundEngine.shared.play(.vttError)
+                return
+            }
+
+            // Lazy-create the overlay manager.
+            if self.speedReadOverlayManager == nil {
+                self.speedReadOverlayManager = SpeedReadOverlayManager()
+            }
+            guard let overlay = self.speedReadOverlayManager else { return }
+
+            overlay.showOverlay(text: text, startingWPM: wpm, compressing: compressEnabled)
+
+            if compressEnabled {
+                // Fire the Haiku compression in the background; once it
+                // returns, swap in the compressed text. If it fails,
+                // fall back to the original.
+                Task {
+                    do {
+                        let compressed = try await Self.compressForSpeedRead(text: text)
+                        await MainActor.run {
+                            overlay.loadCompressedText(compressed, startingWPM: wpm)
+                        }
+                    } catch {
+                        print("⚠️ Speed-read: compression failed — \(error.localizedDescription)")
+                        await MainActor.run {
+                            overlay.compressionFailed(fallbackText: text, startingWPM: wpm)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Capture user's selected text via Cmd+C synth. If nothing was
+    /// selected, fall back to whatever was already on the clipboard.
+    /// Always restores the user's original clipboard before returning.
+    @MainActor
+    private func captureSelectionOrClipboardText() async -> String? {
+        let savedItems = Self.snapshotGeneralPasteboardItems()
+        let originalText = NSPasteboard.general.string(forType: .string)
+        let changeCountBeforeCopy = NSPasteboard.general.changeCount
+
+        Self.synthesizeCommandC()
+
+        // Poll up to 200ms for a pasteboard change indicating a real
+        // selection was copied.
+        let pollDeadline = Date().addingTimeInterval(0.2)
+        var capturedSelection: String?
+        while Date() < pollDeadline {
+            try? await Task.sleep(nanoseconds: 15_000_000)
+            if NSPasteboard.general.changeCount != changeCountBeforeCopy {
+                let candidate = NSPasteboard.general.string(forType: .string) ?? ""
+                if !candidate.isEmpty {
+                    capturedSelection = candidate
+                }
+                break
+            }
+        }
+
+        // Restore the user's original clipboard regardless of outcome.
+        Self.restoreGeneralPasteboardItems(savedItems)
+
+        if let selection = capturedSelection,
+           !selection.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return selection
+        }
+        // Fallback: use the pre-existing clipboard text.
+        if let original = originalText,
+           !original.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return original
+        }
+        return nil
+    }
+
+    /// Route text through Haiku via the Cloudflare Worker's
+    /// /voice-command endpoint. We piggyback on the polish flow: pass
+    /// the source text as `fieldText` and a "compress for speed read"
+    /// modifier. Haiku returns a denser version that feeds the RSVP
+    /// timer.
+    private static func compressForSpeedRead(text: String) async throws -> String {
+        guard let url = URL(string: "\(workerBaseURL)/voice-command") else {
+            throw NSError(domain: "SpeedReadCompress", code: -1,
+                          userInfo: [NSLocalizedDescriptionKey: "Bad worker URL"])
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.timeoutInterval = 15
+
+        let body: [String: Any] = [
+            "command": "polish",
+            "fieldText": text,
+            "modifier": "Compress this for fast reading. Strip filler, redundancy, hedging, and meta-commentary. Preserve every concrete fact, number, name, and step. Output the dense version only — no preamble, no quotes, no explanation. Aim for 40-60% of the original length.",
+            "polishStyle": "compress"
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            let bodyText = String(data: data, encoding: .utf8) ?? "<binary>"
+            throw NSError(domain: "SpeedReadCompress", code: http.statusCode,
+                          userInfo: [NSLocalizedDescriptionKey: "Worker returned \(http.statusCode): \(bodyText.prefix(200))"])
+        }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw NSError(domain: "SpeedReadCompress", code: -2,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not parse worker response"])
+        }
+        // The polish endpoint returns the cleaned text under several
+        // possible keys depending on worker version. Check all common
+        // shapes.
+        let candidates: [String] = [
+            (json["polished"] as? String) ?? "",
+            (json["result"] as? String) ?? "",
+            (json["text"] as? String) ?? "",
+            (json["output"] as? String) ?? ""
+        ]
+        for candidate in candidates {
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        throw NSError(domain: "SpeedReadCompress", code: -3,
+                      userInfo: [NSLocalizedDescriptionKey: "No usable text field in worker response"])
     }
 
     /// Single-tap Option → disengage Realtime hands-free.
+    ///
+    /// v15p3ed (2026-05-16): provider-agnostic — dispatches to whichever
+    /// manager is currently running. We disengage BOTH if both somehow
+    /// got engaged (defensive), since the hands-free flag is shared.
     private func handleOptionSingleTapForRealtimeHandsFree() {
         guard isRealtimeHandsFreeEnabled else { return }
         isRealtimeHandsFreeEnabled = false
         if let manager = realtimeManager, manager.state.isActive {
             manager.disengageContinuousListening()
             manager.endSession()
+        }
+        if let gemini = geminiRealtimeManager, gemini.state.isActive {
+            gemini.disengageContinuousListening()
         }
         print("🎙️ Realtime hands-free → DISENGAGED (single-tap Opt)")
         scheduleTransientHideIfNeeded()
@@ -2842,6 +4003,9 @@ final class CompanionManager: ObservableObject {
 
             ClickyAnalytics.trackPushToTalkStarted()
 
+            // v15p3dd (2026-05-15): capture-to-inbox start sound cue.
+            ClickySoundEngine.shared.play(.vttStart)
+
             isCaptureToInboxModeActive = true
 
             pendingCaptureToInboxShortcutStartTask?.cancel()
@@ -2930,20 +4094,116 @@ final class CompanionManager: ObservableObject {
             // Flip flag so cursor goes magenta.
             isRealtimeModeActive = true
 
-            // Lazily create the manager + bind state observation on
-            // first use.
-            if realtimeManager == nil {
-                realtimeManager = RealtimeConversationManager()
-                bindRealtimeManagerState()
+            // v15p3eq (2026-05-17): fire the engage cue HERE on press,
+            // not buried inside the manager's state = .listening branch.
+            // Previously the cue was gated on setupComplete + vision
+            // capture + activity_start (~500ms total). Steph reported
+            // the cue played AFTER the perceptible delay, defeating
+            // its purpose as instant audible feedback. Now it fires
+            // the moment the hotkey lands.
+            ClickySoundEngine.shared.play(.marinEngage)
+            // v15p3ez (2026-05-17): trigger initial halo flare so the
+            // indicator pulses visibly on engage like other modes do.
+            triggerInitialHaloFlare()
+
+            // v15p3et (2026-05-17): PTT barge-in. If Marin is
+            // currently mid-response when Steph re-presses the
+            // hotkey, treat the press as a barge-in: silence her
+            // playback immediately so she doesn't talk over his
+            // new utterance. The resume path in startSession will
+            // then open a fresh user turn cleanly. Steph confirmed
+            // PTT barge-in via re-press is the desired behavior
+            // (continuous mode uses Escape for the same purpose).
+            if marinUsingGemini {
+                if let gemini = geminiRealtimeManager,
+                   gemini.state == .responding || gemini.isModelCurrentlySpeaking() {
+                    gemini.cancelCurrentResponse()
+                }
+            } else {
+                if let marin = realtimeManager,
+                   marin.state == .responding || marin.isModelCurrentlySpeaking() {
+                    marin.cancelCurrentResponse()
+                }
             }
-            realtimeManager?.startSession()
+
+            // v15p3di (2026-05-16): route through the dispatcher so the
+            // active Marin provider (OpenAI or Gemini) is picked at
+            // session start. Same hotkey, runtime switch via panel.
+            startActiveRealtimeManager()
 
         case .released:
-            realtimeManager?.handleHotkeyRelease()
+            // v15p3dn (2026-05-16): both providers now have the same
+            // semantic — release stops capturing audio, waits for the
+            // response to come back, then auto-closes the session.
+            // Gemini's version was added in v15p3dn so this can route
+            // symmetrically; the previous direct endSession was killing
+            // the WebSocket before Sulafat had time to respond.
+            if marinUsingGemini {
+                geminiRealtimeManager?.handleHotkeyRelease()
+            } else {
+                realtimeManager?.handleHotkeyRelease()
+            }
 
         case .none:
             break
         }
+    }
+
+    /// v15p3gv (2026-05-18): lazily create the advance-input monitor
+    /// and start it. Idempotent — safe to call from refreshAllPermissions.
+    private func installMarinAdvanceInputMonitorIfNeeded() {
+        if marinAdvanceInputMonitor != nil { return }
+        let monitor = MouseSideButtonMonitor()
+        marinAdvanceInputMonitor = monitor
+        marinAdvanceInputCancellable = monitor.advanceTriggeredPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] trigger in
+                self?.handleMarinStepAdvance(trigger: trigger)
+            }
+        monitor.startMonitoring()
+        RealtimeConversationManager.appendDiag(
+            "[advance-input] monitor installed (side mouse buttons + caps lock)"
+        )
+    }
+
+    /// Send a silent "next step" turn to whichever Marin provider is
+    /// currently active. Captures a fresh screenshot under the hood so
+    /// the model can see what just changed on screen (Steph completed
+    /// a click) before generating the next instruction.
+    private func handleMarinStepAdvance(trigger: MouseSideButtonMonitor.AdvanceTrigger) {
+        let triggerLabel: String = {
+            switch trigger {
+            case .middleMouseButton:
+                return "middle-mouse-button"
+            case .leftCmdTap:
+                return "left-cmd-tap"
+            }
+        }()
+        // Cue text matches what Steph naturally says — short, neutral.
+        // The actual response is shaped by the GUIDANCE MODE rules in
+        // the system prompt (one step per reply, brief, etc.).
+        let cueText = "done with that step, what's next?"
+
+        if let gemini = geminiRealtimeManager, gemini.state.isActive {
+            RealtimeConversationManager.appendDiag(
+                "[advance-input] \(triggerLabel) → gemini.sendSilentAdvanceTurn"
+            )
+            gemini.sendSilentAdvanceTurn(cueText: cueText)
+            return
+        }
+        // Marin OpenAI Realtime provider doesn't have an equivalent
+        // silent-advance API yet — log and no-op so the trigger is
+        // discoverable but doesn't crash. Add the OpenAI side when
+        // Steph reports needing it (he's currently on Gemini Marin).
+        if let marin = realtimeManager, marin.state.isActive {
+            RealtimeConversationManager.appendDiag(
+                "[advance-input] \(triggerLabel) → marin-openai active but silent-advance not yet wired for OpenAI provider; no-op"
+            )
+            return
+        }
+        RealtimeConversationManager.appendDiag(
+            "[advance-input] \(triggerLabel) fired but no Marin session active — should have been gated, race?"
+        )
     }
 
     private func bindRealtimeManagerState() {
@@ -2963,6 +4223,9 @@ final class CompanionManager: ObservableObject {
                     RealtimeConversationManager.appendDiag(
                         "isRealtimeModeActive flip: \(priorActive) → \(state.isActive) (state=\(state))"
                     )
+                    // v15p3gv (2026-05-18): same advance-gate flip the
+                    // Gemini path does — see bindGeminiRealtimeManagerState.
+                    MouseSideButtonMonitor.setMarinActive(state.isActive)
                 }
                 if !state.isActive {
                     self.scheduleTransientHideIfNeeded()
@@ -3009,6 +4272,122 @@ final class CompanionManager: ObservableObject {
             .sink { [weak self] turns in
                 self?.realtimeCompletedTurns = turns
             }
+        // v15p3fa (2026-05-17): mirror Marin output level so overlay
+        // can tell when she's audibly speaking (vs just generating).
+        realtimeOutputAudioLevelCancellable = manager.$outputAudioLevel
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] rms in
+                self?.realtimeOutputAudioLevel = CGFloat(min(max(rms, 0), 1))
+            }
+    }
+
+    /// v15p3di (2026-05-16): mirror Gemini manager state onto the same
+    /// CompanionManager properties the OpenAI binding writes to, so the
+    /// indicator UI, hotkey logic, and other observers stay
+    /// provider-agnostic. Only state + inputAudioLevel are bound — v1
+    /// Gemini path doesn't emit transcripts or completedTurns. Empty
+    /// transcripts are acceptable; the overlay just won't show them.
+    private func bindGeminiRealtimeManagerState() {
+        guard let manager = geminiRealtimeManager else { return }
+        geminiRealtimeManagerStateCancellable = manager.$state
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                guard let self else { return }
+                let priorActive = self.isRealtimeModeActive
+                self.isRealtimeModeActive = state.isActive
+                self.realtimeSessionState = state
+                if priorActive != state.isActive {
+                    RealtimeConversationManager.appendDiag(
+                        "[gemini] isRealtimeModeActive flip: \(priorActive) → \(state.isActive) (state=\(state))"
+                    )
+                    // v15p3gv (2026-05-18): flip the side-button/caps-lock
+                    // advance gate. While Marin is active, those inputs
+                    // get consumed and advance the guidance flow. While
+                    // she's inactive, they pass through normally (caps
+                    // lock toggles, browser back/forward works).
+                    MouseSideButtonMonitor.setMarinActive(state.isActive)
+                }
+                if !state.isActive {
+                    self.scheduleTransientHideIfNeeded()
+                }
+            }
+        geminiRealtimeInputAudioLevelCancellable = manager.$inputAudioLevel
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] level in
+                guard let self else { return }
+                // v15p3fm (2026-05-17): PURE PASS-THROUGH. Manager
+                // already applied Buddy's full math chain (raw RMS
+                // × 10.2 boost, smoothed with prev * 0.72, dispatched
+                // to main). Mirrors how Buddy publishes its already-
+                // processed currentAudioPowerLevel directly. Removing
+                // the double-smooth + double-boost that was happening
+                // here was Audit Fix #1 + #2 — gave us a different
+                // temporal shape than Buddy's halo.
+                self.realtimeInputAudioLevel = CGFloat(level)
+            }
+        // v15p3fa (2026-05-17): also mirror output level — overlay
+        // uses this to detect "Marin is audibly speaking right now"
+        // and hide the static spinner in favor of audio-reactive dot.
+        //
+        // v15p3fg (2026-05-17): also drive realtimeInputAudioLevel
+        // from output while Marin is audibly speaking — so the halo
+        // modulates with her voice instead of going dead during her
+        // speech. Uses a moderate 3x boost (vs 7x for user speech)
+        // because her TTS audio is generally louder than raw mic
+        // and we want subtle modulation, not maxed-out flares.
+        geminiOutputAudioLevelCancellable = manager.$outputAudioLevel
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] rms in
+                guard let self else { return }
+                self.realtimeOutputAudioLevel = CGFloat(min(max(rms, 0), 1))
+                if self.realtimeMarinAudioStarted {
+                    // v15p3fn (2026-05-17): drop output boost from 4.0
+                    // → 1.5. At 4.0, RMS of 0.25 (typical TTS) was
+                    //  pinning halo at 1.0 ceiling — looked "way too
+                    // large AND frozen" because max() smoothing can't
+                    // decay while boosted stays saturated. At 1.5x,
+                    // RMS 0.1-0.25 → boosted 0.15-0.375 → halo lives
+                    // in modulatable range and tracks her voice
+                    // chunk-to-chunk variation visibly.
+                    let boosted = CGFloat(min(max(rms * 1.5, 0), 1))
+                    let smoothed = max(boosted, self.realtimeInputAudioLevel * 0.72)
+                    self.realtimeInputAudioLevel = smoothed
+                }
+            }
+        // v15p3ff (2026-05-17): bind the sticky audio-started flag.
+        geminiMarinAudioStartedCancellable = manager.$marinAudioStartedThisTurn
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] started in
+                self?.realtimeMarinAudioStarted = started
+            }
+    }
+
+    /// v15p3di (2026-05-16): dispatch helpers. All call sites that
+    /// previously poked at `realtimeManager` directly should route
+    /// through these so the active-provider toggle works at runtime
+    /// without restart.
+    private func startActiveRealtimeManager() {
+        if marinUsingGemini {
+            if geminiRealtimeManager == nil {
+                geminiRealtimeManager = GeminiRealtimeConversationManager()
+                bindGeminiRealtimeManagerState()
+            }
+            geminiRealtimeManager?.startSession()
+        } else {
+            if realtimeManager == nil {
+                realtimeManager = RealtimeConversationManager()
+                bindRealtimeManagerState()
+            }
+            realtimeManager?.startSession()
+        }
+    }
+
+    private func endActiveRealtimeManager() {
+        if marinUsingGemini {
+            geminiRealtimeManager?.endSession()
+        } else {
+            realtimeManager?.endSession()
+        }
     }
 
     /// v15p2 (2026-05-02): handle Fn+Cmd+Opt toggle press.
@@ -3052,22 +4431,36 @@ final class CompanionManager: ObservableObject {
             currentResponseTask?.cancel()
             ttsClient.stopPlayback()
 
-            if realtimeManager == nil {
-                realtimeManager = RealtimeConversationManager()
-                bindRealtimeManagerState()
-            }
             // Set magenta indicator immediately.
             isRealtimeModeActive = true
-            // Start the session in continuous mode (or upgrade existing
-            // session to continuous mode).
-            realtimeManager?.engageContinuousListening()
+            // v15p3ez (2026-05-17): engage cue + initial halo flare
+            // on this toggle path too. Was missing here as well as
+            // the double-tap path.
+            ClickySoundEngine.shared.play(.marinEngage)
+            triggerInitialHaloFlare()
+            // v15p3ed (2026-05-16): dispatch to active provider so
+            // Gemini gets hands-free parity with Marin.
+            if marinUsingGemini {
+                if geminiRealtimeManager == nil {
+                    geminiRealtimeManager = GeminiRealtimeConversationManager()
+                    bindGeminiRealtimeManagerState()
+                }
+                geminiRealtimeManager?.engageContinuousListening()
+            } else {
+                if realtimeManager == nil {
+                    realtimeManager = RealtimeConversationManager()
+                    bindRealtimeManagerState()
+                }
+                realtimeManager?.engageContinuousListening()
+            }
         } else {
-            // Toggle going OFF.
+            // Toggle going OFF — disengage whichever provider is live.
             if let manager = realtimeManager, manager.state.isActive {
                 manager.disengageContinuousListening()
-                // Also end the session — turning hands-free off is
-                // typically "we're done with the tutorial".
                 manager.endSession()
+            }
+            if let gemini = geminiRealtimeManager, gemini.state.isActive {
+                gemini.disengageContinuousListening()
             }
         }
 
@@ -3085,6 +4478,9 @@ final class CompanionManager: ObservableObject {
             guard !showOnboardingVideo else { return }
             // Don't double-fire if a polish call is already in flight.
             guard pendingPolishCommandTask == nil else { return }
+
+            // v15p3cu (2026-05-14): polish start sound cue.
+            ClickySoundEngine.shared.play(.polishStart)
 
             polishHotkeyPressedAt = Date()
             isPolishHotkeyHeld = true
@@ -3314,12 +4710,36 @@ final class CompanionManager: ObservableObject {
                     contextImageJPEG: screenshotJPEG,
                     intent: isFormatResponseIntent ? "format-response" : nil
                 )
-                let polishedText = detailed.output
+                let rawPolishedText = detailed.output
                 let networkCompletedAt = Date()
 
                 guard !Task.isCancelled else { return }
 
+                // v15p3bh (2026-05-12): preamble-strip guard. The
+                // polishSystemPrompt says "Return ONLY the revised text.
+                // No preamble..." but Sonnet occasionally violates with
+                // "Here's the polished text:" / "I'll polish this:" /
+                // similar lead-ins. Strip these client-side so the
+                // paste only contains the actual polished output.
+                // Pattern: optional intro phrase + colon + optional
+                // newlines at the very start of the response.
+                let polishedText = Self.stripPolishPreamble(rawPolishedText)
+
                 let trimmedPolishedText = polishedText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                // v15p3bh diag: log every polish output so we can see
+                // when the model returns identical-to-input (no-op),
+                // when it leaks reasoning, and what the preamble strip
+                // changed. Critical for debugging the "polish did nothing"
+                // reports — at-a-glance diff between input and output.
+                Self.appendPolishOutputDiag(
+                    modifier: modifier,
+                    intent: isFormatResponseIntent ? "format-response" : "default",
+                    input: textToPolish,
+                    rawOutput: rawPolishedText,
+                    cleanedOutput: trimmedPolishedText
+                )
+
                 guard !trimmedPolishedText.isEmpty else {
                     print("⚠️ Polish: Worker returned empty output; leaving field unchanged")
                     return
@@ -3327,16 +4747,22 @@ final class CompanionManager: ObservableObject {
 
                 ClickyAnalytics.trackAIResponseReceived(response: trimmedPolishedText)
 
-                // v12n (2026-04-28): em-dash strip belt-and-suspenders. The
-                // Worker's preserve-mode prompt now bans em-dashes, but
-                // model output isn't perfectly deterministic — strip any
-                // that slipped through here so the user never sees one.
-                // Same regex as stripVoiceToTextArtifacts: collapse
-                // `[ \t]*[—–][ \t]*` to a single space so word boundaries
-                // are preserved (avoids "pulls— Total" → "pullsTotal").
+                // v12n (2026-04-28): em-dash strip belt-and-suspenders.
+                // v15p3bh (2026-05-12): replacement changed from " " to
+                // ", " because the previous version was eating sentence
+                // boundaries. Example before fix:
+                //   model output: "Testing polish mode — things look good."
+                //   after strip:  "Testing polish mode things look good."
+                //                  ^^^ run-on, missing punctuation
+                // After fix:      "Testing polish mode, things look good."
+                // A comma is a much better default than a space — it
+                // preserves the pause/clause-break semantics of the
+                // em-dash, never produces a run-on, and downstream
+                // double-space collapsing still cleans up "pulls— Total"
+                // → "pulls, Total" (vs old " pulls Total" via single space).
                 let dashStripped = polishedText.replacingOccurrences(
                     of: #"[ \t]*[—–][ \t]*"#,
-                    with: " ",
+                    with: ", ",
                     options: .regularExpression
                 )
                 let collapsedSpaces = Self.collapseHorizontalDoubleSpaces(dashStripped)
@@ -3956,6 +5382,119 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    // MARK: - Polish output diag log (v15p3bh, 2026-05-12)
+    //
+    // Separate from polish_timing because it captures CONTENT, not
+    // latency. Goal: see at-a-glance when polish returned identical-
+    // to-input text (no-op), when the model leaked a preamble or
+    // reasoning, and what the client-side strip did about it.
+
+    private static let polishOutputDiagLogPath = "/tmp/clicky_polish_output.log"
+    private static let polishOutputDiagLogQueue = DispatchQueue(
+        label: "com.stephenpierson.clickyplus.polish-output-diag"
+    )
+
+    private static func appendPolishOutputDiag(
+        modifier: String?,
+        intent: String,
+        input: String,
+        rawOutput: String,
+        cleanedOutput: String
+    ) {
+        polishOutputDiagLogQueue.async {
+            let formatter = ISO8601DateFormatter()
+            let preambleStripped = rawOutput.count != cleanedOutput.count
+                || rawOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    != cleanedOutput
+            let noOp = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                == cleanedOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+            let escape: (String) -> String = { s in
+                s.replacingOccurrences(of: "\n", with: "\\n")
+                 .replacingOccurrences(of: "\r", with: "")
+            }
+            let preview = escape(String(cleanedOutput.prefix(160)))
+            let inputPreview = escape(String(input.prefix(160)))
+            let mod = modifier?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let line = [
+                formatter.string(from: Date()),
+                "intent=\(intent)",
+                "modifier=\"\(escape(mod))\"",
+                "inLen=\(input.count)",
+                "outLen=\(cleanedOutput.count)",
+                "noOp=\(noOp)",
+                "preambleStripped=\(preambleStripped)",
+                "in=\"\(inputPreview)\"",
+                "out=\"\(preview)\"",
+            ].joined(separator: " | ") + "\n"
+            guard let data = line.data(using: .utf8) else { return }
+            let url = URL(fileURLWithPath: polishOutputDiagLogPath)
+            if FileManager.default.fileExists(atPath: polishOutputDiagLogPath) {
+                if let handle = try? FileHandle(forWritingTo: url) {
+                    defer { try? handle.close() }
+                    try? handle.seekToEnd()
+                    try? handle.write(contentsOf: data)
+                }
+            } else {
+                try? data.write(to: url)
+            }
+        }
+    }
+
+    /// v15p3bh (2026-05-12): strip common reasoning/preamble prefixes
+    /// from polish output. The polishSystemPrompt forbids preambles
+    /// ("Return ONLY the revised text. No preamble..."), but model
+    /// output isn't perfectly compliant — occasionally we get
+    /// "Here's the polished text:\n\n<actual output>" or similar.
+    ///
+    /// Strategy: look for a small list of well-known preamble phrasings
+    /// at the very start of the response, optionally followed by a
+    /// colon and one or more newlines, and strip them. Conservative —
+    /// only strips when the match is unambiguous (must be at start,
+    /// must include a colon or newline boundary).
+    ///
+    /// If no pattern matches, returns the input unchanged.
+    static func stripPolishPreamble(_ raw: String) -> String {
+        let leading = raw.drop(while: { $0.isNewline || $0 == " " || $0 == "\t" })
+        let lower = leading.lowercased()
+        let patterns: [String] = [
+            "here's the polished text:",
+            "here's the polished version:",
+            "here is the polished text:",
+            "here is the polished version:",
+            "here's the revised text:",
+            "here's the revised version:",
+            "here is the revised text:",
+            "here is the revised version:",
+            "here's the polished response:",
+            "here is the polished response:",
+            "here's the polish:",
+            "here is the polish:",
+            "polished text:",
+            "polished version:",
+            "revised text:",
+            "revised:",
+            "i'll polish this:",
+            "i'll polish this for you:",
+            "i'll revise this:",
+            "let me polish this:",
+            "let me revise this:",
+            "sure, here's the polished text:",
+            "sure! here's the polished text:",
+            "sure, here it is:",
+            "okay, here it is:",
+        ]
+        for pattern in patterns {
+            if lower.hasPrefix(pattern) {
+                // Strip the matched prefix plus any leading newlines/whitespace
+                // that followed it.
+                let stripped = leading.dropFirst(pattern.count)
+                let cleaned = stripped.drop(while: { $0.isNewline || $0 == " " || $0 == "\t" })
+                return String(cleaned)
+            }
+        }
+        return raw
+    }
+
     /// Appends the raw transcript to the user's Obsidian Idea Inbox.
     /// Format: `- YYYY-MM-DD — [?] <transcript>\n`. Empty transcripts
     /// are dropped so a mis-triggered hotkey can't fill the inbox with
@@ -4128,7 +5667,8 @@ final class CompanionManager: ObservableObject {
                 do {
                     punctuatedText = try await Self.repunctuateTextViaWorker(
                         workerBaseURL: workerBaseURL,
-                        rawText: preSubstitutedText
+                        rawText: preSubstitutedText,
+                        appName: focusedContext?.appName
                     )
                     repunctuateSkipped = false
                     print("✏️ Repunctuate: \(preSubstitutedText.count) chars → \(punctuatedText.count) chars")
@@ -4231,15 +5771,37 @@ final class CompanionManager: ObservableObject {
                 let style = UserDefaults.standard.string(forKey: "clicky.cursorIndicatorStyle") ?? "triangle"
                 let mode = polishAfterRepunctuate ? "toggle" : "hold"
                 let words = finalPayload.split(whereSeparator: { $0.isWhitespace }).count
+                // v15p4bt (2026-05-29): tag each line with the active
+                // VTT provider so head-to-head A/B can be sliced via
+                // `grep "provider=parakeet" /tmp/clicky_vtt_timing.log`
+                // instead of guessing by timestamp window.
                 Self.appendVTTTimingDiag(
-                    "indicator=\(style) mode=\(mode) chars=\(finalPayload.count) words=\(words) " +
+                    "provider=\(selectedVTTProvider) indicator=\(style) mode=\(mode) chars=\(finalPayload.count) words=\(words) " +
                     "setupMs=\(setupMs) repunctuateMs=\(repunctuateMs) polishMs=\(polishMs) finalizeMs=\(finalizeMs) totalMs=\(totalMs) " +
                     "repunctuateSkipped=\(repunctuateSkipped)"
                 )
                 Self.lastVTTReleaseTimestamp = nil
             }
 
-            await Self.typeTextViaClipboard(finalPayload)
+            // v15p4cl (2026-05-30): name correction (alias + phonetic)
+            // now runs for EVERY provider, not just Parakeet — apply it
+            // to the final text before paste. Idempotent, so Parakeet
+            // (which already ran it in its own post-process) is unaffected.
+            let correctedPayload = ParakeetStreamingTranscriptionSession.correctNames(finalPayload)
+            // v15p4ck: capture final text per-provider for engine A/B.
+            Self.appendVTTOutputDiag(provider: selectedVTTProvider, text: correctedPayload)
+            await Self.typeTextViaClipboard(correctedPayload)
+
+            // v15p3cu (2026-05-14): VTT success sound cue — fires only
+            // after the clipboard paste actually completes, so Steph
+            // hears the chime when the text has truly landed.
+            await MainActor.run {
+                if polishAfterRepunctuate {
+                    ClickySoundEngine.shared.play(.polishDone)
+                } else {
+                    ClickySoundEngine.shared.play(.vttSuccess)
+                }
+            }
 
             ClickyAnalytics.trackAIResponseReceived(response: finalPayload)
 
@@ -4303,9 +5865,16 @@ final class CompanionManager: ObservableObject {
     /// POST raw transcript text to the Worker's /repunctuate route.
     /// Returns the Haiku-punctuated text. Throws on transport / non-2xx.
     /// Caller is expected to fall back to raw text on failure.
+    ///
+    /// v15p3cs (2026-05-14): `appName` is now forwarded so the Worker
+    /// can choose between formal and casual prompt variants — colloquial
+    /// reductions ("wanna", "gonna", "kinda") get expanded to their full
+    /// forms by default, but preserved when the destination app is a
+    /// casual-messaging context (Messages, WhatsApp, etc.).
     private static func repunctuateTextViaWorker(
         workerBaseURL: String,
-        rawText: String
+        rawText: String,
+        appName: String?
     ) async throws -> String {
         guard let routeURL = URL(string: "\(workerBaseURL)/repunctuate") else {
             throw NSError(
@@ -4321,7 +5890,10 @@ final class CompanionManager: ObservableObject {
         // slower than 6s something's wrong; better to fall back to raw
         // than make Steph wait 30s for a paste.
         request.timeoutInterval = 6
-        let body: [String: Any] = ["text": rawText]
+        var body: [String: Any] = ["text": rawText]
+        if let appName, !appName.isEmpty {
+            body["appName"] = appName
+        }
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let (responseData, response) = try await URLSession.shared.data(for: request)
@@ -4761,12 +6333,25 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Pastes the most recent assistant response from `conversationHistory`
-    /// into the focused field. If history is empty, speaks a brief notice
-    /// via system TTS. Used by the "show last response" typing-mode command.
+    /// Pastes the most recent assistant response into the focused field.
+    /// v15p3hh (2026-05-19): repointed from base PTT's `conversationHistory`
+    /// (now stale — base PTT was retired) to Marin's live shared history
+    /// at `~/Library/Application Support/com.stephenpierson.clickyplus/
+    /// marin-conversation-history.json`. Both Gemini Marin and OpenAI Marin
+    /// write to that file, so "dictate last" / "show last response" /
+    /// "paste last response" / etc. now reflect what Marin actually just
+    /// said in voice — which is what Steph wants. Uses .iso8601 date
+    /// decoding to match the encoder (default seconds-since-1970 fails
+    /// silently on the file's ISO timestamps).
     private func pasteLastAssistantResponse() {
-        guard let lastEntry = conversationHistory.last else {
-            print("ℹ️ Show last response: no history yet")
+        let responseText = Self.loadLatestMarinAssistantTurn()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        RealtimeConversationManager.appendDiag(
+            "[paste-last] loaded Marin assistant chars=\(responseText.count) preview=\"\(responseText.prefix(100))\""
+        )
+
+        guard !responseText.isEmpty else {
+            RealtimeConversationManager.appendDiag("[paste-last] empty result, speaking notice")
             let synthesizer = NSSpeechSynthesizer()
             synthesizer.startSpeaking("No prior response to show, Steph.")
             voiceState = .responding
@@ -4778,15 +6363,8 @@ final class CompanionManager: ObservableObject {
             }
             return
         }
-        let responseText = lastEntry.assistantResponse.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !responseText.isEmpty else {
-            print("ℹ️ Show last response: history entry was empty")
-            voiceState = .idle
-            scheduleTransientHideIfNeeded()
-            return
-        }
 
-        print("📋 Show last response: pasting \(responseText.count) chars")
+        RealtimeConversationManager.appendDiag("[paste-last] pasting \(responseText.count) chars")
         currentResponseTask?.cancel()
         currentResponseTask = Task { [weak self] in
             self?.voiceState = .processing
@@ -4843,16 +6421,20 @@ final class CompanionManager: ObservableObject {
 
         // Em-dash / en-dash strip. v12l (2026-04-28): replace any em-dash
         // (and en-dash) with a single space, regardless of surrounding
-        // whitespace. The earlier literal-string strip ("— " → "") was
-        // eating the trailing space too, joining "pulls— Total" into
-        // "pullsTotal". Regex preserves word boundaries.
+        // whitespace.
+        // v15p3bh (2026-05-12): replacement changed from " " to ", " —
+        // single space was destroying sentence boundaries when AssemblyAI
+        // emitted em-dashes for speech pauses between clauses. A comma
+        // preserves the pause semantics and never produces run-ons.
+        // Subsequent double-space collapse still cleans "pulls— Total"
+        // → "pulls, Total" (vs old "pulls Total" via space).
         //
         // Uses [ \t]* (horizontal whitespace) NOT \s* so we don't
         // accidentally eat newlines from spoken-punctuation paragraph
         // breaks adjacent to a dash.
         cleaned = cleaned.replacingOccurrences(
             of: #"[ \t]*[—–][ \t]*"#,
-            with: " ",
+            with: ", ",
             options: .regularExpression
         )
 
@@ -5305,11 +6887,24 @@ final class CompanionManager: ObservableObject {
             return
         }
 
-        // v11l: dictate prefix and "dictate last" recovery removed —
-        // VTT toggle (double-tap Ctrl) now serves the long-form raw-or-
-        // polished dictation use case, making "dictate" prefix redundant
-        // and a footgun (e.g. "dictate last response" was being parsed
-        // as the prefix instead of the show-last-response command).
+        // v15p3hh (2026-05-19): the "dictate last" / "show last response"
+        // phrase intercept is owned by `isShowLastResponseCommand` at the
+        // call site upstream (sendTypingQueryToClaude's caller). That path
+        // calls `pasteLastAssistantResponse`, which v15p3hh repoints to
+        // Marin's live shared history. So we don't need a second dispatch
+        // here. Earlier v15p3hc–hg attempts to add one were redundant and
+        // never fired because the v11k intercept matched first. Keeping
+        // the dispatch-diag line so we can confirm typing-mode reaches
+        // this function on every call.
+        RealtimeConversationManager.appendDiag(
+            "[typing-dispatch] rawTranscript=\"\(trimmedRawTranscript.prefix(120))\""
+        )
+
+        // v11l: dictate prefix removed — VTT toggle (double-tap Ctrl)
+        // now serves the long-form raw-or-polished dictation use case,
+        // making "dictate" prefix redundant and a footgun (e.g.
+        // "dictate last response" was being parsed as the prefix instead
+        // of the show-last-response command).
         let trimmed = trimmedRawTranscript
 
         guard !trimmed.isEmpty else {
@@ -5461,6 +7056,52 @@ final class CompanionManager: ObservableObject {
         "dictate that"
     ]
 
+    /// v15p3hb (2026-05-18): minimal mirror of
+    /// `GeminiRealtimeConversationManager.SharedMarinHistoryEntry`.
+    /// Schema is intentionally simple (timestamp/user/assistant) so the
+    /// CompanionManager can read the file without depending on the
+    /// realtime managers' private types.
+    private struct SharedMarinHistoryEntryForDictateLast: Decodable {
+        let timestamp: Date
+        let user: String
+        let assistant: String
+    }
+
+    /// Returns the most recent `assistant` text from the shared Marin
+    /// conversation history file, or an empty string on any miss
+    /// (file missing, parse error, empty array, latest entry has no
+    /// assistant text). Reads from disk every call — the file is at
+    /// most a few KB, and "show last response" is invoked rarely.
+    /// v15p3hh (2026-05-19): switched to `.iso8601` date decoding to
+    /// match Gemini's encoder. Default seconds-since-1970 strategy
+    /// failed silently on the file's ISO8601 timestamps, returning
+    /// an empty array — making the whole function a silent no-op.
+    private static func loadLatestMarinAssistantTurn() -> String {
+        let fm = FileManager.default
+        guard let appSupport = fm.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else { return "" }
+        let url = appSupport
+            .appendingPathComponent("com.stephenpierson.clickyplus", isDirectory: true)
+            .appendingPathComponent("marin-conversation-history.json")
+        guard let data = try? Data(contentsOf: url) else { return "" }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let entries = try? decoder.decode(
+            [SharedMarinHistoryEntryForDictateLast].self, from: data
+        ) else { return "" }
+        // Entries are appended chronologically; the latest is at the
+        // end. Walk back to find the first entry with non-empty
+        // assistant text (skip seed/empty rows).
+        for entry in entries.reversed() {
+            let candidate = entry.assistant
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !candidate.isEmpty { return candidate }
+        }
+        return ""
+    }
+
     /// Returns true if the trimmed transcript matches a recovery phrase.
     /// Strips a single trailing terminal punctuation mark (period, comma,
     /// exclamation, question mark) before comparison so AssemblyAI's
@@ -5478,18 +7119,25 @@ final class CompanionManager: ObservableObject {
         return dictateLastRecoveryPhrases.contains(normalizedForMatching)
     }
 
-    /// Run the full "undo + redo as dictate" recovery flow. Cmd+Z to
-    /// undo whatever was just pasted, then look up the most recent
-    /// spoken request from the rolling buffer and route it through the
-    /// dictate-mode pipeline so the field ends up with the polished
-    /// transcription of what Steph originally meant to dictate.
+    /// v15p3hb (2026-05-18): repurposed. The phrase now pastes the most
+    /// recent thing **Marin** said, pulled from the shared conversation
+    /// history file that both the Gemini and OpenAI Realtime providers
+    /// persist to (`marin-conversation-history.json`). The original
+    /// "undo previous typing-mode paste and redo as dictate" behavior
+    /// was retired — Steph wasn't using it, and the trigger phrase
+    /// reads more naturally as "give me what Marin just said in text."
     private func handleDictateLastRecovery() {
-        guard let mostRecentSpokenPromptToRedoAsDictation = Self.recentTypingRequests.first else {
-            // Nothing in the buffer — silent no-op. The most likely
-            // cause is that the previous typing-mode call was itself
-            // dictate intent (which doesn't get added to the buffer)
-            // or the app just relaunched.
-            print("⚠️ Dictate-last recovery: no recent typing request in buffer")
+        let latestMarinTurnText = Self.loadLatestMarinAssistantTurn()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // v15p3hg (2026-05-19): persistent diag so we can confirm
+        // what got read from marin-conversation-history.json and
+        // what got pasted.
+        RealtimeConversationManager.appendDiag(
+            "[dictate-last] loaded latestMarinTurn chars=\(latestMarinTurnText.count) preview=\"\(latestMarinTurnText.prefix(100))\""
+        )
+
+        guard !latestMarinTurnText.isEmpty else {
+            RealtimeConversationManager.appendDiag("[dictate-last] empty result, bailing")
             voiceState = .idle
             scheduleTransientHideIfNeeded()
             return
@@ -5500,92 +7148,8 @@ final class CompanionManager: ObservableObject {
 
         currentResponseTask = Task {
             voiceState = .processing
-
-            // Step 1: undo the previous paste. Synchronous Cmd+Z;
-            // give the destination app ~120ms to process the undo
-            // before we kick off the new paste.
-            Self.synthesizeCommandZ()
-            try? await Task.sleep(nanoseconds: 120_000_000)
-
-            // Step 2: re-capture screen + AX context fresh. The state
-            // captured during the original typing-mode press has been
-            // cleared, and the user's focus could've moved. Recapturing
-            // also means dictate's tone-matching uses the field as it
-            // is now (post-undo), not as it was at the original press.
-            let recoveryFocusedContext = FocusedElementContextProvider.capture()
-            let recoveryScreenshot: CompanionScreenCapture?
-            do {
-                let captures = try await CompanionScreenCaptureUtility.captureAllScreensAsJPEG()
-                recoveryScreenshot = captures.first(where: { $0.label.localizedCaseInsensitiveContains("primary") })
-                    ?? captures.first
-            } catch {
-                print("⚠️ Dictate-last recovery: screenshot recapture failed (\(error)) — proceeding without")
-                recoveryScreenshot = nil
-            }
-
-            // Step 3: route the previous spoken prompt through the
-            // dictate-mode pipeline. Build the same image payload +
-            // typing-prompt structure, but force isDictateIntent = true
-            // so the dictate system prompt is used.
-            let annotatedRecoveryScreenshot: CompanionScreenCapture? = {
-                guard let shot = recoveryScreenshot else { return nil }
-                guard let axFrame = recoveryFocusedContext?.elementFrameInAXCoords else {
-                    return shot
-                }
-                return CompanionScreenshotAnnotator.addFocusBoundingBox(
-                    to: shot,
-                    axFrame: axFrame
-                )
-            }()
-
-            let labeledImages: [(data: Data, label: String)]
-            if let shot = annotatedRecoveryScreenshot {
-                let dims = " (image dimensions: \(shot.screenshotWidthInPixels)x\(shot.screenshotHeightInPixels) pixels)"
-                let boxHint = recoveryFocusedContext?.elementFrameInAXCoords != nil
-                    ? " — the green rectangle marks the text field the response will paste into"
-                    : ""
-                labeledImages = [(data: shot.imageData, label: "screen at time of recovery" + dims + boxHint)]
-            } else {
-                labeledImages = []
-            }
-
-            let recoveryPrompt = Self.buildTypingPrompt(
-                request: mostRecentSpokenPromptToRedoAsDictation,
-                context: recoveryFocusedContext,
-                isDictateIntent: true
-            )
-
-            do {
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
-                    images: labeledImages,
-                    systemPrompt: Self.typingModeDictateSystemPrompt,
-                    conversationHistory: [],
-                    userPrompt: recoveryPrompt,
-                    personalFacts: Self.loadCurrentObsidianMemoryContents(),
-                    onTextChunk: { _ in }
-                )
-
-                guard !Task.isCancelled else { return }
-
-                let cleanedRecoveryText = Self.parsePointingCoordinates(from: fullResponseText).spokenText
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-
-                ClickyAnalytics.trackAIResponseReceived(response: cleanedRecoveryText)
-
-                if !cleanedRecoveryText.isEmpty {
-                    await Self.typeTextViaClipboard(cleanedRecoveryText)
-                    // Don't add this back to recentTypingRequests —
-                    // it's a redo of an already-buffered prompt, not
-                    // a new prompt. Keeping the buffer pointing at the
-                    // ORIGINAL means a second "dictate last" still
-                    // works against the same source utterance.
-                }
-            } catch is CancellationError {
-                // User moved on — silent drop.
-            } catch {
-                ClickyAnalytics.trackResponseError(error: error.localizedDescription)
-                print("⚠️ Dictate-last recovery error: \(error)")
-            }
+            await Self.typeTextViaClipboard(latestMarinTurnText)
+            ClickyAnalytics.trackAIResponseReceived(response: latestMarinTurnText)
 
             if !Task.isCancelled {
                 voiceState = .idle
@@ -5838,6 +7402,30 @@ final class CompanionManager: ObservableObject {
     // restores the original clipboard after a short delay so the paste
     // has a chance to land before the pasteboard flips back.
 
+    /// v15p4ch (2026-05-30): cache of bundleID → isElectron so the
+    /// filesystem probe runs once per app, not on every paste.
+    private static var electronAppCache: [String: Bool] = [:]
+
+    /// Reliable Electron detection: Electron apps bundle
+    /// "Electron Framework.framework". Covers Cowork
+    /// (com.anthropic.claudefordesktop), Slack, Discord, VS Code, etc.
+    /// without hard-coding bundle IDs. Cached per bundleID.
+    @MainActor
+    private static func frontmostAppIsElectron() -> Bool {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return false }
+        let key = app.bundleIdentifier ?? app.bundleURL?.path ?? ""
+        if let cached = electronAppCache[key] { return cached }
+        var result = false
+        if let url = app.bundleURL {
+            let fw = url.appendingPathComponent(
+                "Contents/Frameworks/Electron Framework.framework"
+            )
+            result = FileManager.default.fileExists(atPath: fw.path)
+        }
+        electronAppCache[key] = result
+        return result
+    }
+
     /// Places `text` on the clipboard, simulates Cmd+V to paste it into
     /// whatever view has focus, then restores the previous clipboard
     /// contents. Runs entirely on the main actor because NSPasteboard
@@ -5860,13 +7448,21 @@ final class CompanionManager: ObservableObject {
         // Tunable via UserDefaults `clicky.prePasteLatchMs` (default 30,
         // clamped 0...500) so we can A/B if 30ms turns out too tight
         // for any app without rebuilding.
-        let prePasteLatchMs = max(0, min(500,
-            UserDefaults.standard.object(forKey: "clicky.prePasteLatchMs") as? Int ?? 30
-        ))
+        // v15p4ch (2026-05-30): Electron/Chromium apps (Cowork, Slack,
+        // Discord, VS Code) are slow to register a freshly-written
+        // clipboard before a synthetic Cmd+V — the 30ms default raced
+        // and silently dropped pastes into Cowork (the chime still
+        // played, so it looked like a clean transcript just vanished).
+        // Use a longer latch when the frontmost app is Electron.
+        let isElectronTarget = Self.frontmostAppIsElectron()
+        let defaultLatch = isElectronTarget
+            ? (UserDefaults.standard.object(forKey: "clicky.prePasteLatchMsElectron") as? Int ?? 110)
+            : (UserDefaults.standard.object(forKey: "clicky.prePasteLatchMs") as? Int ?? 30)
+        let prePasteLatchMs = max(0, min(500, defaultLatch))
         if prePasteLatchMs > 0 {
             try? await Task.sleep(nanoseconds: UInt64(prePasteLatchMs) * 1_000_000)
         }
-        synthesizeCommandV()
+        await synthesizeCommandV()
 
         // Wait for the paste to land.
         // VTT-SPEED Tier 1 (v15m, 2026-05-01): tightened 400ms → 150ms.
@@ -5901,7 +7497,7 @@ final class CompanionManager: ObservableObject {
     /// Synthesize a Cmd+V key down + key up to paste. Uses CGEvent so it
     /// works against whatever app currently has keyboard focus.
     @MainActor
-    private static func synthesizeCommandV() {
+    private static func synthesizeCommandV() async {
         let source = CGEventSource(stateID: .combinedSessionState)
         // Virtual key code 9 = 'v' on US layouts. Paste is a standard
         // shortcut across layouts because AppKit rewrites by semantic
@@ -5911,6 +7507,12 @@ final class CompanionManager: ObservableObject {
         let down = CGEvent(keyboardEventSource: source, virtualKey: keyVCode, keyDown: true)
         down?.flags = .maskCommand
         down?.post(tap: .cgAnnotatedSessionEventTap)
+
+        // v15p4ch (2026-05-30): brief gap between key-down and key-up.
+        // Chromium/Electron (Cowork) intermittently drops a synthetic
+        // Cmd+V posted as a zero-duration chord; a ~12ms hold makes the
+        // keystroke register reliably. Negligible perceived latency.
+        try? await Task.sleep(nanoseconds: 12_000_000)
 
         let up = CGEvent(keyboardEventSource: source, virtualKey: keyVCode, keyDown: false)
         up?.flags = .maskCommand

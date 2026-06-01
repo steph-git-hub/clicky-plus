@@ -143,6 +143,134 @@ enum FocusedElementContextProvider {
         return context
     }
 
+    /// v15p3cn (2026-05-13): Marin Vision Option B — capture the AX
+    /// element AT the cursor position (not the focused element). Used
+    /// by Marin's vision path to tell her exactly what UI element the
+    /// user is hovering over, regardless of which element has keyboard
+    /// focus. Mirrors Google DeepMind's "HOVERING: <element_id>" pattern
+    /// in their Gemini AI cursor demo.
+    ///
+    /// Uses AXUIElementCopyElementAtPosition with the system-wide
+    /// AX element as the root — that finds the deepest accessibility
+    /// node at the given screen point, across any app. Coordinates are
+    /// in AX space (top-left origin, y-down, primary-anchored points).
+    ///
+    /// Returns nil if AX is disabled, the cursor isn't over any app
+    /// that exposes accessibility, or the lookup fails — caller falls
+    /// back to "screenshot only, no hover context."
+    @MainActor
+    static func captureAtCursor() -> FocusedElementContext? {
+        // Convert cursor position from AppKit (bottom-left) to AX
+        // (top-left, primary-anchored). The origin-zero NSScreen is
+        // the primary; AppKit y is measured from primary's bottom.
+        let mouseLocation = NSEvent.mouseLocation
+        let primaryScreen = NSScreen.screens.first(where: { $0.frame.origin == .zero })
+            ?? NSScreen.screens.first
+        guard let primaryHeight = primaryScreen?.frame.height else { return nil }
+        let axX = Float(mouseLocation.x)
+        let axY = Float(primaryHeight - mouseLocation.y)
+
+        // Ask AX for the deepest element at that point. Note this is
+        // the "leaf" — e.g., a specific button, not its parent group.
+        let systemElement = AXUIElementCreateSystemWide()
+        var elementRef: AXUIElement?
+        let result = AXUIElementCopyElementAtPosition(systemElement, axX, axY, &elementRef)
+        guard result == .success, let element = elementRef else {
+            return nil
+        }
+
+        // Pull the same attributes the focused-capture path reads, but
+        // from the element under the cursor. The frontmost app is
+        // typically the one being hovered (cursor over Chrome → Chrome
+        // is frontmost), but if not we still record it for context.
+        let frontApp = NSWorkspace.shared.frontmostApplication
+        let appName = frontApp?.localizedName
+
+        let role = copyAXStringAttribute(element, attribute: kAXRoleAttribute)
+        let roleDescription = copyAXStringAttribute(element, attribute: kAXRoleDescriptionAttribute)
+        // Try several common label attributes — different app frameworks
+        // (AppKit, Electron, Chrome, Safari) expose human-readable text
+        // under different keys.
+        let label = copyAXStringAttribute(element, attribute: kAXTitleAttribute)
+            ?? copyAXStringAttribute(element, attribute: kAXDescriptionAttribute)
+            ?? copyAXStringAttribute(element, attribute: "AXPlaceholderValue")
+            ?? copyAXStringAttribute(element, attribute: "AXIdentifier")
+
+        // The value of a text-bearing element is its content. Trim to
+        // the last ~200 chars to keep token cost bounded.
+        let recentText = copyAXStringAttribute(element, attribute: kAXValueAttribute)
+            .map { trimToSuffix($0, maxLength: recentTextCharLimit) }
+            .flatMap { $0.isEmpty ? nil : $0 }
+
+        // Walk up to the window for the containing-page/document
+        // context. This is the most reliable signal of "what page or
+        // document is this on" — e.g., the Chrome tab title.
+        let windowTitle = copyAXElementAttribute(element, attribute: kAXWindowAttribute)
+            .flatMap { copyAXStringAttribute($0, attribute: kAXTitleAttribute) }
+
+        let elementFrame = copyAXFrame(element)
+
+        return FocusedElementContext(
+            appName: appName,
+            role: role,
+            roleDescription: roleDescription,
+            label: label,
+            windowTitle: windowTitle,
+            recentText: recentText,
+            elementFrameInAXCoords: elementFrame
+        )
+    }
+
+    /// v15p3cn (2026-05-13): build a one-line human-readable summary
+    /// of what the cursor is over, suitable for inclusion in Marin's
+    /// prompt. Examples:
+    ///   "Hovering over: button labeled 'Discard Changes' in window
+    ///    'Marin Vision Benchmark'"
+    ///   "Hovering over: text 'Quantum mechanics predicts particle...'
+    ///    in window 'Marin Vision Benchmark'"
+    ///   "Hovering over: link 'Privacy Policy' on page 'X · Bookmarks'"
+    /// Returns nil if no useful info is available.
+    static func describeForHoverHint(_ context: FocusedElementContext) -> String? {
+        // Prefer a clean role name. AX roles come back as "AXButton",
+        // "AXTextField", "AXStaticText" etc. — strip the AX prefix and
+        // lowercase the remainder for readability.
+        let prettyRole: String? = {
+            guard let r = context.role else { return context.roleDescription }
+            let stripped = r.hasPrefix("AX") ? String(r.dropFirst(2)) : r
+            return stripped.lowercased()
+        }()
+
+        // Build the element description. Prefer label, fall back to a
+        // short snippet of the element's value/text content.
+        let elementText: String? = {
+            if let label = context.label, !label.isEmpty {
+                return "'\(label)'"
+            }
+            if let value = context.recentText, !value.isEmpty {
+                // Quote a short snippet so Marin can recognize text.
+                let snippet = value.count > 60 ? String(value.prefix(60)) + "…" : value
+                return "'\(snippet)'"
+            }
+            return nil
+        }()
+
+        var parts: [String] = []
+        if let role = prettyRole, let text = elementText {
+            parts.append("\(role) \(text)")
+        } else if let role = prettyRole {
+            parts.append(role)
+        } else if let text = elementText {
+            parts.append(text)
+        }
+        if let window = context.windowTitle, !window.isEmpty {
+            parts.append("in window '\(window)'")
+        } else if let app = context.appName, !app.isEmpty {
+            parts.append("in \(app)")
+        }
+        guard !parts.isEmpty else { return nil }
+        return "Hovering over: " + parts.joined(separator: " ")
+    }
+
     // MARK: - Low-level AX helpers
 
     /// Copy an arbitrary AX attribute. Returns nil if the attribute

@@ -202,12 +202,18 @@ struct BlueCursorView: View {
     /// The color used for the waveform + spinner right now. Encodes the
     /// current capture mode so the user has immediate visual feedback
     /// about what kind of interaction they triggered:
-    ///   cyan   → polish hotkey flash (⌃⌥⌘ or voice "polish") — brief
-    ///   yellow → capture-to-inbox mode (Fn+Opt)
-    ///   purple → voice-to-text mode (Fn+Shift), raw transcript pastes
-    ///   green  → typing mode (Fn+Cmd), Claude response pastes
-    ///   red    → burst mode (Fn+Shift+Opt), multi-frame capture
-    ///   blue   → normal push-to-talk voice
+    ///   cyan    → polish hotkey flash (⌃⌥⌘ or voice "polish") — brief
+    ///   yellow  → capture-to-inbox mode (Fn+Shift)
+    ///   purple  → Deepgram VTT mode (Fn+Ctrl), raw transcript pastes
+    ///   orange  → AssemblyAI VTT mode (Fn+Shift+Opt, fallback chord)
+    ///   green   → typing mode (Fn+Cmd), Claude response pastes
+    ///   red     → Watch mode (Fn+Opt), screen-frame streaming to Gemini
+    ///   magenta → Marin (Realtime/Gemini conversation)
+    ///   blue    → idle / default
+    /// v15p3fq (2026-05-17): red moved off the disabled burst mode and
+    /// onto the new Watch mode; AssemblyAI gets orange so it's distinct
+    /// from Deepgram purple even though they share the same downstream
+    /// paste pipeline.
     /// Polish flash takes precedence because it's a brief 250ms tap-fire
     /// confirmation; the other modes are sustained holds. Order matters
     /// only defensively — the shortcut layer already ensures the
@@ -218,20 +224,45 @@ struct BlueCursorView: View {
     /// becomes the universal indicator across idle/listening/processing
     /// states instead of swapping in the waveform/spinner views.
     private var dotModeForVoiceState: CursorPresenceDot.DotMode {
+        // v15p3fv (2026-05-17): Watch mode is always "listening" while
+        // the hotkey is held — frames are streaming, mic is open. We
+        // key off isVideoWatchModeActive directly instead of waiting
+        // for isRealtimeModeActive + realtimeSessionState=.listening
+        // to propagate through the binding (which can lag the press
+        // by a beat).
+        // v15p3fw (2026-05-17): during the post-release response phase
+        // (isVideoWatchResponseInFlight && !isVideoWatchModeActive),
+        // show the processing spinner. The dot stays red the whole
+        // time but the animation shifts from "listening halo" to
+        // "thinking spinner" so the user knows the model is generating.
+        if companionManager.isVideoWatchModeActive {
+            return .listening
+        }
+        if companionManager.isVideoWatchResponseInFlight {
+            return .processing
+        }
         // v15p3 (2026-05-06): bridge Realtime state into the dot
-        // indicator the same way `lineModeForVoiceState` does. Without
-        // this, the dot indicator stayed in `.idle` mode through every
-        // Realtime session because voiceState only tracks
-        // buddyDictationManager — Steph saw no listening / processing
-        // animation when Marin was active.
+        // indicator the same way `lineModeForVoiceState` does.
+        //
+        // v15p3ff (2026-05-17): use STICKY realtimeMarinAudioStarted
+        // flag (true from first audio chunk until turn end) instead
+        // of instantaneous output level. Spinner shows only during
+        // the thinking phase (state .responding, audio not yet
+        // started). Once audio starts, dot mode flips to .listening
+        // and stays there until turn ends. No oscillation because
+        // the flag doesn't flip back mid-turn.
         if companionManager.isRealtimeModeActive
             && !companionManager.isRealtimeSuspendedByOtherMode {
             switch companionManager.realtimeSessionState {
             case .listening:
                 return .listening
             case .responding:
-                return .processing
-            case .connecting, .idle, .errored:
+                return companionManager.realtimeMarinAudioStarted
+                    ? .listening
+                    : .processing
+            case .connecting:
+                return .listening
+            case .idle, .errored:
                 return .idle
             }
         }
@@ -251,6 +282,13 @@ struct BlueCursorView: View {
     /// AND the Realtime session state. Previously the waveform/spinner
     /// only reacted to voiceState — invisible across Realtime sessions.
     private var isListeningForIndicator: Bool {
+        // v15p3fv (2026-05-17): Watch mode is always listening during
+        // the hold. Same reason as dotModeForVoiceState — propagation
+        // lag through the realtime state binding can leave the
+        // indicator stuck idle for the first ~100ms.
+        if companionManager.isVideoWatchModeActive {
+            return true
+        }
         if companionManager.isRealtimeModeActive
             && !companionManager.isRealtimeSuspendedByOtherMode {
             return companionManager.realtimeSessionState == .listening
@@ -259,11 +297,17 @@ struct BlueCursorView: View {
     }
 
     private var isProcessingForIndicator: Bool {
+        // v15p3ff (2026-05-17): spinner shows only during the actual
+        // "loading" phase — state .responding AND audio hasn't
+        // started yet. Once first audio arrives, sticky flag flips
+        // and spinner hides for the rest of the turn. No oscillation.
         if companionManager.isRealtimeModeActive
             && !companionManager.isRealtimeSuspendedByOtherMode {
             switch companionManager.realtimeSessionState {
-            case .responding, .connecting:
-                return true
+            case .responding:
+                return !companionManager.realtimeMarinAudioStarted
+            case .connecting:
+                return false
             case .listening, .idle, .errored:
                 return false
             }
@@ -300,14 +344,21 @@ struct BlueCursorView: View {
         // tracks buddyDictationManager and stays .idle during Marin
         // sessions, which made the indicator a solid pink line with
         // no audio reactivity. This bridges the gap.
+        // v15p3ff (2026-05-17): same sticky-flag approach as dot mode.
+        // Hide processing visual once audio actually starts; flag
+        // doesn't flip back until turn end so no oscillation.
         if companionManager.isRealtimeModeActive
             && !companionManager.isRealtimeSuspendedByOtherMode {
             switch companionManager.realtimeSessionState {
             case .listening:
                 return .listening
             case .responding:
-                return .processing
-            case .connecting, .idle, .errored:
+                return companionManager.realtimeMarinAudioStarted
+                    ? .listening
+                    : .processing
+            case .connecting:
+                return .listening
+            case .idle, .errored:
                 return .idle
             }
         }
@@ -327,6 +378,13 @@ struct BlueCursorView: View {
     /// her input RMS. Otherwise fall back to the legacy
     /// buddyDictationManager level used by VTT/Typing/etc.
     private var indicatorAudioPowerLevel: CGFloat {
+        // v15p3fv (2026-05-17): Watch mode pipes mic audio through the
+        // Gemini manager, which publishes realtimeInputAudioLevel —
+        // same source the magenta Marin halo uses. Read it directly
+        // so the red watch halo modulates with the user's voice.
+        if companionManager.isVideoWatchModeActive {
+            return companionManager.realtimeInputAudioLevel
+        }
         if companionManager.isRealtimeModeActive
             && !companionManager.isRealtimeSuspendedByOtherMode {
             return companionManager.realtimeInputAudioLevel
@@ -348,7 +406,24 @@ struct BlueCursorView: View {
     private var currentCursorTint: Color {
         if companionManager.isPolishCommandFlashActive
             || companionManager.isPolishHotkeyModifierCaptureModeActive {
-            return DS.Colors.overlayCursorCyan
+            // v15p3gz (2026-05-18): swapped with Deepgram VTT (was cyan).
+            // Steph uses VTT more, prefers cyan for the high-frequency
+            // mode and purple for the rarer polish flash.
+            return DS.Colors.overlayCursorPurple
+        }
+        // v15p3fv (2026-05-17): Watch mode now wins OVER Marin's magenta.
+        // Watch opens a Gemini session, so isRealtimeModeActive ALSO
+        // becomes true during a watch hold — without this reorder,
+        // magenta would win and the red indicator would never show.
+        // v15p3fw (2026-05-17): also cover isVideoWatchResponseInFlight
+        // so the indicator stays red THROUGH the post-release response
+        // phase (1-2s while Gemini generates the description). Without
+        // this, isVideoWatchModeActive flipped false on release but
+        // isRealtimeModeActive stayed true (WS alive), so the cursor
+        // briefly flashed magenta between release and session close.
+        if companionManager.isVideoWatchModeActive
+            || companionManager.isVideoWatchResponseInFlight {
+            return DS.Colors.overlayCursorRed
         }
         // v15p3bb (2026-05-11): magenta whenever Marin is alive. Steph
         // explicitly wants visual confirmation Marin is listening even
@@ -365,20 +440,32 @@ struct BlueCursorView: View {
         if companionManager.isCaptureToInboxModeActive {
             return DS.Colors.overlayCursorYellow
         }
+        // v15p3fq (2026-05-17): AssemblyAI VTT moved from purple →
+        // orange. Steph wanted a visually distinct color from Deepgram
+        // (which took purple) so the active provider is obvious at a
+        // glance.
         if companionManager.isVoiceToTextModeActive {
-            return DS.Colors.overlayCursorPurple
+            return DS.Colors.overlayCursorOrange
         }
         if companionManager.isTypingModeActive {
             return DS.Colors.overlayCursorGreen
         }
+        // v15p3hx (2026-05-19): single VTT hotkey, color follows the
+        // selected provider — cyan for Deepgram, orange for AssemblyAI.
+        // The active-mode flag is still isVoiceToTextDeepgramModeActive
+        // because the hotkey wiring hasn't been renamed.
+        if companionManager.isVoiceToTextDeepgramModeActive {
+            switch companionManager.selectedVTTProvider {
+            case "assemblyai": return DS.Colors.overlayCursorOrange
+            default: return DS.Colors.overlayCursorCyan
+            }
+        }
         if companionManager.isBurstModeActive || companionManager.isBurstResponseCycleInFlight {
-            // Cover both the capture phase (isBurstModeActive, briefly
-            // ~hold duration) AND the processing/spinner phase that follows
-            // (isBurstResponseCycleInFlight, until response is delivered).
-            // Without the second flag, the spinner falls back to default
-            // blue instead of burst red because isBurstModeActive clears
-            // ~100ms after release.
-            return DS.Colors.overlayCursorRed
+            // v15p3fq (2026-05-17): burst mode is functionally retired
+            // (v13t). This branch is kept defensively in case any stale
+            // path flips the flag, but uses orange now since red moved
+            // to Watch mode. Realistically should never fire.
+            return DS.Colors.overlayCursorOrange
         }
         return DS.Colors.overlayCursorBlue
     }
@@ -746,10 +833,18 @@ struct BlueCursorView: View {
             // session is genuinely active (avoids ghost text from prior
             // sessions). Auto-collapses on session end (transcript clears).
             if !companionManager.vttLiveTranscript.isEmpty
-                && (companionManager.isVoiceToTextModeActive || companionManager.isPolishHotkeyModifierCaptureModeActive)
+                && (companionManager.isVoiceToTextModeActive
+                    || companionManager.isVoiceToTextDeepgramModeActive
+                    || companionManager.isPolishHotkeyModifierCaptureModeActive)
                 && buddyIsVisibleOnThisScreen {
-                // v15p3aa (2026-05-10): tint matches the active mode color
-                // (purple for VTT, cyan for Polish-modifier capture).
+                // v15p3aa (2026-05-10): tint matches the active mode color.
+                // v15p3bu (2026-05-13): added Deepgram tint for the
+                // A/B test VTT mode.
+                // v15p3fq (2026-05-17): tints updated to match the new
+                // mode colors — Deepgram purple, AssemblyAI orange,
+                // Polish-modifier cyan. The pill always matches the
+                // cursor indicator so it's obvious which provider /
+                // mode is driving the transcript on screen.
                 // v15p3aq (2026-05-11): pinned to the bottom-right of the
                 // active screen instead of following the cursor. Steph
                 // wanted to try a static position so it doesn't compete
@@ -763,9 +858,18 @@ struct BlueCursorView: View {
                 // the screen's bottom-right and the content grows up/left.
                 LiveVTTPreviewView(
                     transcript: companionManager.vttLiveTranscript,
+                    // v15p3fq (2026-05-17): tint resolution updated to
+                    // match the new cursor-color mapping. Order matters
+                    // because Polish-modifier capture can co-exist with
+                    // a VTT mode flag during the engage→polish handoff,
+                    // and we want Polish cyan to win in that overlap.
+                    // v15p3gz (2026-05-18): polish ↔ Deepgram color
+                    // swap. Polish now purple, VTT Deepgram now cyan.
                     tint: companionManager.isPolishHotkeyModifierCaptureModeActive
-                        ? DS.Colors.overlayCursorCyan
-                        : DS.Colors.overlayCursorPurple
+                        ? DS.Colors.overlayCursorPurple
+                        : (companionManager.isVoiceToTextDeepgramModeActive
+                            ? DS.Colors.overlayCursorCyan
+                            : DS.Colors.overlayCursorOrange)
                 )
                     .padding(.trailing, 20)
                     .padding(.bottom, 20)
@@ -1260,22 +1364,25 @@ private struct CursorPresenceDot: View {
     @State private var processingSpin: Double = 0
 
     var body: some View {
-        ZStack {
-            // Spinning dashed ring around dot during processing
-            Circle()
-                .stroke(tint, style: StrokeStyle(lineWidth: 1.2, dash: [3, 2.5]))
-                .frame(width: 18, height: 18)
-                .opacity(mode == .processing ? 0.7 : 0)
-                .rotationEffect(.degrees(processingSpin))
-
-            // Main dot
-            Circle()
-                .fill(tint)
-                .frame(width: dotDiameter, height: dotDiameter)
-                .opacity(dotOpacity)
-                .shadow(color: tint.opacity(0.6), radius: 2)
-        }
-        .allowsHitTesting(false)
+        // v15p3he (2026-05-18): re-anchor on the dot itself. Same root
+        // cause + fix as CursorDotWithSonarRing — overlay alignment on
+        // the dot's frame guarantees the processing ring is concentric
+        // with the dot by construction, eliminating the off-center halo
+        // bug in both indicator styles.
+        Circle()
+            .fill(tint)
+            .frame(width: dotDiameter, height: dotDiameter)
+            .opacity(dotOpacity)
+            .shadow(color: tint.opacity(0.6), radius: 2)
+            .overlay(
+                // Processing ring — dashed, slowly spinning.
+                Circle()
+                    .stroke(tint, style: StrokeStyle(lineWidth: 1.2, dash: [3, 2.5]))
+                    .frame(width: 18, height: 18)
+                    .opacity(mode == .processing ? 0.7 : 0)
+                    .rotationEffect(.degrees(processingSpin))
+            )
+            .allowsHitTesting(false)
         .onAppear {
             // v15h: idle is now SOLID (no pulse). Spin animation only used
             // when in .processing state but kept always-on so transitioning
@@ -1354,30 +1461,46 @@ private struct CursorDotWithSonarRing: View {
     @State private var processingSpin: Double = 0
 
     var body: some View {
-        ZStack {
-            // Spinning dashed ring during processing (matches CursorPresenceDot).
-            Circle()
-                .stroke(tint, style: StrokeStyle(lineWidth: 1.2, dash: [3, 2.5]))
-                .frame(width: 18, height: 18)
-                .opacity(mode == .processing ? 0.7 : 0)
-                .rotationEffect(.degrees(processingSpin))
-
-            // Sonar ring — expands and fades with audio level. Only visible
-            // when listening AND there's actual audio to react to.
-            Circle()
-                .stroke(tint, lineWidth: 1.4)
-                .frame(width: sonarDiameter, height: sonarDiameter)
-                .opacity(sonarOpacity)
-                .shadow(color: tint.opacity(0.4), radius: 2)
-
-            // Main dot — fixed small size, bright. Anchors the eye.
-            Circle()
-                .fill(tint)
-                .frame(width: dotDiameter, height: dotDiameter)
-                .opacity(dotOpacity)
-                .shadow(color: tint.opacity(0.6), radius: 2)
-        }
-        .allowsHitTesting(false)
+        // v15p3he (2026-05-18): re-anchor on the dot. Previous ZStack +
+        // fixed-frame + compositingGroup approach (v15p3bz/dg) was still
+        // producing off-center sonar rings — Steph reports persisted into
+        // 2026-05-18 in Marin mode. Root cause hypothesis: SwiftUI's ZStack
+        // center alignment + a 50x50 frame splits responsibility for
+        // centering between the ZStack and each child's intrinsic geometry.
+        // Subpixel rounding under .compositingGroup() at Sceptre's pixel
+        // density can leave the sonar ring's geometric center drifting up
+        // to a half-pixel from the dot's. New approach: the DOT is the
+        // layout root, and the sonar ring + processing ring are .overlay()
+        // children — overlay alignment defaults to .center on the base
+        // view's bounds, which IS the dot's bounds, so the rings are
+        // concentric with the dot by construction, not by frame lockdown.
+        Circle()
+            .fill(tint)
+            .frame(width: dotDiameter, height: dotDiameter)
+            .opacity(dotOpacity)
+            .shadow(color: tint.opacity(0.6), radius: 2)
+            .overlay(
+                // Sonar ring — expands and fades with audio level.
+                // v15p3hf (2026-05-18): shadow removed. Shadow filter
+                // rendering on a stroked circle can leave subpixel
+                // asymmetry against the dot center under SwiftUI's
+                // default compositing — most likely source of the
+                // "halo off-center" Steph reports. The ring itself
+                // is concentric with the dot via overlay alignment.
+                Circle()
+                    .stroke(tint, lineWidth: 1.4)
+                    .frame(width: sonarDiameter, height: sonarDiameter)
+                    .opacity(sonarOpacity)
+            )
+            .overlay(
+                // Processing ring — fixed 18x18, dashed, slowly spinning.
+                Circle()
+                    .stroke(tint, style: StrokeStyle(lineWidth: 1.2, dash: [3, 2.5]))
+                    .frame(width: 18, height: 18)
+                    .opacity(mode == .processing ? 0.7 : 0)
+                    .rotationEffect(.degrees(processingSpin))
+            )
+            .allowsHitTesting(false)
         .onAppear {
             withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
                 processingSpin = 360
@@ -1749,17 +1872,20 @@ private struct BlueCursorWaveformView: View {
 // MARK: - Idea Captured Toast
 
 /// v15p3v (2026-05-09): live preview overlay for in-flight dictation.
-/// Shows AssemblyAI's streaming partial transcript above the cursor
-/// during VTT or Polish-modifier capture. Lets Steph see his words
-/// landing as he speaks. Distinct from IdeaCapturedToast (yellow,
+/// Shows the active provider's streaming partial transcript above the
+/// cursor during VTT or Polish-modifier capture. Lets Steph see his
+/// words landing as he speaks. Distinct from IdeaCapturedToast (yellow,
 /// post-capture) — this is mode-tinted, pre-finalize, only shows during
 /// active dictation. Empty transcript = view collapses.
-/// v15p3aa (2026-05-10): tint is now driven by the active mode (purple
-/// for VTT, cyan for Polish modifier capture) so the pill matches the
+/// v15p3aa (2026-05-10): tint is now driven by the active mode.
+/// v15p3fq (2026-05-17): tints are Deepgram purple, AssemblyAI orange,
+/// Polish-modifier cyan — matching the cursor indicator so the pill
 /// rest of the visual language for that mode.
 private struct LiveVTTPreviewView: View {
     let transcript: String
-    var tint: Color = DS.Colors.overlayCursorPurple
+    // v15p3gz (2026-05-18): default now cyan to match the Deepgram VTT
+    // color swap. Polish-modifier callers pass overlayCursorPurple.
+    var tint: Color = DS.Colors.overlayCursorCyan
 
     // v15p3at (2026-05-11): Steph wants width capped (back to 380) but no
     // line cap — text wraps within the pill, height grows as content adds,

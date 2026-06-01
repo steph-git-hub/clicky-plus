@@ -33,15 +33,141 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
     /// a few rapid reconnections to the same host.
     private let sharedWebSocketURLSession = URLSession(configuration: .default)
 
+    // v15p3bk (2026-05-12): warm-session cache. The biggest single
+    // latency win in the audit (§8 #1) — kills 1-1.5s of cold-start
+    // handshake (token fetch + WSS open + AssemblyAI "Begin" message)
+    // on every VTT engage. Strategy:
+    //   - At app launch and after every session ends, kick off a
+    //     background prewarm that opens an idle websocket and stores
+    //     it here.
+    //   - On engage, if a warm session exists AND its keyterms match
+    //     the upcoming request, hand it off (just swap in real callbacks)
+    //     and the audio path can start streaming immediately.
+    //   - Mismatch → cold start (existing path), leave warm for a later
+    //     match (the 25s discard timer will evict eventually).
+    //   - Server auto-terminates idle WSS after ~30s; discard timer is
+    //     well under that.
+    private let warmingQueue = DispatchQueue(label: "com.learningbuddy.assemblyai.prewarm")
+    private var warmSession: AssemblyAIStreamingTranscriptionSession?
+    private var warmDiscardWorkItem: DispatchWorkItem?
+    private static let warmIdleLifetimeSeconds: TimeInterval = 25.0
+
+    /// Open a websocket session in the background with the given keyterms
+    /// and hold it idle until either (a) an engage happens that matches
+    /// these keyterms — at which point the engage path adopts it as the
+    /// active session — or (b) the 25-second idle timer fires and we
+    /// drop the session. Cancels and replaces any prior warm session.
+    /// Safe to call from any thread; runs the actual network work in a
+    /// detached Task. Errors are swallowed silently — a failed prewarm
+    /// just means the next engage cold-starts as it always did.
+    func prewarmSession(keyterms: [String]) {
+        // v15p4co (2026-05-30): prewarm DISABLED for AssemblyAI. The warm
+        // socket is a SECOND concurrent session stacked on the active one,
+        // and AssemblyAI's account concurrent-session cap is low enough
+        // that warm + active (plus slow server-side slot release) trips
+        // Error 1008 "too many concurrent sessions" even under normal use.
+        // As a secondary provider it's better active-only: one live
+        // session that can't pile up, at the cost of a cold start each
+        // engage. Flip to true to restore prewarming if the account's
+        // concurrency limit is ever raised.
+        let assemblyAIPrewarmEnabled = false
+        guard assemblyAIPrewarmEnabled else { return }
+        warmingQueue.async { [weak self] in
+            guard let self else { return }
+
+            // Cancel any prior warm — it's about to be replaced.
+            self.warmSession?.cancel()
+            self.warmSession = nil
+            self.warmDiscardWorkItem?.cancel()
+            self.warmDiscardWorkItem = nil
+
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let temporaryToken = try await self.fetchTemporaryToken()
+                    let session = AssemblyAIStreamingTranscriptionSession(
+                        apiKey: nil,
+                        temporaryToken: temporaryToken,
+                        urlSession: self.sharedWebSocketURLSession,
+                        keyterms: keyterms,
+                        onTranscriptUpdate: { _ in /* warm — no-op until adoption */ },
+                        onFinalTranscriptReady: { _ in /* warm — no-op until adoption */ },
+                        onError: { [weak self] _ in
+                            // If the warm session errors before handoff,
+                            // drop it from the cache so the next engage
+                            // cold-starts cleanly.
+                            self?.warmingQueue.async {
+                                self?.warmSession?.cancel()
+                                self?.warmSession = nil
+                                self?.warmDiscardWorkItem?.cancel()
+                                self?.warmDiscardWorkItem = nil
+                            }
+                        }
+                    )
+                    try await session.open()
+                    self.warmingQueue.async {
+                        // If someone else replaced us mid-open, discard
+                        // this freshly-opened session — newest wins.
+                        if self.warmSession != nil {
+                            session.cancel()
+                            return
+                        }
+                        self.warmSession = session
+                        print("🎙️ AssemblyAI: warm session ready (keyterms=\(keyterms.count))")
+                        // Arm the discard timer.
+                        let discard = DispatchWorkItem { [weak self] in
+                            self?.warmingQueue.async {
+                                self?.warmSession?.cancel()
+                                self?.warmSession = nil
+                                self?.warmDiscardWorkItem = nil
+                                print("🎙️ AssemblyAI: warm session evicted (idle > \(Int(Self.warmIdleLifetimeSeconds))s)")
+                            }
+                        }
+                        self.warmDiscardWorkItem = discard
+                        self.warmingQueue.asyncAfter(
+                            deadline: .now() + Self.warmIdleLifetimeSeconds,
+                            execute: discard
+                        )
+                    }
+                } catch {
+                    print("🎙️ AssemblyAI: prewarm failed (\(error.localizedDescription)) — next engage cold-starts")
+                }
+            }
+        }
+    }
+
     func startStreamingSession(
         keyterms: [String],
         onTranscriptUpdate: @escaping (String) -> Void,
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
     ) async throws -> any BuddyStreamingTranscriptionSession {
-        // Fetch a fresh temporary token from the proxy before each session
+        // v15p3bk: try the warm cache first.
+        let normalizedRequestedKeyterms = Self.normalizeKeyterms(keyterms)
+        let warmCandidate: AssemblyAIStreamingTranscriptionSession? = warmingQueue.sync {
+            guard let warm = warmSession, warm.isStillUsable else { return nil }
+            let warmKeyterms = Self.normalizeKeyterms(warm.openedWithKeyterms)
+            guard warmKeyterms == normalizedRequestedKeyterms else { return nil }
+            // Match: consume the warm session and clear the cache.
+            warmSession = nil
+            warmDiscardWorkItem?.cancel()
+            warmDiscardWorkItem = nil
+            return warm
+        }
+
+        if let warm = warmCandidate {
+            warm.adoptCallbacks(
+                onTranscriptUpdate: onTranscriptUpdate,
+                onFinalTranscriptReady: onFinalTranscriptReady,
+                onError: onError
+            )
+            print("🎙️ AssemblyAI: handed off warm session (zero handshake latency)")
+            return warm
+        }
+
+        // Cold path — original behavior.
         let temporaryToken = try await fetchTemporaryToken()
-        print("🎙️ AssemblyAI: fetched temporary token (\(temporaryToken.prefix(20))...)")
+        print("🎙️ AssemblyAI: fetched temporary token (\(temporaryToken.prefix(20))...) [cold start]")
 
         let session = AssemblyAIStreamingTranscriptionSession(
             apiKey: nil,
@@ -55,6 +181,18 @@ final class AssemblyAIStreamingTranscriptionProvider: BuddyTranscriptionProvider
 
         try await session.open()
         return session
+    }
+
+    /// Normalize a keyterms array for warm-cache equality checks: trim,
+    /// drop empties, lowercase, dedupe (preserving first-occurrence order
+    /// shouldn't matter for AssemblyAI but we sort to make equality
+    /// order-independent). A warm session with the same SET of keyterms
+    /// is equivalent to a fresh one for matching purposes.
+    private static func normalizeKeyterms(_ keyterms: [String]) -> [String] {
+        let normalized = keyterms
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .filter { !$0.isEmpty }
+        return Array(Set(normalized)).sorted()
     }
 
     /// Calls the Cloudflare Worker to get a short-lived AssemblyAI token.
@@ -117,9 +255,15 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
     private let apiKey: String?
     private let temporaryToken: String?
     private let keyterms: [String]
-    private let onTranscriptUpdate: (String) -> Void
-    private let onFinalTranscriptReady: (String) -> Void
-    private let onError: (Error) -> Void
+    // v15p3bk (2026-05-12): callbacks made mutable (with stateQueue
+    // synchronization) so a pre-warmed session can adopt real callbacks
+    // at handoff time. Initially set to no-ops; the provider calls
+    // `adoptCallbacks` to swap in real handlers when transitioning a
+    // warm session into an active one. Reads from receive thread, writes
+    // from the engage path — both go through stateQueue.async.
+    private var onTranscriptUpdate: (String) -> Void
+    private var onFinalTranscriptReady: (String) -> Void
+    private var onError: (Error) -> Void
 
     private let stateQueue = DispatchQueue(label: "com.learningbuddy.assemblyai.state")
     private let sendQueue = DispatchQueue(label: "com.learningbuddy.assemblyai.send")
@@ -136,6 +280,11 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
     private var activeTurnTranscriptText = ""
     private var storedTurnTranscriptsByOrder: [Int: StoredTurnTranscript] = [:]
     private var explicitFinalTranscriptDeadlineWorkItem: DispatchWorkItem?
+    // v15p3bk: tracks whether the session is still usable for a fresh
+    // engage. Flips to false if the websocket errors or terminates
+    // during the warm-idle window. Used by the provider to decide
+    // whether to hand off a warm session or fall through to cold start.
+    private var hasFailedOrTerminated = false
 
     init(
         apiKey: String?,
@@ -153,6 +302,39 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
         self.onTranscriptUpdate = onTranscriptUpdate
         self.onFinalTranscriptReady = onFinalTranscriptReady
         self.onError = onError
+    }
+
+    // v15p3bk (2026-05-12): swap a warm session's no-op callbacks for
+    // real ones at handoff time. Must be called BEFORE any audio is
+    // sent — otherwise transcript updates fired during the swap window
+    // would land in the wrong handler (or get dropped). All reads of
+    // the callbacks are dispatched through stateQueue, so writing them
+    // there is the synchronization point.
+    func adoptCallbacks(
+        onTranscriptUpdate: @escaping (String) -> Void,
+        onFinalTranscriptReady: @escaping (String) -> Void,
+        onError: @escaping (Error) -> Void
+    ) {
+        stateQueue.sync {
+            self.onTranscriptUpdate = onTranscriptUpdate
+            self.onFinalTranscriptReady = onFinalTranscriptReady
+            self.onError = onError
+        }
+    }
+
+    // v15p3bk: snapshot of the keyterms this session was opened with.
+    // The provider uses this to decide whether a warm session matches
+    // the upcoming engage's keyterm set. Mismatch → cold-start that
+    // engage and keep the warm session for a potential later match
+    // (or let the 25s discard timer evict it).
+    var openedWithKeyterms: [String] { keyterms }
+
+    // v15p3bk: liveness check. False after any websocket error,
+    // any server "Termination" message, or any call to cancel().
+    // The provider checks this before handing off — a dead warm
+    // session should never be returned to the engage path.
+    var isStillUsable: Bool {
+        stateQueue.sync { !hasFailedOrTerminated && !hasDeliveredFinalTranscript }
     }
 
     func open() async throws {
@@ -209,6 +391,9 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
         stateQueue.async {
             self.explicitFinalTranscriptDeadlineWorkItem?.cancel()
             self.explicitFinalTranscriptDeadlineWorkItem = nil
+            // v15p3bk: mark dead so the provider's warm cache won't
+            // attempt to hand off this session.
+            self.hasFailedOrTerminated = true
         }
 
         sendJSONMessage(["type": "Terminate"])
@@ -234,6 +419,11 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
 
                 self.receiveNextMessage()
             case .failure(let error):
+                let code = self.webSocketTask?.closeCode.rawValue ?? -1
+                let reason = self.webSocketTask?.closeReason
+                    .flatMap { String(data: $0, encoding: .utf8) } ?? "nil"
+                let ns = error as NSError
+                Self.appendAADiag("RECV FAILURE: \(error.localizedDescription) | \(ns.domain)#\(ns.code) | closeCode=\(code) reason=\(reason)")
                 self.failSession(with: error)
             }
         }
@@ -245,6 +435,13 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
         do {
             let envelope = try JSONDecoder().decode(MessageEnvelope.self, from: messageData)
 
+            // v15p4cm: log every non-Turn message raw so Begin /
+            // Termination / error payloads (e.g. concurrency caps) are
+            // visible in /tmp/clicky_assemblyai_diag.log.
+            if envelope.type.lowercased() != "turn" {
+                Self.appendAADiag("MSG type=\(envelope.type): \(text.prefix(400))")
+            }
+
             switch envelope.type.lowercased() {
             case "begin":
                 resolveReadyContinuationIfNeeded(with: .success(()))
@@ -254,6 +451,11 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
             case "termination":
                 resolveReadyContinuationIfNeeded(with: .success(()))
                 stateQueue.async {
+                    // v15p3bk: mark dead so a warm session can't be
+                    // mistakenly handed off after the server has
+                    // closed its end. AssemblyAI auto-terminates idle
+                    // websockets after ~30s — that path lands here.
+                    self.hasFailedOrTerminated = true
                     if self.isAwaitingExplicitFinalTranscript && !self.hasDeliveredFinalTranscript {
                         self.deliverFinalTranscriptIfNeeded(self.bestAvailableTranscriptText())
                     }
@@ -273,6 +475,15 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
     private func handleTurnMessage(_ turnMessage: TurnMessage) {
         let transcriptText = turnMessage.transcript?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        // v15p3br (2026-05-13): mark T2 in the live-preview latency
+        // diag. Idempotent — only the first Turn message per engage
+        // records a value. Skip empty transcripts so the timer
+        // measures press → first usable content, not press → first
+        // empty heartbeat.
+        if !transcriptText.isEmpty {
+            VTTLatencyDiag.markFirstAssemblyAITurn(preview: transcriptText)
+        }
 
         stateQueue.async {
             let turnOrder = turnMessage.turn_order
@@ -367,10 +578,22 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
     private func deliverFinalTranscriptIfNeeded(_ transcriptText: String) {
         guard !hasDeliveredFinalTranscript else { return }
         hasDeliveredFinalTranscript = true
+        hasFailedOrTerminated = true
         explicitFinalTranscriptDeadlineWorkItem?.cancel()
         explicitFinalTranscriptDeadlineWorkItem = nil
         onFinalTranscriptReady(transcriptText)
         sendJSONMessage(["type": "Terminate"])
+        // v15p4cn (2026-05-30): close the socket shortly after Terminate
+        // so the concurrent-session count drops immediately. Previously
+        // the success path left the socket open, relying on AssemblyAI's
+        // ~30s idle auto-terminate — under rapid dictation that piled up
+        // half-open sessions and tripped the "too many concurrent
+        // sessions" (1008) cap, and billed idle connection time. The
+        // 300ms delay lets the Terminate frame flush first.
+        let taskToClose = webSocketTask
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            taskToClose?.cancel(with: .goingAway, reason: nil)
+        }
     }
 
     private func sendJSONMessage(_ payload: [String: Any]) {
@@ -389,9 +612,32 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
         }
     }
 
+    private static let aaDiagPath = "/tmp/clicky_assemblyai_diag.log"
+    /// v15p4cm (2026-05-30): AssemblyAI failure diagnostics — WSS close
+    /// codes/reasons + non-Turn server messages, to pin down why
+    /// sessions stop returning transcripts (concurrency cap vs cleanup).
+    static func appendAADiag(_ msg: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(ts)] \(msg)\n"
+        guard let data = line.data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: aaDiagPath) {
+            if let h = try? FileHandle(forWritingTo: URL(fileURLWithPath: aaDiagPath)) {
+                defer { try? h.close() }
+                try? h.seekToEnd()
+                try? h.write(contentsOf: data)
+            }
+        } else {
+            try? data.write(to: URL(fileURLWithPath: aaDiagPath))
+        }
+    }
+
     private func failSession(with error: Error) {
+        Self.appendAADiag("SESSION FAILED: \(error.localizedDescription)")
         resolveReadyContinuationIfNeeded(with: .failure(error))
         stateQueue.async {
+            // v15p3bk: mark dead immediately so the provider's warm
+            // cache rejects this session on the next handoff attempt.
+            self.hasFailedOrTerminated = true
             let latestTranscriptText = self.bestAvailableTranscriptText()
 
             if self.isAwaitingExplicitFinalTranscript
@@ -456,7 +702,38 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
             // Steph's spoken-punctuation overrides ("comma", "new
             // paragraph", etc.) still win because they apply AFTER Haiku.
             URLQueryItem(name: "format_turns", value: "false"),
-            URLQueryItem(name: "speech_model", value: "u3-rt-pro")
+            URLQueryItem(name: "speech_model", value: "u3-rt-pro"),
+            // v15p3bs (2026-05-13): tune partial-emission cadence for
+            // smoother live preview.
+            //
+            // Doc deep-dive 2026-05-13 corrected yesterday's confusion:
+            // for Universal-3 Pro Streaming (u3-rt-pro), the correct
+            // parameter name is `min_turn_silence` (NOT the older
+            // model's `min_end_of_turn_silence_when_confident`). Per
+            // the docs: "Silence duration in milliseconds before a
+            // speculative end-of-turn check. If terminal punctuation
+            // is found, the turn ends. Otherwise, a partial is emitted
+            // and the turn continues." Default: 100ms.
+            //
+            // The latency-diag (v15p3br) measurement on 2026-05-13
+            // showed press → first-partial averaging ~1.7s with the
+            // default 100ms. Steph reported: first few words appear,
+            // then partials stall while he speaks continuously, then
+            // updates resume after a pause. That's the silence-check
+            // floor gating partial emission. Halving min_turn_silence
+            // to 50ms doubles the check frequency.
+            //
+            // v15p3bt (2026-05-13): pushed further to 25ms. The 50ms
+            // value (v15p3bs) cut first-partial latency from ~1912ms
+            // → ~1356ms (29% improvement) and tightened the spread
+            // from 2.6s → 0.5s. Going to 25ms doubles the check
+            // frequency again — testing whether AssemblyAI has any
+            // remaining slack between "audio processed and ready" and
+            // "next emission check fires." max_turn_silence (1000ms
+            // default) still bounds the worst case, so false end-of-
+            // turn detection risk is bounded. Easy revert to 50ms if
+            // partials get unstable.
+            URLQueryItem(name: "min_turn_silence", value: "25")
         ]
 
         let normalizedKeyterms = keyterms

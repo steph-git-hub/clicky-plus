@@ -10,9 +10,20 @@ import Foundation
 
 protocol BuddyStreamingTranscriptionSession: AnyObject {
     var finalTranscriptFallbackDelaySeconds: TimeInterval { get }
+    /// v15p3gx (2026-05-18): hold the mic tap open for up to this many
+    /// seconds after key release, gated by audio-power-level silence
+    /// detection in BuddyDictationManager. Default 0 (immediate cleanup).
+    /// Providers whose final transcript drops trailing audio when the
+    /// tap is cut mid-word (Deepgram) override this. AssemblyAI's
+    /// ForceEndpoint is aggressive enough that 0 works there.
+    var trailingAudioGraceSeconds: TimeInterval { get }
     func appendAudioBuffer(_ audioBuffer: AVAudioPCMBuffer)
     func requestFinalTranscript()
     func cancel()
+}
+
+extension BuddyStreamingTranscriptionSession {
+    var trailingAudioGraceSeconds: TimeInterval { 0 }
 }
 
 protocol BuddyTranscriptionProvider {
@@ -27,6 +38,19 @@ protocol BuddyTranscriptionProvider {
         onFinalTranscriptReady: @escaping (String) -> Void,
         onError: @escaping (Error) -> Void
     ) async throws -> any BuddyStreamingTranscriptionSession
+
+    /// v15p3bk (2026-05-12): optionally pre-open a streaming session in
+    /// the background so the next engage can skip the handshake. Default
+    /// is a no-op for providers that don't support pre-warming (Apple
+    /// Speech, OpenAI Whisper batch). Only the AssemblyAI streaming
+    /// provider currently implements this.
+    func prewarmSession(keyterms: [String])
+}
+
+extension BuddyTranscriptionProvider {
+    func prewarmSession(keyterms: [String]) {
+        // Default: no-op. Providers that support pre-warming override.
+    }
 }
 
 enum BuddyTranscriptionProviderFactory {

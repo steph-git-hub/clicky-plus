@@ -32,6 +32,37 @@ enum CompanionScreenshotAnnotator {
         alpha: 1.0
     )
 
+    /// v15p3ca (2026-05-13): cursor marker for Marin vision pre-annotation.
+    /// Magenta (Marin's tint) so the visual language matches her cursor
+    /// indicator. White outline so the marker is legible against any
+    /// background — magenta blends into pink/red UI elements, so the
+    /// halo of white provides guaranteed contrast.
+    private static let cursorMarkerFillColor = CGColor(
+        red: 0xE0 / 255.0,
+        green: 0x3D / 255.0,
+        blue: 0xB0 / 255.0,
+        alpha: 1.0
+    )
+    private static let cursorMarkerOutlineColor = CGColor(
+        red: 1.0, green: 1.0, blue: 1.0, alpha: 1.0
+    )
+
+    /// v15p3cc (2026-05-13): marker geometry redesigned to a HOLLOW
+    /// reticle so it doesn't cover content underneath. Previous filled
+    /// design (v15p3ca/cb) obscured small text the user was pointing
+    /// at — fatal flaw when the whole purpose is to mark where Marin
+    /// should READ. New design:
+    ///   - Outer white halo (8px stroke at radius ~26px) for contrast
+    ///   - Magenta ring (6px stroke at radius ~22px) for visibility
+    ///   - Tiny magenta dot (3px radius) at exact center for precision
+    /// The middle of the indicator stays empty so the content the user
+    /// is pointing at remains fully visible to Marin.
+    private static let cursorMarkerRingRadiusPixels: CGFloat = 22
+    private static let cursorMarkerRingStrokePixels: CGFloat = 6
+    private static let cursorMarkerOutlineRadiusPixels: CGFloat = 26
+    private static let cursorMarkerOutlineStrokePixels: CGFloat = 8
+    private static let cursorMarkerCenterDotRadiusPixels: CGFloat = 3
+
     /// Line width is thick on purpose. Retina screenshots are huge
     /// (sometimes 5000+ pixels wide), so a thin stroke would be
     /// invisible after the image is downscaled for the model.
@@ -101,8 +132,144 @@ enum CompanionScreenshotAnnotator {
             displayHeightInPoints: capture.displayHeightInPoints,
             displayFrame: capture.displayFrame,
             screenshotWidthInPixels: capture.screenshotWidthInPixels,
-            screenshotHeightInPixels: capture.screenshotHeightInPixels
+            screenshotHeightInPixels: capture.screenshotHeightInPixels,
+            cursorPositionInImagePixels: capture.cursorPositionInImagePixels,
+            // v15p3cp (2026-05-13): forward the freshly-annotated bitmap
+            // so downstream consumers (OCR pass) still see consistent
+            // pixels even after re-encode. If the encode path didn't
+            // hand back a CGImage we just nil it out — OCR will fall
+            // back to decoding `imageData`.
+            cgImage: annotatedImage
         )
+    }
+
+    /// v15p3ca (2026-05-13): draw a magenta cursor marker on `capture`
+    /// at the cursor position captured alongside the image. Used by
+    /// Marin's vision path so the model knows exactly where the user
+    /// is pointing. Returns the original capture unchanged if no
+    /// cursor position is available (cursor was off the captured
+    /// region) or if any drawing step fails — same fail-safe pattern
+    /// as the bounding-box function.
+    static func addCursorMarker(to capture: CompanionScreenCapture) -> CompanionScreenCapture {
+        guard let cursorPixel = capture.cursorPositionInImagePixels else {
+            return capture
+        }
+
+        // Sanity-check the point is inside the image bounds. Edge
+        // cases: cursor right at the image edge, sub-pixel rounding.
+        let imageBounds = CGRect(
+            x: 0,
+            y: 0,
+            width: capture.screenshotWidthInPixels,
+            height: capture.screenshotHeightInPixels
+        )
+        guard imageBounds.contains(cursorPixel) else {
+            return capture
+        }
+
+        // Decode → draw → re-encode (same flow as the bounding-box path).
+        guard let source = CGImageSourceCreateWithData(capture.imageData as CFData, nil),
+              let originalImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            return capture
+        }
+        guard let annotatedImage = drawCursorMarker(
+            onto: originalImage,
+            pixelPoint: cursorPixel
+        ) else {
+            return capture
+        }
+        guard let annotatedData = encodeJPEG(image: annotatedImage) else {
+            return capture
+        }
+
+        return CompanionScreenCapture(
+            imageData: annotatedData,
+            label: capture.label,
+            isCursorScreen: capture.isCursorScreen,
+            displayWidthInPoints: capture.displayWidthInPoints,
+            displayHeightInPoints: capture.displayHeightInPoints,
+            displayFrame: capture.displayFrame,
+            screenshotWidthInPixels: capture.screenshotWidthInPixels,
+            screenshotHeightInPixels: capture.screenshotHeightInPixels,
+            cursorPositionInImagePixels: capture.cursorPositionInImagePixels,
+            // v15p3cp (2026-05-13): forward the freshly-annotated bitmap
+            // so downstream consumers (OCR pass) still see consistent
+            // pixels even after re-encode. If the encode path didn't
+            // hand back a CGImage we just nil it out — OCR will fall
+            // back to decoding `imageData`.
+            cgImage: annotatedImage
+        )
+    }
+
+    /// v15p3cc (2026-05-13): hollow reticle marker — outer white halo
+    /// + magenta ring + tiny magenta center dot. Middle of the indicator
+    /// stays transparent so content the user is pointing at remains
+    /// fully visible to Marin's vision pass.
+    private static func drawCursorMarker(
+        onto originalImage: CGImage,
+        pixelPoint: CGPoint
+    ) -> CGImage? {
+        let width = originalImage.width
+        let height = originalImage.height
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+
+        guard let context = CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else {
+            return nil
+        }
+
+        // Draw the original image first.
+        context.draw(originalImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+
+        // Flip y for our point: pixelPoint is top-left origin, but the
+        // CGContext draws in bottom-left origin.
+        let flippedY = CGFloat(height) - pixelPoint.y
+
+        // Layer 1: outer white halo (drawn first, biggest). Provides
+        // contrast against any background color the content has.
+        let outlineRect = CGRect(
+            x: pixelPoint.x - cursorMarkerOutlineRadiusPixels,
+            y: flippedY - cursorMarkerOutlineRadiusPixels,
+            width: cursorMarkerOutlineRadiusPixels * 2,
+            height: cursorMarkerOutlineRadiusPixels * 2
+        )
+        context.setStrokeColor(cursorMarkerOutlineColor)
+        context.setLineWidth(cursorMarkerOutlineStrokePixels)
+        context.strokeEllipse(in: outlineRect)
+
+        // Layer 2: magenta ring (drawn over the halo). Primary visible
+        // signal of the cursor location.
+        let ringRect = CGRect(
+            x: pixelPoint.x - cursorMarkerRingRadiusPixels,
+            y: flippedY - cursorMarkerRingRadiusPixels,
+            width: cursorMarkerRingRadiusPixels * 2,
+            height: cursorMarkerRingRadiusPixels * 2
+        )
+        context.setStrokeColor(cursorMarkerFillColor)
+        context.setLineWidth(cursorMarkerRingStrokePixels)
+        context.strokeEllipse(in: ringRect)
+
+        // Layer 3: tiny magenta center dot for sub-ring precision. Tells
+        // Marin exactly which pixel the user is on, while leaving the
+        // text/content immediately around the cursor visible through
+        // the ring's empty middle.
+        let centerDotRect = CGRect(
+            x: pixelPoint.x - cursorMarkerCenterDotRadiusPixels,
+            y: flippedY - cursorMarkerCenterDotRadiusPixels,
+            width: cursorMarkerCenterDotRadiusPixels * 2,
+            height: cursorMarkerCenterDotRadiusPixels * 2
+        )
+        context.setFillColor(cursorMarkerFillColor)
+        context.fillEllipse(in: centerDotRect)
+
+        return context.makeImage()
     }
 
     // MARK: - Coordinate conversion

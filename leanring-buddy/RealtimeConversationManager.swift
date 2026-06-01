@@ -289,6 +289,18 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         // v15p3au (2026-05-11): start the ephemeral-token warming loop
         // so Marin's first engage skips the ~200-800ms Worker call.
         startEphemeralTokenWarming()
+        // v15p3hs (2026-05-19): live Marin volume control. Slider in
+        // panel posts marinVolumeDidChange; apply immediately.
+        NotificationCenter.default.addObserver(
+            forName: .marinVolumeDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else { return }
+            if let volume = notification.userInfo?["volume"] as? Float {
+                self.outputPlayer.volume = volume
+            }
+        }
         // v15p3q (2026-05-08): subscribe to AVAudioEngineConfigurationChange
         // so plugging/unplugging headphones mid-conversation doesn't kill
         // mic capture. macOS reroutes default audio devices on plug/unplug
@@ -449,6 +461,8 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                     return
                 }
                 Self.appendDiag("session ready (state=listening)")
+                // v15p3cu (2026-05-14): Marin-engage sound cue.
+                await MainActor.run { ClickySoundEngine.shared.play(.marinEngage) }
                 // Cancel the startup watchdog — we made it through.
                 watchdogTask.cancel()
             } catch {
@@ -526,6 +540,8 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         audioStateLock.unlock()
         guard active else { return }
         Self.appendDiag("endSession requested")
+        // v15p3cu (2026-05-14): Marin-disengage sound cue.
+        ClickySoundEngine.shared.play(.marinDisengage)
         cancelWarmSessionAutoClose()
         teardown()
     }
@@ -1269,6 +1285,8 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
         if !outputEngine.attachedNodes.contains(outputPlayer) {
             outputEngine.attach(outputPlayer)
         }
+        // v15p3hs (2026-05-19): apply persisted Marin volume.
+        outputPlayer.volume = MarinVolumeStore.volume
         let outputMixer = outputEngine.mainMixerNode
         outputEngine.connect(outputPlayer, to: outputMixer, format: pcm16Format)
         try outputEngine.start()
@@ -1750,31 +1768,208 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
     private func captureAndSendActiveScreenshot() {
         Task { @MainActor in
             do {
-                let active = try await CompanionScreenCaptureUtility.captureActiveScreenAsJPEG()
-                let base64 = active.imageData.base64EncodedString()
+                // v15p3cu (2026-05-14): vision-capture sound cue fired
+                // before the asynchronous SCStream pull so Steph heard
+                // the "shutter" the instant his action triggered the
+                // screenshot.
+                // v15p3dd (2026-05-15): REMOVED per Steph — visual
+                // confirmation in the panel + the Marin engage/disengage
+                // sounds already bracket vision turns, so a per-capture
+                // tone was redundant noise. The .visionCapture
+                // ClickySoundID stays in the enum so the patterns and
+                // preview matrix continue to work; we just don't trigger
+                // it on actual screen captures anymore.
+                let rawCapture = try await CompanionScreenCaptureUtility.captureActiveScreenAsJPEG()
+                // v15p3ca (2026-05-13): Marin Vision Option A — draw a
+                // magenta cursor marker on the screenshot before sending
+                // so the model knows exactly where Steph is pointing.
+                // Fail-safe: addCursorMarker returns the original capture
+                // unchanged if cursor position is unavailable or any
+                // drawing step fails, so Marin always gets a screenshot
+                // even if the annotation step errors.
+                // v15p3ck (2026-05-13): REMOVED our own cursor marker.
+                // v15p3cn (2026-05-13): added AX-element-under-cursor.
+                // Following Google DeepMind's Gemini AI cursor approach
+                // — instead of asking Marin to find the cursor in the
+                // screenshot, query AXUIElementCopyElementAtPosition
+                // for the element directly under the cursor and tell
+                // Marin in text what she's looking at. Solves cursor-
+                // identification, display scaling, and cursor-variant
+                // edge cases all at once.
+                let active = rawCapture
+                // v15p3cd (2026-05-13): dump every annotated screenshot
+                // to /tmp/clicky_last_marin_screenshot.jpg so Steph can
+                // visually verify what Marin actually sees. Overwrites
+                // each capture — only the most recent is preserved.
+                // Diagnostic only; can be removed once vision tuning
+                // is stable.
+                let dumpURL = URL(fileURLWithPath: "/tmp/clicky_last_marin_screenshot.jpg")
+                try? active.imageData.write(to: dumpURL)
+
+                // v15p3co (2026-05-13): UNIVERSAL hover detection.
+                //
+                // Three signals stacked, each independent of the others
+                // so Chrome (AX-opaque) and native AppKit (AX-rich) both
+                // get useful context with zero per-app setup:
+                //
+                //   1. AX element under cursor — fast, semantic, works
+                //      on native apps. We gate inclusion on having an
+                //      actual label or text content; a generic role
+                //      like "scrollarea" with no other signal would
+                //      mislead Marin into thinking she knows what's
+                //      under the cursor when she really doesn't.
+                //
+                //   2. OCR-nearest-text via Vision.framework — pixels
+                //      are universal, so this works ANYWHERE: Chrome,
+                //      Sceptre, fullscreen apps, virtualized windows,
+                //      PDFs. Cost is ~200–400ms on Apple Silicon for
+                //      a 1080p frame; acceptable inside a vision turn.
+                //
+                //   3. Explicit cursor pixel coordinates in the image
+                //      — guarantees Marin can locate the focus region
+                //      even when both signals above produce noise.
+                //
+                // Caller does NOT pick one; we give Marin all three and
+                // let her vision attention reconcile. AX wins when it
+                // has a real label; OCR wins when AX is generic; pixel
+                // coords always anchor the spatial reference.
+                // v15p3cr (2026-05-13): build the fovea crop FIRST so
+                // we can gate the expensive OCR pass on its result —
+                // when the fovea succeeds Marin sees the cursor region
+                // directly and OCR text is redundant. Saves ~200–400ms
+                // per vision turn on virtually every query.
+                let foveaStart = Date()
+                let foveaCrop: CursorFoveaCrop? = {
+                    guard let cgImage = active.cgImage else { return nil }
+                    return CursorFoveaCropper.cropAroundCursor(
+                        sourceImage: cgImage,
+                        cursorInImagePixels: active.cursorPositionInImagePixels
+                    )
+                }()
+                let foveaMs = Int(Date().timeIntervalSince(foveaStart) * 1000)
+
+                let hoverContext = FocusedElementContextProvider.captureAtCursor()
+                let axHint: String? = {
+                    guard let ctx = hoverContext else { return nil }
+                    let hasLabel = (ctx.label?.isEmpty == false)
+                    let hasText = (ctx.recentText?.isEmpty == false)
+                    // Suppress AX hint if it's just a generic container
+                    // with no human-readable content — that's the Chrome
+                    // failure mode and it actively hurts Marin's accuracy.
+                    guard hasLabel || hasText else { return nil }
+                    return FocusedElementContextProvider.describeForHoverHint(ctx)
+                }()
+
+                // v15p3cr: OCR is now opt-in. When the fovea crop
+                // succeeded, Marin gets a high-detail tile of the cursor
+                // region — that already contains every word OCR would
+                // find PLUS the visual context OCR can't convey (icons,
+                // colors, layout). Skipping OCR here saves the 200–400ms
+                // Vision.framework spends on text recognition. OCR only
+                // fires as a fallback when the fovea couldn't build —
+                // cursor off-screen, no CGImage exposed, image smaller
+                // than the crop side length, etc.
+                let ocrStart = Date()
+                let ocrResult: CursorProximityTextResult? = {
+                    guard foveaCrop == nil else { return nil }
+                    return CursorProximityTextDetector.findNearestText(
+                        cgImage: active.cgImage,
+                        imageData: active.imageData,
+                        cursorInImagePixels: active.cursorPositionInImagePixels,
+                        imageWidthInPixels: active.screenshotWidthInPixels,
+                        imageHeightInPixels: active.screenshotHeightInPixels
+                    )
+                }()
+                let ocrMs = Int(Date().timeIntervalSince(ocrStart) * 1000)
+                let ocrHint = CursorProximityTextDetector.describeForHoverHint(ocrResult)
+
+                // Compose the final cursor hint string sent to Marin.
+                // Always include cursor pixel coords when available —
+                // they're the universal fallback that lets Marin focus
+                // her vision attention even when AX + OCR both miss.
+                var hintPieces: [String] = []
+                if let axHint { hintPieces.append(axHint) }
+                if let ocrHint { hintPieces.append(ocrHint) }
+                if let cursorPx = active.cursorPositionInImagePixels {
+                    hintPieces.append(
+                        "Cursor is at pixel (\(Int(cursorPx.x.rounded())), \(Int(cursorPx.y.rounded()))) in this \(active.screenshotWidthInPixels)×\(active.screenshotHeightInPixels) image"
+                    )
+                }
+                let cursorHint: String
+                if hintPieces.isEmpty {
+                    cursorHint = " The macOS system cursor is visible in the screenshot. Find it and treat what it's pointing at as the focus of the user's attention."
+                } else {
+                    cursorHint = " " + hintPieces.joined(separator: ". ") + ". The signals above pinpoint what the user is pointing at; treat them as the focus of the user's attention even if the broader screenshot shows more context."
+                }
+                Self.appendDiag("vision: ax-hint = \(axHint ?? "<none>")")
+                Self.appendDiag("vision: ocr-hint = \(ocrHint ?? "<none>") (ocr=\(ocrMs)ms)")
+                if let crop = foveaCrop {
+                    Self.appendDiag(
+                        "vision: fovea-crop = \(crop.widthInPixels)x\(crop.heightInPixels)px, " +
+                        "\(crop.jpegData.count) bytes, " +
+                        "cursorInCrop=(\(Int(crop.cursorInCropPixels.x.rounded())),\(Int(crop.cursorInCropPixels.y.rounded()))) " +
+                        "(fovea=\(foveaMs)ms)"
+                    )
+                } else {
+                    Self.appendDiag("vision: fovea-crop = <none> (no cursor position or crop failed) (fovea=\(foveaMs)ms)")
+                }
+
+                // v15p3cr (2026-05-13): updated prompt to include the
+                // exact cursor position within the crop. When the cursor
+                // is near an edge of the source image we clamp the crop
+                // bounds, so the cursor is NOT always dead-center inside
+                // the tile — telling Marin its actual offset lets her
+                // pick the right element even in those edge-clamped cases.
+                let cropPromptSegment: String = {
+                    guard let crop = foveaCrop else { return "" }
+                    let cx = Int(crop.cursorInCropPixels.x.rounded())
+                    let cy = Int(crop.cursorInCropPixels.y.rounded())
+                    return " The SECOND image is a \(crop.widthInPixels)×\(crop.heightInPixels) crop showing the area around the user's cursor — trust it as the definitive answer for what they are pointing at. The cursor itself is at pixel (\(cx), \(cy)) within that crop."
+                }()
+
+                // Build the content array. The full screenshot is the
+                // first image (broader context), the fovea crop is the
+                // second (focus). Prompt explicitly tells Marin to
+                // trust the second image for what the cursor is on.
+                var content: [[String: Any]] = [
+                    [
+                        "type": "input_text",
+                        "text": "[\(active.label) — visible to you for this turn.\(cropPromptSegment)\(cursorHint)]",
+                    ],
+                    [
+                        "type": "input_image",
+                        "image_url": "data:image/jpeg;base64,\(active.imageData.base64EncodedString())",
+                    ],
+                ]
+                if let crop = foveaCrop {
+                    content.append([
+                        "type": "input_image",
+                        "image_url": "data:image/jpeg;base64,\(crop.jpegData.base64EncodedString())",
+                    ])
+                }
                 let payload: [String: Any] = [
                     "type": "conversation.item.create",
                     "item": [
                         "type": "message",
                         "role": "user",
-                        "content": [
-                            [
-                                "type": "input_text",
-                                "text": "[\(active.label) — visible to you for this turn]",
-                            ],
-                            [
-                                "type": "input_image",
-                                "image_url": "data:image/jpeg;base64,\(base64)",
-                            ],
-                        ],
+                        "content": content,
                     ],
                 ]
                 self.sendJSON(payload)
+                let foveaSummary = foveaCrop.map { " + fovea \($0.widthInPixels)x\($0.heightInPixels)px \($0.jpegData.count)B" } ?? ""
                 Self.appendDiag(
                     "vision: sent screenshot — \(active.imageData.count) bytes, " +
                     "\(active.screenshotWidthInPixels)x\(active.screenshotHeightInPixels) px, " +
-                    "label=\"\(active.label)\""
+                    "label=\"\(active.label)\"\(foveaSummary)"
                 )
+
+                // v15p3cq diagnostic: also dump the fovea crop so Steph
+                // can visually verify what Marin sees as the "focused"
+                // tile. Overwrites each query.
+                if let crop = foveaCrop {
+                    let foveaDumpURL = URL(fileURLWithPath: "/tmp/clicky_last_marin_fovea.jpg")
+                    try? crop.jpegData.write(to: foveaDumpURL)
+                }
             } catch {
                 Self.appendDiag("vision: capture failed — \(error.localizedDescription)")
             }
@@ -2202,6 +2397,15 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
                         "contents": payload,
                     ]
                 }
+                self.sendFunctionCallResult(callId: callId, name: name, result: result)
+            }
+
+        // ── Web fetch (v15p3em, 2026-05-17) ────────────────────
+        case "web_fetch":
+            let url = (args["url"] as? String) ?? ""
+            Task { [weak self] in
+                guard let self else { return }
+                let result = await MarinResearchTools.webFetch(url: url)
                 self.sendFunctionCallResult(callId: callId, name: name, result: result)
             }
 
@@ -2951,7 +3155,15 @@ final class RealtimeConversationManager: NSObject, ObservableObject {
 
     private static let maxHistoryTurnsToKeep = 30
     private static let maxHistoryTurnsToReplay = 12
-    private static let maxHistoryAgeHoursForReplay: TimeInterval = 24
+    // v15p3dt (2026-05-16): cut from 24h → 0.25h (15 min). Old behavior
+    // meant Steph would start a fresh day and Marin would still think
+    // they were mid-conversation about yesterday's topic — a context
+    // bleed bug. Within 15 min of the last turn ("still working on it")
+    // she replays history and remembers; after 15 min of silence, fresh
+    // start. Symmetric with Gemini's autoCloseTask window so both
+    // providers behave the same. Persistent file is unchanged — we
+    // still WRITE everything; replay just filters more aggressively.
+    private static let maxHistoryAgeHoursForReplay: TimeInterval = 0.25
 
     private static var historyFileURL: URL? {
         let fm = FileManager.default

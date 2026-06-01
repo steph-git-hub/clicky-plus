@@ -190,6 +190,15 @@ enum DS {
         /// magenta to confirm Marin is listening.
         static let overlayCursorMagenta = Color(hex: "#FF3FB5")
 
+        /// Orange variant of the overlay cursor, used ONLY during
+        /// AssemblyAI voice-to-text mode (Fn+Shift+Opt hold, v15p3fq
+        /// 2026-05-17). Steph migrated to Deepgram for the high-frequency
+        /// VTT chord (Fn+Ctrl, now purple) but kept AssemblyAI available
+        /// on a secondary chord as a fallback / A-B comparison. Orange
+        /// makes the active provider visually obvious vs. Deepgram purple
+        /// and the new red Watch mode that took Fn+Opt.
+        static let overlayCursorOrange = Color(hex: "#FF8C33")
+
         // ── Floating Button Gradient ─────────────────────────────────
 
         /// The floating session button gradient colors (unchanged from original —

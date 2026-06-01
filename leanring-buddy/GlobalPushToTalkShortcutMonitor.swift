@@ -39,9 +39,10 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// speech-to-speech. Audio is streamed bidirectionally rather than
     /// transcribed-then-acted-on like the other modes.
     let realtimeTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
-    /// Separate publisher for the Realtime hands-free toggle (Fn+Cmd+Opt, v15p2).
-    /// Single tap → flip hands-free state. State persists in UserDefaults.
-    let realtimeHandsFreeToggleTransitionPublisher = PassthroughSubject<BuddyPushToTalkShortcut.ShortcutTransition, Never>()
+    // v15p3fq (2026-05-17): realtimeHandsFreeToggleTransitionPublisher
+    // removed alongside the matching detector in BuddyPushToTalkShortcut.
+    // Fn+Shift+Opt is now AssemblyAI VTT (driven by the existing burst
+    // publisher); the redundant hands-free toggle has been retired.
     /// Separate publisher for the polish hotkey (⌃⌥⌘ tap). Unlike the
     /// other 5 modes, polish is NOT a hold — subscribers should only
     /// react to `.pressed` transitions and ignore `.released`. Polish
@@ -60,6 +61,20 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// click-to-capture. Option chosen because it doesn't override click
     /// behavior in macOS the way Cmd/Ctrl do.
     let optionDoubleTapPublisher = PassthroughSubject<Void, Never>()
+    /// v15p3gt (2026-05-18): fires when the user double-taps the Shift
+    /// modifier alone (no chord). Used to engage speed-read mode —
+    /// captures selected text or clipboard contents and opens the
+    /// RSVP overlay. Shift was the last solo-tap modifier that
+    /// wasn't claimed; it's chord-safe with Shift+Ctrl polish,
+    /// Fn+Shift capture, and Fn+Shift+Opt VTT because the chord-cancel
+    /// rule below filters any press where a non-modifier or extra
+    /// modifier joins during the press window.
+    let shiftDoubleTapPublisher = PassthroughSubject<Void, Never>()
+    /// Single-tap Shift fires only when this monitor was just locked
+    /// into something by a double-tap (matches the ctrl/cmd pattern).
+    /// Currently unused by CompanionManager but published for parity
+    /// with the other modifiers — keeps the surface symmetrical.
+    let shiftSingleTapPublisher = PassthroughSubject<Void, Never>()
     /// Fires on a single confirmed tap of Control alone (no chord). CompanionManager
     /// treats this as "disengage VTT lock if active" — a quick way to end a
     /// no-hold dictation session without moving fingers to Esc. Confirmed
@@ -71,6 +86,16 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// Fires on a single confirmed tap of Option alone. Used to disengage
     /// hands-free voice-mode toggle (v12s).
     let optionSingleTapPublisher = PassthroughSubject<Void, Never>()
+    /// v15p3bx (2026-05-13): closure populated by CompanionManager. The
+    /// monitor invokes it when Esc is pressed to decide whether to
+    /// consume the event (return nil from the event tap) or pass it
+    /// through to the foreground app. Returning true means "Clicky+ has
+    /// an active mode/state and is going to act on Esc itself, so don't
+    /// also let it reach the foreground app." Returning false (or nil
+    /// closure) preserves the old pass-through behavior so unrelated Esc
+    /// workflows in other apps keep working.
+    var shouldConsumeEscapeWhenPressed: (() -> Bool)?
+
     /// Fires on Escape key press. CompanionManager uses this to unlock
     /// any active double-tap-toggled dictation session.
     let escapeKeyPublisher = PassthroughSubject<Void, Never>()
@@ -86,6 +111,16 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     let nativeScreenshotSessionPublisher = PassthroughSubject<Bool, Never>()
     @Published private(set) var isNativeScreenshotSessionActive: Bool = false
     private var nativeScreenshotTimeoutTask: DispatchWorkItem?
+
+    /// v15p4p (2026-05-23): Cmd+Shift+2 — Clicky+ custom screenshot-
+    /// and-paste hotkey. Fires when the user presses Cmd+Shift+2. The
+    /// subscriber spawns `/usr/sbin/screencapture -ci` (interactive,
+    /// to clipboard), then sends Cmd+V to the frontmost app once the
+    /// clipboard changes. Same crosshair / Space-for-window UX as
+    /// Cmd+Shift+4, plus auto-paste. Event is CONSUMED so apps that
+    /// bind Cmd+Shift+2 (Slack workspace-switch, some browsers) don't
+    /// also see it.
+    let screenshotPasteShortcutPublisher = PassthroughSubject<Void, Never>()
 
     private var globalEventTap: CFMachPort?
     private var globalEventTapRunLoopSource: CFRunLoopSource?
@@ -109,8 +144,9 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     @Published private(set) var isCaptureToInboxShortcutCurrentlyPressed = false
     /// Parallel state for the Realtime conversation shortcut (Fn + Opt, v15p2).
     @Published private(set) var isRealtimeShortcutCurrentlyPressed = false
-    /// Parallel state for the Realtime hands-free toggle (Fn+Cmd+Opt, v15p2).
-    @Published private(set) var isRealtimeHandsFreeToggleShortcutCurrentlyPressed = false
+    // v15p3fq (2026-05-17): isRealtimeHandsFreeToggleShortcutCurrentlyPressed
+    // removed — the publisher and detector it backed are gone (chord
+    // repurposed for AssemblyAI VTT).
     /// Parallel state for the polish hotkey (⌃⌥⌘). Tracked the same way
     /// as the other modes so press/release transitions debounce correctly,
     /// even though only `.pressed` is acted upon downstream.
@@ -150,10 +186,21 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             )
         }
 
+        // v15p3bx (2026-05-13): switched from .listenOnly to .defaultTap
+        // so the callback's return value is actually honored by the
+        // system. .listenOnly is a passive observer — it can see events
+        // but can't modify or consume them. .defaultTap lets us return
+        // nil to swallow specific events (currently used to consume Esc
+        // when Clicky+ is active so it doesn't leak to the foreground
+        // app). Tradeoff: every event of interest now passes through
+        // this callback before reaching the app, so handler latency
+        // affects system-wide keystroke responsiveness. The current
+        // handler is lightweight (dispatch + tap-state bookkeeping)
+        // and shouldn't be a perf issue, but worth monitoring.
         guard let globalEventTap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
             place: .headInsertEventTap,
-            options: .listenOnly,
+            options: .defaultTap,
             eventsOfInterest: eventMask,
             callback: eventTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
@@ -214,6 +261,49 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         // tick as the keyDown — before macOS's screencaptureui snapshots the
         // window list for its window-mode picker.
         handleNativeScreenshotSession(eventType: eventType, event: event)
+
+        // v15p4p (2026-05-23): Cmd+Shift+2 custom screenshot-and-paste.
+        // Consume the event (return nil) so Slack/Chrome/etc. don't
+        // also receive it. Strict flag filter rejects Cmd+Shift+Opt+2
+        // and Cmd+Shift+Ctrl+2 so those chords stay free for other use.
+        //
+        // v15p4r (2026-05-23): autorepeat guard. When the user holds
+        // Cmd+Shift+2 for ~200 ms (which they routinely do, since the
+        // screenshot UI takes a moment to come up), macOS sends
+        // additional keyDown events with the autorepeat bit set. Each
+        // fired the publisher → each spawned its own polling timer →
+        // each posted Cmd+V when the clipboard changed → triple paste.
+        // Fix: ignore repeats. The publisher fires only on the initial
+        // press.
+        if eventType == .keyDown {
+            let kc = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+            let f = event.flags
+            let isAutorepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
+            if kc == Self.screenshotKeyCode2
+                && f.contains(.maskCommand)
+                && f.contains(.maskShift)
+                && !f.contains(.maskAlternate)
+                && !f.contains(.maskControl) {
+                if !isAutorepeat {
+                    screenshotPasteShortcutPublisher.send(())
+                }
+                return nil
+            }
+        }
+        // Also consume the corresponding keyUp so the destination app
+        // (after the screencapture overlay closes) doesn't see a phantom
+        // "2" character. Without this, a TextEdit / Slack input that has
+        // focus would receive "2" between when screencapture exits and
+        // when we post Cmd+V.
+        if eventType == .keyUp {
+            let kc = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
+            let f = event.flags
+            if kc == Self.screenshotKeyCode2
+                && f.contains(.maskCommand)
+                && f.contains(.maskShift) {
+                return nil
+            }
+        }
 
         let eventKeyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
         let shortcutTransition = BuddyPushToTalkShortcut.shortcutTransition(
@@ -342,25 +432,10 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             realtimeTransitionPublisher.send(.released)
         }
 
-        // Realtime hands-free toggle (Fn+Cmd+Opt, v15p2) is detected
-        // in parallel. Forbidden flags (.shift/.control) keep it
-        // mutually exclusive with everything else.
-        let realtimeHandsFreeToggleTransition = BuddyPushToTalkShortcut.realtimeHandsFreeToggleTransition(
-            eventType: eventType,
-            modifierFlagsRawValue: event.flags.rawValue,
-            wasPreviouslyPressed: isRealtimeHandsFreeToggleShortcutCurrentlyPressed
-        )
-
-        switch realtimeHandsFreeToggleTransition {
-        case .none:
-            break
-        case .pressed:
-            isRealtimeHandsFreeToggleShortcutCurrentlyPressed = true
-            realtimeHandsFreeToggleTransitionPublisher.send(.pressed)
-        case .released:
-            isRealtimeHandsFreeToggleShortcutCurrentlyPressed = false
-            realtimeHandsFreeToggleTransitionPublisher.send(.released)
-        }
+        // v15p3fq (2026-05-17): Realtime hands-free toggle (Fn+Shift+Opt)
+        // detector removed. The chord is now AssemblyAI VTT, driven by
+        // the burst detector above (same modifier flags, .shift/.opt/.fn).
+        // Marin hands-free remains available via double-tap Option.
 
         // Polish hotkey (⌃⌥⌘) is detected in parallel. Its transition
         // function forbids .function and .shift, so it cannot
@@ -391,6 +466,8 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         ctrlTapState.processFlagsChangedEvent(eventType: eventType, event: event)
         cmdTapState.processFlagsChangedEvent(eventType: eventType, event: event)
         optTapState.processFlagsChangedEvent(eventType: eventType, event: event)
+        // v15p3gt (2026-05-18): Shift tap detector for speed-read mode.
+        shiftTapState.processFlagsChangedEvent(eventType: eventType, event: event)
 
         // Non-modifier keyDown means a chord is happening. Reset all
         // tap trackers so e.g. ⌘+C doesn't look like a single Cmd tap.
@@ -398,10 +475,26 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             ctrlTapState.notifyNonModifierKeyDown()
             cmdTapState.notifyNonModifierKeyDown()
             optTapState.notifyNonModifierKeyDown()
+            shiftTapState.notifyNonModifierKeyDown()
 
             let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
             if keyCode == Self.escapeKeyCode {
                 escapeKeyPublisher.send()
+                // v15p3bx (2026-05-13): consume Esc at the tap level when
+                // Clicky+ is the one acting on it. Without this, every
+                // Esc — even ones meant to cancel a Clicky toggle or
+                // interrupt Marin — also reaches the foreground app and
+                // dismisses modals, cancels Cowork work, etc.
+                //
+                // The predicate is populated by CompanionManager and
+                // returns true when ANY active mode/state is set (Marin
+                // alive, VTT/typing/polish in flight, any toggle locked,
+                // voice state .responding/.processing, etc.). When false
+                // (Clicky idle), Esc passes through as it always did so
+                // unrelated workflows in other apps still work.
+                if shouldConsumeEscapeWhenPressed?() == true {
+                    return nil
+                }
             }
         }
 
@@ -546,12 +639,19 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         singleTapPublisher: optionSingleTapPublisher,
         doubleTapPublisher: optionDoubleTapPublisher
     )
+    // v15p3gt (2026-05-18): Shift tap state for speed-read engage.
+    private lazy var shiftTapState = ModifierTapState(
+        modifier: .shift,
+        singleTapPublisher: shiftSingleTapPublisher,
+        doubleTapPublisher: shiftDoubleTapPublisher
+    )
 
     // MARK: - Native macOS screenshot session
 
     /// Key codes for the top-row number keys that pair with Cmd+Shift to
     /// trigger native macOS screenshot flows on a standard ANSI/ISO layout:
     /// 3 → full screen, 4 → selection (and spacebar window mode), 5 → UI.
+    private static let screenshotKeyCode2: UInt16 = 19   // v15p4p: Clicky+ screenshot-and-paste
     private static let screenshotKeyCode3: UInt16 = 20
     private static let screenshotKeyCode4: UInt16 = 21
     private static let screenshotKeyCode5: UInt16 = 23
