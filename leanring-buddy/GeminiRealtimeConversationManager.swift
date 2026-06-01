@@ -623,6 +623,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                     "location": ["type": "STRING", "description": "Optional location string, e.g. 'Zoom' or '123 Main St'."],
                     "attendees_csv": ["type": "STRING", "description": "Optional comma-separated list of attendee email addresses (e.g. 'lukas@x.com, kevin@y.com'). ONLY include if Steph explicitly named people to invite."],
                     "send_invites": ["type": "BOOLEAN", "description": "If true, Google emails calendar invites to attendees. Default false. ONLY set true if Steph explicitly asks ('send invites', 'invite them')."],
+                    "event_type": ["type": "STRING", "description": "Event type. Omit or 'default' for a normal event. Use 'outOfOffice' when Steph asks for an out-of-office / OOO / holiday / vacation block — this creates a real Google OOO event that AUTO-DECLINES conflicting meetings. OOO events cannot have attendees (don't pass attendees_csv with outOfOffice)."],
                 ],
                 "required": ["summary", "start", "end"],
             ],
@@ -1060,6 +1061,9 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 if !emails.isEmpty { body["attendees"] = emails }
             }
             if let s = args["send_invites"] as? Bool { body["send_invites"] = s }
+            // v15p4cv (2026-06-01): pass through OOO event type so Marin can
+            // create real out-of-office blocks that auto-decline conflicts.
+            if let et = args["event_type"] as? String, !et.isEmpty { body["event_type"] = et }
             // v15p4bk (2026-05-29): log the FULL request + response for
             // calendar creates. Previous diag only logged "tool_response
             // sent" with no payload, so when Marin claimed success and

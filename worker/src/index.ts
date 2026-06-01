@@ -1612,6 +1612,7 @@ async function handleCalendarCreateEvent(request: Request, env: Env): Promise<Re
     location?: string;
     attendees?: string[];
     send_invites?: boolean;
+    event_type?: string; // v15p4cv: "default" (normal) or "outOfOffice"
   };
   try {
     payload = (await request.json()) as typeof payload;
@@ -1622,6 +1623,14 @@ async function handleCalendarCreateEvent(request: Request, env: Env): Promise<Re
   const summary = (payload.summary ?? "").trim();
   const start = (payload.start ?? "").trim();
   const end = (payload.end ?? "").trim();
+  // v15p4cv (2026-06-01): out-of-office event support. Google treats OOO as a
+  // distinct eventType that auto-declines conflicting meetings. OOO events have
+  // Google-imposed constraints: primary calendar only (we already post there),
+  // no attendees, and they should be opaque/busy. We accept event_type and,
+  // when "outOfOffice", attach outOfOfficeProperties with auto-decline.
+  const eventType = (payload.event_type ?? "default").trim();
+  const isOOO = eventType === "outOfOffice";
+
   if (!summary) return jsonError("summary is required", 400);
   if (!start) return jsonError("start is required (ISO8601 with offset)", 400);
   if (!end) return jsonError("end is required (ISO8601 with offset)", 400);
@@ -1647,11 +1656,21 @@ async function handleCalendarCreateEvent(request: Request, env: Env): Promise<Re
     start: { dateTime: start },
     end: { dateTime: end },
   };
-  if (payload.description) eventBody.description = payload.description;
-  if (payload.location) eventBody.location = payload.location;
-  if (payload.attendees && payload.attendees.length > 0) {
+  if (isOOO) {
+    // Google requires eventType + outOfOfficeProperties for a real OOO block.
+    // autoDeclineMode "declineAllConflictingInvitations" declines both existing
+    // and new conflicts — the behavior Steph wants for holiday OOO.
+    eventBody.eventType = "outOfOffice";
+    eventBody.outOfOfficeProperties = {
+      autoDeclineMode: "declineAllConflictingInvitations",
+    };
+    eventBody.transparency = "opaque"; // shows as busy
+    // OOO events cannot have attendees; ignore any passed in.
+  } else if (payload.attendees && payload.attendees.length > 0) {
     eventBody.attendees = payload.attendees.map((email) => ({ email }));
   }
+  if (payload.description) eventBody.description = payload.description;
+  if (payload.location) eventBody.location = payload.location;
 
   // sendUpdates=none means Google does NOT email attendees on create.
   // We default to none unless Steph explicitly asks for invites via
