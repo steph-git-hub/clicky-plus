@@ -36,6 +36,7 @@
 import AppKit
 import AVFoundation
 import Combine
+import CoreAudio
 import Foundation
 
 /// Each user-visible event Clicky+ plays a sound for.
@@ -167,6 +168,18 @@ final class ClickySoundEngine: ObservableObject {
     private let mixerNode: AVAudioMixerNode
     private let sampleRate: Double = 48_000
 
+    // v15p4cu (2026-06-01): idle-stop on Bluetooth output. A continuously
+    // running output AVAudioEngine forces CoreAudio to open a Bluetooth
+    // headset (AirPods) in HFP/call mode, which enables sidetone (Steph hears
+    // his own voice fed back) and drops the AirPods to call-quality audio —
+    // even when Clicky is idle and making no sound. Fix: when output is
+    // Bluetooth, don't hold the engine warm. Start it on demand in play()
+    // (already lazy) and stop it after a short idle window so the AirPods fall
+    // back to A2DP. On built-in / wired output we keep the engine warm exactly
+    // as before (no latency change where there was no problem).
+    private var idleStopWorkItem: DispatchWorkItem?
+    private static let bluetoothIdleStopDelaySeconds: Double = 2.5
+
     /// Built-in synthesized buffers — one set per built-in family.
     private var buffers: [ClickySoundFamily: [ClickySoundID: AVAudioPCMBuffer]] = [:]
 
@@ -257,14 +270,73 @@ final class ClickySoundEngine: ObservableObject {
         // custom samples in alphabetical order.
         recomputeAllFamilies()
 
-        // Start the engine. If this fails, play() will silently no-op
-        // and we never disrupt the rest of the app.
-        do {
-            try engine.start()
-            playerNode.play()
-        } catch {
-            print("⚠️ ClickySoundEngine: failed to start engine — \(error)")
+        // v15p4cu (2026-06-01): only hold the engine warm at launch when
+        // output is NOT Bluetooth. On AirPods, a running engine pins HFP/call
+        // mode (sidetone). play() lazy-starts the engine on demand, so leaving
+        // it stopped here just means the first click on AirPods pays a small
+        // start cost — acceptable to kill the constant feedback.
+        if Self.defaultOutputDeviceUsesBluetoothTransport() {
+            print("🔇 ClickySoundEngine: Bluetooth output at launch — engine left stopped (idle-stop mode)")
+        } else {
+            do {
+                try engine.start()
+                playerNode.play()
+            } catch {
+                print("⚠️ ClickySoundEngine: failed to start engine — \(error)")
+            }
         }
+    }
+
+    /// v15p4cu (2026-06-01): true when the current default OUTPUT device is a
+    /// Bluetooth transport (AirPods etc.). Mirrors the input-side check in
+    /// BuddyDictationManager. Used to decide whether to idle-stop the engine.
+    private static func defaultOutputDeviceUsesBluetoothTransport() -> Bool {
+        var deviceID = AudioDeviceID(0)
+        var deviceIDSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        var deviceIDAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let deviceIDStatus = AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject),
+            &deviceIDAddr, 0, nil, &deviceIDSize, &deviceID
+        )
+        guard deviceIDStatus == noErr, deviceID != 0 else { return false }
+
+        var transport: UInt32 = 0
+        var transportSize = UInt32(MemoryLayout<UInt32>.size)
+        var transportAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let transportStatus = AudioObjectGetPropertyData(
+            deviceID, &transportAddr, 0, nil, &transportSize, &transport
+        )
+        guard transportStatus == noErr else { return false }
+        return transport == kAudioDeviceTransportTypeBluetooth
+            || transport == kAudioDeviceTransportTypeBluetoothLE
+    }
+
+    /// v15p4cu (2026-06-01): after a sound plays on Bluetooth output, schedule
+    /// the engine to stop after a short idle window so the AirPods drop back to
+    /// A2DP (killing sidetone). Any new play() within the window cancels and
+    /// reschedules. No-op on non-Bluetooth output (engine stays warm).
+    private func scheduleIdleStopIfBluetooth() {
+        idleStopWorkItem?.cancel()
+        idleStopWorkItem = nil
+        guard Self.defaultOutputDeviceUsesBluetoothTransport() else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if self.playerNode.isPlaying { self.playerNode.stop() }
+            if self.engine.isRunning { self.engine.stop() }
+        }
+        idleStopWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.bluetoothIdleStopDelaySeconds,
+            execute: work
+        )
     }
 
     // MARK: - Public API
@@ -281,6 +353,10 @@ final class ClickySoundEngine: ObservableObject {
     /// for interface sounds).
     func play(_ id: ClickySoundID) {
         guard isEnabled else { return }
+        // v15p4cu: a new sound cancels any pending idle-stop so the engine
+        // stays up across a burst of clicks.
+        idleStopWorkItem?.cancel()
+        idleStopWorkItem = nil
         if !engine.isRunning {
             try? engine.start()
             if !playerNode.isPlaying { playerNode.play() }
@@ -288,6 +364,7 @@ final class ClickySoundEngine: ObservableObject {
         if !playerNode.isPlaying {
             playerNode.play()
         }
+        defer { scheduleIdleStopIfBluetooth() }
         // v15p3dc (2026-05-15): use .interrupts on the FIRST buffer of
         // each play() call so rapid retriggers replace the current
         // playback instead of queueing behind it. Without this, clicking
@@ -326,6 +403,8 @@ final class ClickySoundEngine: ObservableObject {
     /// same custom-pattern dispatch, same enable-flag short-circuit.
     func preview(family: ActiveSoundFamily, id: ClickySoundID) {
         guard isEnabled else { return }
+        idleStopWorkItem?.cancel()
+        idleStopWorkItem = nil
         if !engine.isRunning {
             try? engine.start()
             if !playerNode.isPlaying { playerNode.play() }
@@ -333,6 +412,7 @@ final class ClickySoundEngine: ObservableObject {
         if !playerNode.isPlaying {
             playerNode.play()
         }
+        defer { scheduleIdleStopIfBluetooth() }
         // v15p3dc (2026-05-15): same .interrupts semantics as play().
         // The matrix preview window often gets rapid clicks while the
         // user A/B's families; .interrupts ensures each click replaces
