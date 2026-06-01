@@ -5109,11 +5109,14 @@ final class CompanionManager: ObservableObject {
         var request = URLRequest(url: voiceCommandRouteURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "content-type")
-        // 8s timeout — polish uses Sonnet 4.6 (~1.5-3s typical). Set below
-        // the VTT safety net's 10s so a slow polish fails gracefully (falls
-        // back to the unpolished punctuated text) before the safety net
-        // would force-cancel mid-call and lose the transcript entirely.
-        request.timeoutInterval = 8
+        // v15p4cp (2026-06-01): 9.5s timeout — polish uses Sonnet 4.6 (~1.5-3s
+        // typical). Bumped from 8s after a 583-char/107-word toggle polish hit
+        // 8009ms and timed out by 9ms. MUST stay below the VTT watchdog's 10s
+        // force-clear (scheduleVoiceStateWatchdog) so a slow polish fails
+        // gracefully (falls back to the unpolished punctuated text) before the
+        // watchdog force-cancels mid-call and loses the transcript entirely.
+        // 9.5s is the safe ceiling under that 10s cap.
+        request.timeoutInterval = 9.5
 
         var requestBody: [String: Any] = [
             "command": "polish",
