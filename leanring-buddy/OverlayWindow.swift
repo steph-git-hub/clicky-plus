@@ -1458,8 +1458,6 @@ private struct CursorDotWithSonarRing: View {
     private let ringMinDiameter: CGFloat = 11
     private let ringMaxDiameter: CGFloat = 36
 
-    @State private var processingSpin: Double = 0
-
     // v15p4cq (2026-06-01): SINGLE-DRAW CANVAS. Prior approaches (v15p3bz
     // ZStack+frame, v15p3dg compositingGroup, v15p3he overlay-on-dot) all
     // chased STATIC concentricity — making the ring centered on the dot at
@@ -1482,61 +1480,74 @@ private struct CursorDotWithSonarRing: View {
     // ring size/spin is driven by the values feeding the draw, not by
     // animating separate child frames.
     private let canvasSide: CGFloat = 40
+    // Processing ring spin period (seconds for a full 360°). Matches the
+    // prior .rotationEffect cadence (1.2s/rev).
+    private let spinPeriod: Double = 1.2
 
     var body: some View {
-        Canvas { context, size in
-            let center = CGPoint(x: size.width / 2, y: size.height / 2)
+        // v15p4cs (2026-06-01): wrap the Canvas in TimelineView(.animation).
+        // A Canvas does NOT continuously redraw from a one-shot
+        // withAnimation(repeatForever) value — SwiftUI only re-runs the draw
+        // closure when an *input* changes, so the v15p4cq spin animation drew
+        // the dashed processing ring once and froze it (Steph: "frozen broken
+        // line halo"). TimelineView(.animation) gives the Canvas a real
+        // per-frame clock; we derive the spin angle from that clock so the
+        // ring rotates smoothly. The single-draw concentricity from v15p4cq is
+        // preserved — all shapes still draw from one shared center point.
+        TimelineView(.animation) { timeline in
+            Canvas { context, size in
+                let center = CGPoint(x: size.width / 2, y: size.height / 2)
 
-            // Sonar ring — listening only. Drawn first so the dot sits on top.
-            if sonarOpacity > 0 {
-                let r = sonarDiameter / 2
-                let ringRect = CGRect(
-                    x: center.x - r, y: center.y - r,
-                    width: sonarDiameter, height: sonarDiameter
+                // Sonar ring — listening only. Drawn first so dot sits on top.
+                if sonarOpacity > 0 {
+                    let r = sonarDiameter / 2
+                    let ringRect = CGRect(
+                        x: center.x - r, y: center.y - r,
+                        width: sonarDiameter, height: sonarDiameter
+                    )
+                    context.stroke(
+                        Path(ellipseIn: ringRect),
+                        with: .color(tint.opacity(sonarOpacity)),
+                        lineWidth: 1.4
+                    )
+                }
+
+                // Processing ring — dashed, spinning, concentric by construction.
+                if mode == .processing {
+                    // Spin angle derived from the timeline clock so the Canvas
+                    // actually re-renders each frame.
+                    let t = timeline.date.timeIntervalSinceReferenceDate
+                    let angle = (t.truncatingRemainder(dividingBy: spinPeriod) / spinPeriod) * 360.0
+                    let pr: CGFloat = 9 // 18pt diameter
+                    let procRect = CGRect(
+                        x: center.x - pr, y: center.y - pr,
+                        width: pr * 2, height: pr * 2
+                    )
+                    var procCtx = context
+                    procCtx.translateBy(x: center.x, y: center.y)
+                    procCtx.rotate(by: .degrees(angle))
+                    procCtx.translateBy(x: -center.x, y: -center.y)
+                    procCtx.stroke(
+                        Path(ellipseIn: procRect),
+                        with: .color(tint.opacity(0.7)),
+                        style: StrokeStyle(lineWidth: 1.2, dash: [3, 2.5])
+                    )
+                }
+
+                // Dot — always, same center.
+                let dr = dotDiameter / 2
+                let dotRect = CGRect(
+                    x: center.x - dr, y: center.y - dr,
+                    width: dotDiameter, height: dotDiameter
                 )
-                context.stroke(
-                    Path(ellipseIn: ringRect),
-                    with: .color(tint.opacity(sonarOpacity)),
-                    lineWidth: 1.4
+                context.fill(
+                    Path(ellipseIn: dotRect),
+                    with: .color(tint.opacity(dotOpacity))
                 )
             }
-
-            // Processing ring — dashed, spinning, concentric by construction.
-            if mode == .processing {
-                let pr: CGFloat = 9 // 18pt diameter
-                let procRect = CGRect(
-                    x: center.x - pr, y: center.y - pr,
-                    width: pr * 2, height: pr * 2
-                )
-                var procCtx = context
-                procCtx.translateBy(x: center.x, y: center.y)
-                procCtx.rotate(by: .degrees(processingSpin))
-                procCtx.translateBy(x: -center.x, y: -center.y)
-                procCtx.stroke(
-                    Path(ellipseIn: procRect),
-                    with: .color(tint.opacity(0.7)),
-                    style: StrokeStyle(lineWidth: 1.2, dash: [3, 2.5])
-                )
-            }
-
-            // Dot — always, same center.
-            let dr = dotDiameter / 2
-            let dotRect = CGRect(
-                x: center.x - dr, y: center.y - dr,
-                width: dotDiameter, height: dotDiameter
-            )
-            context.fill(
-                Path(ellipseIn: dotRect),
-                with: .color(tint.opacity(dotOpacity))
-            )
         }
         .frame(width: canvasSide, height: canvasSide)
         .allowsHitTesting(false)
-        .onAppear {
-            withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
-                processingSpin = 360
-            }
-        }
         .animation(.spring(response: 0.18, dampingFraction: 0.65), value: sonarDiameter)
         .animation(.easeInOut(duration: 0.2), value: mode)
     }
