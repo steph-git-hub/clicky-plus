@@ -767,6 +767,12 @@ enum MarinResearchTools {
         }
         let resultString = output.stringValue ?? ""
         appendAppleScriptLog(script: source, outcome: "OK\(resultString.isEmpty ? "" : " → \(resultString.prefix(200))")")
+        // v15p4dh (2026-06-02): audible confirmation ding when Marin actually
+        // does something via run_applescript. Steph wanted a 'it happened' cue
+        // that pairs with announce-then-do. Reuses the existing sound engine;
+        // .polishDone is a short pleasant chime. Only on success (not error/
+        // refused/blocked — those are surfaced verbally).
+        ClickySoundEngine.shared.play(.polishDone)
         return ["status": "ok", "result": resultString]
     }
 
