@@ -628,6 +628,18 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "required": ["summary", "start", "end"],
             ],
         ],
+        // ── delete_calendar_event (v15p4do) ──
+        [
+            "name": "delete_calendar_event",
+            "description": "Delete an event from Steph's primary Google Calendar by its event ID. WORKFLOW: you do NOT know event IDs directly — FIRST call list_calendar_events (or find_next_event) to find the event and get its `id` field, READ THE TITLE + DATE BACK to Steph and wait for his explicit yes ('yes delete it' / 'go ahead'), THEN call this with that id. Deleting is destructive, so always confirm the specific event before calling. Use this when Steph says 'delete that event', 'remove the X meeting', 'cancel the old hold', or when replacing a regular event with an OOO version (create the OOO, then delete the old one). Does not email attendees (sendUpdates=none).",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "event_id": ["type": "STRING", "description": "The event's id from a prior list_calendar_events / find_next_event result. Required."],
+                ],
+                "required": ["event_id"],
+            ],
+        ],
         // ── run_applescript: catch-all local OS control (v15p4cw) ──
         [
             "name": "run_applescript",
@@ -1101,6 +1113,14 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "[gemini] create_calendar_event RESPONSE (\(createResponse.count) chars): \(createResponse.prefix(800))"
             )
             return createResponse
+        case "delete_calendar_event":
+            // v15p4do (2026-06-02): delete a calendar event by ID. Marin must
+            // first list_calendar_events to get the id + read the title back to
+            // Steph, then delete. The event_id comes from a prior list result.
+            let eventId = (args["event_id"] as? String) ?? ""
+            RealtimeConversationManager.appendDiag("[gemini] delete_calendar_event REQUEST: event_id=\"\(eventId)\"")
+            let delResponse = await safeWorkerCall(path: "/calendar/delete-event", body: ["event_id": eventId])
+            return delResponse
         case "search_slack":
             let query = (args["query"] as? String) ?? ""
             let maxResults = (args["max_results"] as? Int) ?? ((args["max_results"] as? NSNumber)?.intValue ?? 10)

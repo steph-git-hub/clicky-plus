@@ -684,7 +684,18 @@ enum MarinResearchTools {
     // than `bash`. We additionally block AppleScript's `do shell script`
     // escape hatch so it can't be used to smuggle arbitrary shell in.
 
+    // v15p4dn (2026-06-02): PERSISTENT action log. /tmp clears on reboot, so
+    // for a real audit trail ("always be able to find out what Marin did") the
+    // canonical log now lives in Application Support. We keep writing the /tmp
+    // copy too as a convenience mirror for quick debugging.
     private static let applescriptLogPath = "/tmp/clicky_applescript.log"
+    private static let persistentActionLogPath: String = {
+        let dir = (NSHomeDirectory() as NSString)
+            .appendingPathComponent("Library/Application Support/Clicky/action-log")
+        try? FileManager.default.createDirectory(
+            atPath: dir, withIntermediateDirectories: true, attributes: nil)
+        return (dir as NSString).appendingPathComponent("marin-actions.log")
+    }()
 
     /// Patterns that cause an OUTRIGHT REFUSAL — never executed regardless of
     /// confirmation. Case-insensitive substring match on the script source.
@@ -820,14 +831,16 @@ enum MarinResearchTools {
     private static func appendAppleScriptLog(script: String, outcome: String) {
         let ts = ISO8601DateFormatter().string(from: Date())
         let line = "[\(ts)] outcome=\(outcome)\n  script: \(script.replacingOccurrences(of: "\n", with: " ⏎ "))\n"
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: applescriptLogPath),
-               let handle = FileHandle(forWritingAtPath: applescriptLogPath) {
+        guard let data = line.data(using: .utf8) else { return }
+        // Write to BOTH the persistent audit log (canonical) and the /tmp mirror.
+        for path in [persistentActionLogPath, applescriptLogPath] {
+            if FileManager.default.fileExists(atPath: path),
+               let handle = FileHandle(forWritingAtPath: path) {
                 handle.seekToEndOfFile()
                 handle.write(data)
                 try? handle.close()
             } else {
-                try? data.write(to: URL(fileURLWithPath: applescriptLogPath))
+                try? data.write(to: URL(fileURLWithPath: path))
             }
         }
     }

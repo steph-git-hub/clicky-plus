@@ -138,6 +138,10 @@ export default {
         return await handleCalendarCreateEvent(request, env);
       }
 
+      if (url.pathname === "/calendar/delete-event") {
+        return await handleCalendarDeleteEvent(request, env);
+      }
+
       if (url.pathname === "/slack/search") {
         return await handleSlackSearch(request, env);
       }
@@ -1701,6 +1705,55 @@ async function handleCalendarCreateEvent(request: Request, env: Env): Promise<Re
     }),
     { status: 200, headers: { "content-type": "application/json" } }
   );
+}
+
+/// /calendar/delete-event (v15p4do, 2026-06-02) — delete an event from the
+/// primary calendar by its event ID. Marin gets the ID from a prior
+/// list-events call (she should look it up + read back the title before
+/// deleting). sendUpdates=none so attendees aren't emailed cancellations
+/// unless explicitly wanted (default none = safe).
+async function handleCalendarDeleteEvent(request: Request, env: Env): Promise<Response> {
+  let payload: { event_id?: string };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+  const eventId = (payload.event_id ?? "").trim();
+  if (!eventId) return jsonError("event_id is required", 400);
+
+  let accessToken: string;
+  try {
+    accessToken = await getCalendarAccessToken(env);
+  } catch (err) {
+    console.error(`[/calendar/delete-event] token exchange failed: ${err}`);
+    return jsonError(`Calendar auth failed: ${err}`, 500);
+  }
+
+  const url = new URL(
+    `https://www.googleapis.com/calendar/v3/calendars/primary/events/${encodeURIComponent(eventId)}`
+  );
+  url.searchParams.set("sendUpdates", "none");
+
+  const response = await fetch(url.toString(), {
+    method: "DELETE",
+    headers: { authorization: `Bearer ${accessToken}` },
+  });
+  // Google returns 204 No Content on success; 404/410 if already gone.
+  if (response.status === 204 || response.status === 200) {
+    return new Response(
+      JSON.stringify({ status: "deleted", event_id: eventId }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+  if (response.status === 404 || response.status === 410) {
+    return new Response(
+      JSON.stringify({ status: "already_gone", event_id: eventId, note: "Event not found or already deleted." }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+  const errorBody = await response.text();
+  return sanitizedUpstreamError("/calendar/delete-event", response.status, errorBody);
 }
 
 function summarizeCalendarEvent(ev: any): Record<string, unknown> {
