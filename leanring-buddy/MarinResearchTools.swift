@@ -726,52 +726,48 @@ enum MarinResearchTools {
             ]
         }
 
-        // 3. Execute OFF the main thread with a hard timeout.
+        // 3. Execute on the MAIN thread, with an AppleScript-level timeout.
         //
-        // v15p4cx (2026-06-01): NSAppleScript.executeAndReturnError is
-        // SYNCHRONOUS and an AppleEvent to an unresponsive app (e.g. Spotify
-        // sitting on its login screen) blocks for the system default ~120s.
-        // Running it inline froze Marin until the timeout fired (Steph hit this
-        // on the very first Spotify test). Run on a background queue and cap the
-        // wait at 10s so a wedged target app can never stall the voice agent.
-        let timeoutSeconds = 10.0
-        let resultLock = NSLock()
-        var resultPayload: [String: Any]? = nil
-        let done = DispatchSemaphore(value: 0)
-        DispatchQueue.global(qos: .userInitiated).async {
-            var errorInfo: NSDictionary?
-            let payload: [String: Any]
-            if let script = NSAppleScript(source: trimmed) {
-                let output = script.executeAndReturnError(&errorInfo)
-                if let errorInfo {
-                    let msg = (errorInfo[NSAppleScript.errorMessage] as? String) ?? "\(errorInfo)"
-                    payload = ["status": "error", "reason": msg]
-                } else {
-                    payload = ["status": "ok", "result": output.stringValue ?? ""]
-                }
-            } else {
-                payload = ["status": "error", "reason": "Could not compile the AppleScript."]
+        // v15p4cz (2026-06-01): REVERTED the v15p4cx background-thread approach.
+        // It fixed the freeze but BROKE the macOS automation PERMISSION PROMPT:
+        // TCC only surfaces the "Clicky wants to control <app>" prompt when the
+        // Apple event is sent from the MAIN thread. From a background queue macOS
+        // silently denies (errAEEventNotPermitted, "Not authorized") and never
+        // even lists the app under Privacy → Automation — exactly what Steph saw
+        // (no prompt, Clicky absent from the list).
+        //
+        // To get the prompt back AND avoid the original ~120s freeze on an
+        // unresponsive app, we run on the main thread but wrap the user's script
+        // in `with timeout of N seconds`, which caps how long app commands wait
+        // for a reply. Worst case the main thread blocks ~N seconds instead of
+        // 120 — a tolerable hitch, and only when an app is genuinely wedged.
+        let timeoutSeconds = 12
+        let wrapped = "with timeout of \(timeoutSeconds) seconds\n\(trimmed)\nend timeout"
+
+        var errorInfo: NSDictionary?
+        guard let script = NSAppleScript(source: wrapped) else {
+            // Fall back to the unwrapped script if the wrap fails to compile
+            // (rare — e.g. the script defines top-level handlers).
+            guard let bare = NSAppleScript(source: trimmed) else {
+                appendAppleScriptLog(script: trimmed, outcome: "ERROR (could not compile)")
+                return ["status": "error", "reason": "Could not compile the AppleScript."]
             }
-            resultLock.lock(); resultPayload = payload; resultLock.unlock()
-            done.signal()
+            let out = bare.executeAndReturnError(&errorInfo)
+            return finishAppleScript(trimmed, out, errorInfo)
         }
+        let output = script.executeAndReturnError(&errorInfo)
+        return finishAppleScript(trimmed, output, errorInfo)
+    }
 
-        if done.wait(timeout: .now() + timeoutSeconds) == .timedOut {
-            // The AppleEvent is still blocking its background thread; we can't
-            // safely kill it, so we stop waiting and return. Nothing the script
-            // would do has been confirmed — better to free the agent than freeze.
-            appendAppleScriptLog(script: trimmed, outcome: "TIMEOUT (\(Int(timeoutSeconds))s)")
-            return [
-                "status": "error",
-                "reason": "The target app didn't respond in \(Int(timeoutSeconds)) seconds (it may be on a login screen or showing a dialog). Nothing was changed — tell Steph to check the app, then try again.",
-            ]
+    private static func finishAppleScript(_ source: String, _ output: NSAppleEventDescriptor, _ errorInfo: NSDictionary?) -> [String: Any] {
+        if let errorInfo {
+            let msg = (errorInfo[NSAppleScript.errorMessage] as? String) ?? "\(errorInfo)"
+            appendAppleScriptLog(script: source, outcome: "ERROR: \(msg)")
+            return ["status": "error", "reason": msg]
         }
-
-        resultLock.lock(); let payload = resultPayload ?? ["status": "error", "reason": "Unknown failure"]; resultLock.unlock()
-        let status = (payload["status"] as? String) ?? "error"
-        let detail = (payload["result"] as? String) ?? (payload["reason"] as? String) ?? ""
-        appendAppleScriptLog(script: trimmed, outcome: "\(status.uppercased())\(detail.isEmpty ? "" : " → \(detail.prefix(200))")")
-        return payload
+        let resultString = output.stringValue ?? ""
+        appendAppleScriptLog(script: source, outcome: "OK\(resultString.isEmpty ? "" : " → \(resultString.prefix(200))")")
+        return ["status": "ok", "result": resultString]
     }
 
     /// Heuristic: does this script create/modify/delete/send rather than just
