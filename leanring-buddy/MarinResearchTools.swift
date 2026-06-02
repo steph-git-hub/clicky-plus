@@ -786,28 +786,26 @@ enum MarinResearchTools {
         // app object>" still caught via the app-targeting verbs below. We err
         // toward allowing reads (low stakes) while still catching real writes,
         // creates, sends, deletes, and anything that types into apps.
-        // v15p4dd (2026-06-02): BROWSER NAVIGATION IS BENIGN. Steph's explicit
-        // pref — opening tabs / navigating Chrome or Safari is not destructive
-        // and should NOT require confirmation. So if the script targets a
-        // browser and isn't doing something genuinely destructive (close/quit/
-        // delete), treat it as benign regardless of "make new tab".
-        let isBrowser = lower.contains("google chrome") || lower.contains("safari")
-        let destructiveVerbs = ["delete ", "remove ", "quit", "close ", "send "]
-        let isDestructive = destructiveVerbs.contains { lower.contains($0) }
-        if isBrowser && !isDestructive { return false }
-
-        let mutatingVerbs = [
-            "make new", "delete ", "create ", "add ", "remove ", "move ",
-            "duplicate ", "save ", "quit ", "close ", "keystroke", "key code",
-            "send ",                 // Messages/Mail send
-            "set the clipboard",     // overwrites clipboard
-            "set value of",          // UI scripting writes
-            "perform action",        // UI scripting clicks
-            "click ",                // UI scripting clicks
-        ]
-        // "set <var> to" with no app-object target is a local read assignment —
-        // don't treat the generic "set " as mutating anymore.
-        return mutatingVerbs.contains { lower.contains($0) }
+        // v15p4de (2026-06-02): ANNOUNCE-THEN-DO for low-stakes actions.
+        // Steph found the read-back-and-wait gate uncanny for reminders/notes.
+        // New policy: the run_applescript confirmation gate fires ONLY for
+        // genuinely risky, hard-to-undo actions. Everything else (reminders,
+        // notes, browser nav, music, opening apps, quitting apps) runs
+        // immediately — Marin announces what she's doing in one natural sentence
+        // (handled in the tool DESCRIPTION / prompt) and just does it. Steph can
+        // interrupt if she misheard; no awkward "Okay?" dance.
+        //
+        // The ONLY thing still gated here: FILE DELETION (Finder delete — goes
+        // to Trash, recoverable, but Steph wants a confirm). Sending messages
+        // will get the dedicated approval-card; attendee calendar events are
+        // gated in the separate create_calendar_event tool, not here. Truly
+        // catastrophic ops (rm, disk, shutdown, do shell script) are already
+        // hard-REFUSED upstream by the deny-list, never reaching this gate.
+        let fileDeleteSignals = ["delete selection", "delete file", "delete folder",
+                                 "move ", "delete (every"]
+        let isFinderDelete = lower.contains("finder") &&
+            fileDeleteSignals.contains { lower.contains($0) }
+        return isFinderDelete
     }
 
     private static func appendAppleScriptLog(script: String, outcome: String) {
