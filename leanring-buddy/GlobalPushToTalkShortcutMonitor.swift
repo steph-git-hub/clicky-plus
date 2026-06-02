@@ -166,8 +166,15 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     // release stagger (~30-60ms) so it won't false-trigger.
     private static let vttReleaseLatchGuardSeconds: TimeInterval = 0.15
     /// Diagnostic for the release-to-polish gesture → /tmp/clicky_gesture_diag.log
+    /// v15p4dt: millisecond-precision timestamps so we can see the real gaps
+    /// between key transitions (second-resolution was hiding the truth).
+    private static let gestureDiagFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        return f
+    }()
     static func gestureDiag(_ msg: String) {
-        let ts = ISO8601DateFormatter().string(from: Date())
+        let ts = gestureDiagFormatter.string(from: Date())
         let line = "[\(ts)] \(msg)\n"
         let path = "/tmp/clicky_gesture_diag.log"
         if let data = line.data(using: .utf8) {
@@ -431,6 +438,12 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             let hasForbidden = currFlags.contains(.shift)
                 || currFlags.contains(.option)
                 || currFlags.contains(.command)
+
+            // v15p4dt: trace EVERY flag change while a session is active (or on
+            // a transition) so we see exactly when each key lifts, ms-precise.
+            if isVoiceToTextShortcutCurrentlyPressed || voiceToTextTransition == .pressed {
+                Self.gestureDiag("flags: fn=\(fnDown) ctrl=\(ctrlDown) bothDown=\(bothDown) oneDown=\(exactlyOneDown) trans=\(voiceToTextTransition) latched=\(vttReleaseToPolishLatched) armPending=\(vttReleaseLatchArmWorkItem != nil)")
+            }
 
             switch voiceToTextTransition {
             case .pressed:
