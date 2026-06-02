@@ -441,12 +441,9 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
                 || currFlags.contains(.option)
                 || currFlags.contains(.command)
 
-            // v15p4dt: trace EVERY flag change while a session is active (or on
-            // a transition) so we see exactly when each key lifts, ms-precise.
-            if isVoiceToTextShortcutCurrentlyPressed || voiceToTextTransition == .pressed {
-                Self.gestureDiag("flags: fn=\(fnDown) ctrl=\(ctrlDown) bothDown=\(bothDown) oneDown=\(exactlyOneDown) trans=\(voiceToTextTransition) latched=\(vttReleaseToPolishLatched) armPending=\(vttReleaseLatchArmWorkItem != nil)")
-            }
-
+            // v15p4dv: per-transition flag trace removed (was for tuning;
+            // validated 5/5 at 60ms guard). Lightweight latch logging (arm /
+            // fire / both-up) stays for ongoing visibility.
             switch voiceToTextTransition {
             case .pressed:
                 isVoiceToTextShortcutCurrentlyPressed = true
