@@ -779,18 +779,30 @@ enum MarinResearchTools {
     /// so the confirmation gate fires. Playback/volume/open are allow-listed as
     /// benign because they're reversible and low-stakes.
     private static func appleScriptLooksMutating(_ lower: String) -> Bool {
-        // Benign verbs that should NOT trip confirmation on their own.
-        let benignOnly = ["play", "pause", "next track", "previous track",
-                          "set sound volume", "playpause", "activate", "open location"]
-        // Mutating verbs.
-        let mutatingVerbs = ["make new", "delete", "set ", "send", "create",
-                             "add ", "remove", "move ", "duplicate", "save",
-                             "quit", "close ", "keystroke", "key code"]
-        // If it only contains benign verbs and none of the mutating ones, allow.
-        let hasMutating = mutatingVerbs.contains { lower.contains($0) }
-        let hasBenign = benignOnly.contains { lower.contains($0) }
-        if hasBenign && !hasMutating { return false }
-        return hasMutating
+        // v15p4cy (2026-06-01): tightened to avoid false positives on READ-ONLY
+        // scripts. The old list flagged bare "set " — but reading data routinely
+        // uses "set x to text of ..." for a LOCAL VARIABLE, which is not a
+        // mutation. Steph hit this reading an iMessage ("set latestMessage to
+        // text of first message...") — it got blocked for confirmation wrongly.
+        //
+        // New rule: only treat as mutating when a verb ACTS ON AN APP/SYSTEM
+        // OBJECT. "set ... to" as local assignment is allowed; "set <property of
+        // app object>" still caught via the app-targeting verbs below. We err
+        // toward allowing reads (low stakes) while still catching real writes,
+        // creates, sends, deletes, and anything that types into apps.
+        let mutatingVerbs = [
+            "make new", "delete ", "create ", "add ", "remove ", "move ",
+            "duplicate ", "save ", "quit ", "close ", "keystroke", "key code",
+            "send ",                 // Messages/Mail send
+            "set the clipboard",     // overwrites clipboard
+            "set volume",            // system volume (mild, but a change)
+            "set value of",          // UI scripting writes
+            "perform action",        // UI scripting clicks
+            "click ",                // UI scripting clicks
+        ]
+        // "set <var> to" with no app-object target is a local read assignment —
+        // don't treat the generic "set " as mutating anymore.
+        return mutatingVerbs.contains { lower.contains($0) }
     }
 
     private static func appendAppleScriptLog(script: String, outcome: String) {

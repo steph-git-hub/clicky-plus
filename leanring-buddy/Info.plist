@@ -16,5 +16,7 @@
 	<string>Clicky needs screen recording access to see your screen and help you.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Clicky uses speech recognition to transcribe your voice when you talk to it</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Clicky controls apps like Spotify, Reminders, Notes, and Finder on your behalf when you ask Marin to.</string>
 </dict>
 </plist>
