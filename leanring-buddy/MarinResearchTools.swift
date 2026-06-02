@@ -767,12 +767,15 @@ enum MarinResearchTools {
         }
         let resultString = output.stringValue ?? ""
         appendAppleScriptLog(script: source, outcome: "OK\(resultString.isEmpty ? "" : " → \(resultString.prefix(200))")")
-        // v15p4dh (2026-06-02): audible confirmation ding when Marin actually
-        // does something via run_applescript. Steph wanted a 'it happened' cue
-        // that pairs with announce-then-do. Reuses the existing sound engine;
-        // .polishDone is a short pleasant chime. Only on success (not error/
-        // refused/blocked — those are surfaced verbally).
-        ClickySoundEngine.shared.play(.polishDone)
+        // v15p4dk (2026-06-02): NO code-played sound. v15p4dh/dj played a chime
+        // here; ANY code-played audio (ClickySoundEngine AVAudioEngine OR even
+        // NSSound) risks colliding with Gemini's live realtime audio and hanging
+        // the notch voiceState in .processing (Steph: 'spinner stuck every time').
+        // Replaced with a spoken ONE-WORD confirmation driven by the tool
+        // description (e.g. 'Opened.' / 'Set.' / 'Done.') — that rides Marin's
+        // normal TTS output channel, which is the path that always worked, so it
+        // can't disrupt the audio graph. Tool just returns success; the prompt
+        // tells her to say the one word.
         return ["status": "ok", "result": resultString]
     }
 
