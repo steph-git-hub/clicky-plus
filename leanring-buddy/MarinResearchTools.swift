@@ -786,12 +786,21 @@ enum MarinResearchTools {
         // app object>" still caught via the app-targeting verbs below. We err
         // toward allowing reads (low stakes) while still catching real writes,
         // creates, sends, deletes, and anything that types into apps.
+        // v15p4dd (2026-06-02): BROWSER NAVIGATION IS BENIGN. Steph's explicit
+        // pref — opening tabs / navigating Chrome or Safari is not destructive
+        // and should NOT require confirmation. So if the script targets a
+        // browser and isn't doing something genuinely destructive (close/quit/
+        // delete), treat it as benign regardless of "make new tab".
+        let isBrowser = lower.contains("google chrome") || lower.contains("safari")
+        let destructiveVerbs = ["delete ", "remove ", "quit", "close ", "send "]
+        let isDestructive = destructiveVerbs.contains { lower.contains($0) }
+        if isBrowser && !isDestructive { return false }
+
         let mutatingVerbs = [
             "make new", "delete ", "create ", "add ", "remove ", "move ",
             "duplicate ", "save ", "quit ", "close ", "keystroke", "key code",
             "send ",                 // Messages/Mail send
             "set the clipboard",     // overwrites clipboard
-            "set volume",            // system volume (mild, but a change)
             "set value of",          // UI scripting writes
             "perform action",        // UI scripting clicks
             "click ",                // UI scripting clicks
