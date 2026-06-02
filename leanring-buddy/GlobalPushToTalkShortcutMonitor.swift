@@ -140,6 +140,26 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// independence guarantees as the other three — a single key event
     /// cannot toggle more than one mode.
     @Published private(set) var isVoiceToTextShortcutCurrentlyPressed = false
+
+    // v15p4dq (2026-06-02): "release-to-polish" gesture. During a VTT (Fn+Ctrl)
+    // hold, if Steph releases ONE key but keeps the OTHER held and keeps
+    // talking, that latches "run full toggle-polish on this dictation" — fired
+    // when he finally releases the second key. Use case: he realizes mid-stream
+    // the text is getting long and flags it without stopping.
+    //
+    // FALLBACK: set enableReleaseToPolishGesture = false → byte-for-byte old
+    // behavior (session ends on first key up, no latch). No git revert needed.
+    static let enableReleaseToPolishGesture = true
+    /// True once the single-key-held state has persisted past the guard window.
+    /// Consumer (CompanionManager) reads this at submit time and ORs it into the
+    /// polish decision; reset on next .pressed.
+    @Published private(set) var vttReleaseToPolishLatched = false
+    /// Pending latch-arm work item. Scheduled when we enter the one-key-held
+    /// state; fires after the guard window to SET the latch. Cancelled on full
+    /// release or re-press. The guard prevents a normal both-keys release (whose
+    /// two flagsChanged events are ~30-60ms apart) from tripping polish.
+    private var vttReleaseLatchArmWorkItem: DispatchWorkItem?
+    private static let vttReleaseLatchGuardSeconds: TimeInterval = 0.40
     /// Parallel state for the capture-to-inbox shortcut (Fn + Shift, v15p2).
     @Published private(set) var isCaptureToInboxShortcutCurrentlyPressed = false
     /// Parallel state for the Realtime conversation shortcut (Fn + Opt, v15p2).
@@ -377,15 +397,74 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             wasVoiceToTextPreviouslyPressed: isVoiceToTextShortcutCurrentlyPressed
         )
 
-        switch voiceToTextTransition {
-        case .none:
-            break
-        case .pressed:
-            isVoiceToTextShortcutCurrentlyPressed = true
-            voiceToTextTransitionPublisher.send(.pressed)
-        case .released:
-            isVoiceToTextShortcutCurrentlyPressed = false
-            voiceToTextTransitionPublisher.send(.released)
+        if Self.enableReleaseToPolishGesture {
+            // v15p4dq: gesture-aware handling. The stock transition fires
+            // .released the moment EITHER key lifts. We intercept that window:
+            // while a VTT session is active and exactly ONE of Fn/Ctrl is still
+            // held, we KEEP the session alive (don't send .released yet) and arm
+            // a latch timer. Only when BOTH keys are up do we send .released.
+            let currFlags = NSEvent.ModifierFlags(rawValue: UInt(event.flags.rawValue))
+                .intersection(.deviceIndependentFlagsMask)
+            let fnDown = currFlags.contains(.function)
+            let ctrlDown = currFlags.contains(.control)
+            let bothDown = fnDown && ctrlDown
+            let exactlyOneDown = (fnDown || ctrlDown) && !bothDown
+            // No-forbidden check mirrors voiceToTextTransition so adding shift/
+            // opt/cmd still cleanly ends the VTT chord (handled by stock path).
+            let hasForbidden = currFlags.contains(.shift)
+                || currFlags.contains(.option)
+                || currFlags.contains(.command)
+
+            switch voiceToTextTransition {
+            case .pressed:
+                isVoiceToTextShortcutCurrentlyPressed = true
+                vttReleaseToPolishLatched = false
+                vttReleaseLatchArmWorkItem?.cancel()
+                vttReleaseLatchArmWorkItem = nil
+                voiceToTextTransitionPublisher.send(.pressed)
+            case .released, .none:
+                // Stock would end on first key-up. Override: if a session is
+                // active, exactly one chord key remains, and no forbidden
+                // modifier is present → HOLD the session open + arm the latch.
+                if isVoiceToTextShortcutCurrentlyPressed && exactlyOneDown && !hasForbidden {
+                    if vttReleaseLatchArmWorkItem == nil {
+                        let work = DispatchWorkItem { [weak self] in
+                            self?.vttReleaseToPolishLatched = true
+                        }
+                        vttReleaseLatchArmWorkItem = work
+                        DispatchQueue.main.asyncAfter(
+                            deadline: .now() + Self.vttReleaseLatchGuardSeconds,
+                            execute: work)
+                    }
+                    // Do NOT send .released — session stays alive on one key.
+                } else if isVoiceToTextShortcutCurrentlyPressed && !fnDown && !ctrlDown {
+                    // BOTH keys now up → real end of session.
+                    vttReleaseLatchArmWorkItem?.cancel()
+                    vttReleaseLatchArmWorkItem = nil
+                    isVoiceToTextShortcutCurrentlyPressed = false
+                    voiceToTextTransitionPublisher.send(.released)
+                } else if isVoiceToTextShortcutCurrentlyPressed && hasForbidden {
+                    // A forbidden modifier joined (chord changed) → end cleanly,
+                    // matching stock behavior; don't treat as polish gesture.
+                    vttReleaseLatchArmWorkItem?.cancel()
+                    vttReleaseLatchArmWorkItem = nil
+                    isVoiceToTextShortcutCurrentlyPressed = false
+                    voiceToTextTransitionPublisher.send(.released)
+                }
+                // else: not an active VTT session — ignore (stock .none).
+            }
+        } else {
+            // Original behavior (fallback when gesture disabled).
+            switch voiceToTextTransition {
+            case .none:
+                break
+            case .pressed:
+                isVoiceToTextShortcutCurrentlyPressed = true
+                voiceToTextTransitionPublisher.send(.pressed)
+            case .released:
+                isVoiceToTextShortcutCurrentlyPressed = false
+                voiceToTextTransitionPublisher.send(.released)
+            }
         }
 
         // Capture-to-inbox shortcut (Fn + Shift, v15p2) is detected in

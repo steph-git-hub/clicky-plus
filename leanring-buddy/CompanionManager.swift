@@ -2908,9 +2908,10 @@ final class CompanionManager: ObservableObject {
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
                         let toggleScreenshot = self.vttToggleEngagementScreenshot
                         self.vttToggleEngagementScreenshot = nil
+                        let gesturePolish = self.globalPushToTalkShortcutMonitor.vttReleaseToPolishLatched
                         self.pasteVoiceToTextTranscript(
                             finalTranscript,
-                            polishAfterRepunctuate: isToggleSession,
+                            polishAfterRepunctuate: isToggleSession || gesturePolish,
                             contextScreenshot: toggleScreenshot
                         )
                     }
@@ -3027,9 +3028,13 @@ final class CompanionManager: ObservableObject {
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
                         let toggleScreenshot = self.vttToggleEngagementScreenshot
                         self.vttToggleEngagementScreenshot = nil
+                        // v15p4dq: release-to-polish gesture — if the latch
+                        // fired during this hold (one key released + kept
+                        // talking), polish even though it's a hold session.
+                        let gesturePolish = self.globalPushToTalkShortcutMonitor.vttReleaseToPolishLatched
                         self.pasteVoiceToTextTranscript(
                             finalTranscript,
-                            polishAfterRepunctuate: isToggleSession,
+                            polishAfterRepunctuate: isToggleSession || gesturePolish,
                             contextScreenshot: toggleScreenshot
                         )
                     },
