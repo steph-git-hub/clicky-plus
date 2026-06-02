@@ -18,5 +18,9 @@
 	<string>Clicky uses speech recognition to transcribe your voice when you talk to it</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Clicky controls apps like Spotify, Reminders, Notes, and Finder on your behalf when you ask Marin to.</string>
+	<key>NSRemindersUsageDescription</key>
+	<string>Clicky creates reminders for you when you ask Marin to.</string>
+	<key>NSCalendarsUsageDescription</key>
+	<string>Clicky reads and creates calendar events for you when you ask Marin to.</string>
 </dict>
 </plist>
