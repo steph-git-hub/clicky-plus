@@ -159,12 +159,14 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// release or re-press. The guard prevents a normal both-keys release (whose
     /// two flagsChanged events are ~30-60ms apart) from tripping polish.
     private var vttReleaseLatchArmWorkItem: DispatchWorkItem?
-    // v15p4ds (2026-06-02): guard dropped 400ms → 150ms. Diag showed the
-    // gesture works perfectly but 400ms was too long for Steph's natural
-    // motion — his quicker "lift one key, keep talking" releases the 2nd key
-    // in <400ms and missed the latch. 150ms still clears the normal both-keys
-    // release stagger (~30-60ms) so it won't false-trigger.
-    private static let vttReleaseLatchGuardSeconds: TimeInterval = 0.15
+    // v15p4du (2026-06-02): guard → 60ms, set from DATA. Phase-1 test measured
+    // Steph's 10 normal both-keys releases: stagger was 2/9/4/<1/2/9/16/12/3/6 ms
+    // — max ~16ms, almost all <10ms. So 60ms sits ~4x above his worst normal
+    // stagger (no false-triggers) yet so low that any intentional "lift one key
+    // and keep talking" clears it instantly — gesture feels immediate, no
+    // deliberate pause needed. Huge clean margin between ~16ms (normal) and the
+    // 150ms+ he held during real gestures.
+    private static let vttReleaseLatchGuardSeconds: TimeInterval = 0.06
     /// Diagnostic for the release-to-polish gesture → /tmp/clicky_gesture_diag.log
     /// v15p4dt: millisecond-precision timestamps so we can see the real gaps
     /// between key transitions (second-resolution was hiding the truth).
