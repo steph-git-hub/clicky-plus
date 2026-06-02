@@ -628,6 +628,19 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "required": ["summary", "start", "end"],
             ],
         ],
+        // ── run_applescript: catch-all local OS control (v15p4cw) ──
+        [
+            "name": "run_applescript",
+            "description": "Control any scriptable app or the OS on Steph's Mac by running AppleScript YOU generate. This is your broad local-control tool — use it to play/pause/skip music or set volume in Spotify or Music, open apps or URLs, create reminders/notes, control Finder, and similar Mac automation. \n\nSAFETY PROTOCOL — follow exactly:\n• BENIGN actions (music playback, volume, opening an app or URL): just announce in one sentence and call immediately with confirmed=false. \n• MUTATING actions (creating/editing/deleting/sending anything — reminders, notes, emails, files, quitting apps): you MUST read the action back to Steph in plain language and WAIT for an explicit 'yes / go ahead / do it' before calling with confirmed=true. Never set confirmed=true without that explicit yes. \n• Some operations are hard-blocked for safety (shell-outs, file deletion, disk ops, shutdown) and will be refused — don't try to work around a refusal. \n\nWrite correct AppleScript for the target app (e.g. `tell application \"Spotify\" to set sound volume to 50`). If a call returns status 'needs_confirmation', read the action back and retry with confirmed=true after Steph agrees. If it returns 'refused', tell Steph it's a blocked operation — do not attempt a workaround.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "script": ["type": "STRING", "description": "The AppleScript source to run. Write valid AppleScript targeting the relevant app (Spotify, Music, Reminders, Notes, Finder, System Events, etc.)."],
+                    "confirmed": ["type": "BOOLEAN", "description": "Set true ONLY for mutating actions AFTER Steph has explicitly said yes to a read-back. Leave false (or omit) for benign actions like playback/volume/open — those run without confirmation."],
+                ],
+                "required": ["script"],
+            ],
+        ],
         // ── Slack (worker-backed) ──────────────────────────────
         [
             "name": "search_slack",
@@ -1024,6 +1037,14 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             }
         case "read_clipboard":
             return await MainActor.run { MarinResearchTools.readClipboard() }
+        case "run_applescript":
+            // v15p4cw (2026-06-01): catch-all local OS-control tool. Deny-list
+            // + confirmation gate + logging live in MarinResearchTools.
+            let source = (args["script"] as? String) ?? ""
+            let confirmed = (args["confirmed"] as? Bool) ?? false
+            return await MainActor.run {
+                MarinResearchTools.runAppleScript(source: source, confirmed: confirmed)
+            }
         case "web_fetch":
             let url = (args["url"] as? String) ?? ""
             return await MarinResearchTools.webFetch(url: url)

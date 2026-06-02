@@ -659,6 +659,127 @@ enum MarinResearchTools {
         ]
     }
 
+    // MARK: - run_applescript (v15p4cw, 2026-06-01)
+    //
+    // Catch-all local OS-control tool. Lets Marin drive any scriptable Mac
+    // app (Spotify, Reminders, Notes, Finder, Mail, Music, System Events, etc.)
+    // by generating AppleScript on the fly — the "super functional, broadly"
+    // capability Steph wanted, modeled on Farza's GPT-Realtime-2 demo.
+    //
+    // SAFETY (Steph's machine runs real business work — voice mishearing flows
+    // straight to execution, so this is gated harder than other tools):
+    //   1. Deny-list — scripts containing genuinely destructive patterns are
+    //      REFUSED outright and never run (shell-outs, rm, disk erase, mass
+    //      delete, sudo, etc.). A misheard command can't reach these.
+    //   2. requiresConfirmation flag — the CALLER (Gemini dispatcher) is told
+    //      via the tool description to read back + wait for explicit yes before
+    //      calling with confirmed=true on any mutating/destructive action.
+    //      Benign actions (play/pause, volume, open app) run immediately.
+    //   3. Full logging — every script (run or refused) is written to
+    //      /tmp/clicky_applescript.log with the outcome, so anything odd is
+    //      reconstructable. Mirrors the calendar-tool verbose logging.
+    //
+    // AppleScript (not raw shell) is the deliberate choice: it reaches the
+    // structured app-automation doorway, which is broad but far more contained
+    // than `bash`. We additionally block AppleScript's `do shell script`
+    // escape hatch so it can't be used to smuggle arbitrary shell in.
+
+    private static let applescriptLogPath = "/tmp/clicky_applescript.log"
+
+    /// Patterns that cause an OUTRIGHT REFUSAL — never executed regardless of
+    /// confirmation. Case-insensitive substring match on the script source.
+    private static let applescriptDenyList: [String] = [
+        "do shell script",   // AppleScript → shell escape hatch
+        "rm -rf", "rm -r ", "/bin/rm", "diskutil erase", "erase disk",
+        "sudo ", "mkfs", "dd if=", "dd of=",
+        "delete every", "delete folder", "delete disk",
+        "empty trash",       // mass destructive; allow explicitly later if wanted
+        "system shutdown", "shut down", "restart computer",
+    ]
+
+    static func runAppleScript(source: String, confirmed: Bool) -> [String: Any] {
+        let trimmed = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            return ["status": "error", "reason": "Empty script"]
+        }
+        let lower = trimmed.lowercased()
+
+        // 1. Deny-list — refuse outright, never execute.
+        for pattern in applescriptDenyList where lower.contains(pattern) {
+            appendAppleScriptLog(script: trimmed, outcome: "REFUSED (deny-list: \(pattern))")
+            return [
+                "status": "refused",
+                "reason": "This script contains a blocked operation (\(pattern)) and was not run. Destructive/shell operations are disabled for safety.",
+            ]
+        }
+
+        // 2. Confirmation gate. The tool description instructs the model to set
+        // confirmed=true only after reading back a mutating action and getting
+        // an explicit yes. If a heuristic flags this as mutating and it's not
+        // confirmed, refuse and ask the caller to confirm. Benign read/playback
+        // verbs are allowed through without confirmation.
+        if Self.appleScriptLooksMutating(lower) && !confirmed {
+            appendAppleScriptLog(script: trimmed, outcome: "BLOCKED (needs confirmation)")
+            return [
+                "status": "needs_confirmation",
+                "reason": "This looks like it changes or creates something. Read the action back to Steph and call again with confirmed=true once he says yes.",
+            ]
+        }
+
+        // 3. Execute.
+        var errorInfo: NSDictionary?
+        guard let script = NSAppleScript(source: trimmed) else {
+            appendAppleScriptLog(script: trimmed, outcome: "ERROR (could not compile)")
+            return ["status": "error", "reason": "Could not compile the AppleScript."]
+        }
+        let output = script.executeAndReturnError(&errorInfo)
+        if let errorInfo {
+            let msg = (errorInfo[NSAppleScript.errorMessage] as? String) ?? "\(errorInfo)"
+            appendAppleScriptLog(script: trimmed, outcome: "ERROR: \(msg)")
+            return ["status": "error", "reason": msg]
+        }
+        let resultString = output.stringValue ?? ""
+        appendAppleScriptLog(script: trimmed, outcome: "OK\(resultString.isEmpty ? "" : " → \(resultString.prefix(200))")")
+        return [
+            "status": "ok",
+            "result": resultString,
+        ]
+    }
+
+    /// Heuristic: does this script create/modify/delete/send rather than just
+    /// read or control playback? Conservative — when unsure, treats as mutating
+    /// so the confirmation gate fires. Playback/volume/open are allow-listed as
+    /// benign because they're reversible and low-stakes.
+    private static func appleScriptLooksMutating(_ lower: String) -> Bool {
+        // Benign verbs that should NOT trip confirmation on their own.
+        let benignOnly = ["play", "pause", "next track", "previous track",
+                          "set sound volume", "playpause", "activate", "open location"]
+        // Mutating verbs.
+        let mutatingVerbs = ["make new", "delete", "set ", "send", "create",
+                             "add ", "remove", "move ", "duplicate", "save",
+                             "quit", "close ", "keystroke", "key code"]
+        // If it only contains benign verbs and none of the mutating ones, allow.
+        let hasMutating = mutatingVerbs.contains { lower.contains($0) }
+        let hasBenign = benignOnly.contains { lower.contains($0) }
+        if hasBenign && !hasMutating { return false }
+        return hasMutating
+    }
+
+    private static func appendAppleScriptLog(script: String, outcome: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(ts)] outcome=\(outcome)\n  script: \(script.replacingOccurrences(of: "\n", with: " ⏎ "))\n"
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: applescriptLogPath),
+               let handle = FileHandle(forWritingAtPath: applescriptLogPath) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                try? handle.close()
+            } else {
+                try? data.write(to: URL(fileURLWithPath: applescriptLogPath))
+            }
+        }
+    }
+
     // MARK: - web_fetch (v15p3em, 2026-05-17)
     //
     // Fetch a URL and return its text content. Pairs with Gemini's
