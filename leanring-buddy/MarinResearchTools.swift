@@ -726,24 +726,52 @@ enum MarinResearchTools {
             ]
         }
 
-        // 3. Execute.
-        var errorInfo: NSDictionary?
-        guard let script = NSAppleScript(source: trimmed) else {
-            appendAppleScriptLog(script: trimmed, outcome: "ERROR (could not compile)")
-            return ["status": "error", "reason": "Could not compile the AppleScript."]
+        // 3. Execute OFF the main thread with a hard timeout.
+        //
+        // v15p4cx (2026-06-01): NSAppleScript.executeAndReturnError is
+        // SYNCHRONOUS and an AppleEvent to an unresponsive app (e.g. Spotify
+        // sitting on its login screen) blocks for the system default ~120s.
+        // Running it inline froze Marin until the timeout fired (Steph hit this
+        // on the very first Spotify test). Run on a background queue and cap the
+        // wait at 10s so a wedged target app can never stall the voice agent.
+        let timeoutSeconds = 10.0
+        let resultLock = NSLock()
+        var resultPayload: [String: Any]? = nil
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            var errorInfo: NSDictionary?
+            let payload: [String: Any]
+            if let script = NSAppleScript(source: trimmed) {
+                let output = script.executeAndReturnError(&errorInfo)
+                if let errorInfo {
+                    let msg = (errorInfo[NSAppleScript.errorMessage] as? String) ?? "\(errorInfo)"
+                    payload = ["status": "error", "reason": msg]
+                } else {
+                    payload = ["status": "ok", "result": output.stringValue ?? ""]
+                }
+            } else {
+                payload = ["status": "error", "reason": "Could not compile the AppleScript."]
+            }
+            resultLock.lock(); resultPayload = payload; resultLock.unlock()
+            done.signal()
         }
-        let output = script.executeAndReturnError(&errorInfo)
-        if let errorInfo {
-            let msg = (errorInfo[NSAppleScript.errorMessage] as? String) ?? "\(errorInfo)"
-            appendAppleScriptLog(script: trimmed, outcome: "ERROR: \(msg)")
-            return ["status": "error", "reason": msg]
+
+        if done.wait(timeout: .now() + timeoutSeconds) == .timedOut {
+            // The AppleEvent is still blocking its background thread; we can't
+            // safely kill it, so we stop waiting and return. Nothing the script
+            // would do has been confirmed — better to free the agent than freeze.
+            appendAppleScriptLog(script: trimmed, outcome: "TIMEOUT (\(Int(timeoutSeconds))s)")
+            return [
+                "status": "error",
+                "reason": "The target app didn't respond in \(Int(timeoutSeconds)) seconds (it may be on a login screen or showing a dialog). Nothing was changed — tell Steph to check the app, then try again.",
+            ]
         }
-        let resultString = output.stringValue ?? ""
-        appendAppleScriptLog(script: trimmed, outcome: "OK\(resultString.isEmpty ? "" : " → \(resultString.prefix(200))")")
-        return [
-            "status": "ok",
-            "result": resultString,
-        ]
+
+        resultLock.lock(); let payload = resultPayload ?? ["status": "error", "reason": "Unknown failure"]; resultLock.unlock()
+        let status = (payload["status"] as? String) ?? "error"
+        let detail = (payload["result"] as? String) ?? (payload["reason"] as? String) ?? ""
+        appendAppleScriptLog(script: trimmed, outcome: "\(status.uppercased())\(detail.isEmpty ? "" : " → \(detail.prefix(200))")")
+        return payload
     }
 
     /// Heuristic: does this script create/modify/delete/send rather than just
