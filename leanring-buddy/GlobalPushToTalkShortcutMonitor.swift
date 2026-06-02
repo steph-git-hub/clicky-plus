@@ -160,6 +160,18 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// two flagsChanged events are ~30-60ms apart) from tripping polish.
     private var vttReleaseLatchArmWorkItem: DispatchWorkItem?
     private static let vttReleaseLatchGuardSeconds: TimeInterval = 0.40
+    /// Diagnostic for the release-to-polish gesture → /tmp/clicky_gesture_diag.log
+    static func gestureDiag(_ msg: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(ts)] \(msg)\n"
+        let path = "/tmp/clicky_gesture_diag.log"
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: path),
+               let h = FileHandle(forWritingAtPath: path) {
+                h.seekToEndOfFile(); h.write(data); try? h.close()
+            } else { try? data.write(to: URL(fileURLWithPath: path)) }
+        }
+    }
     /// Parallel state for the capture-to-inbox shortcut (Fn + Shift, v15p2).
     @Published private(set) var isCaptureToInboxShortcutCurrentlyPressed = false
     /// Parallel state for the Realtime conversation shortcut (Fn + Opt, v15p2).
@@ -428,8 +440,10 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
                 // modifier is present → HOLD the session open + arm the latch.
                 if isVoiceToTextShortcutCurrentlyPressed && exactlyOneDown && !hasForbidden {
                     if vttReleaseLatchArmWorkItem == nil {
+                        Self.gestureDiag("one-key-held detected (fn=\(fnDown) ctrl=\(ctrlDown)) — arming latch (\(Int(Self.vttReleaseLatchGuardSeconds*1000))ms)")
                         let work = DispatchWorkItem { [weak self] in
                             self?.vttReleaseToPolishLatched = true
+                            Self.gestureDiag("LATCH FIRED — polish will apply on full release")
                         }
                         vttReleaseLatchArmWorkItem = work
                         DispatchQueue.main.asyncAfter(
@@ -439,6 +453,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
                     // Do NOT send .released — session stays alive on one key.
                 } else if isVoiceToTextShortcutCurrentlyPressed && !fnDown && !ctrlDown {
                     // BOTH keys now up → real end of session.
+                    Self.gestureDiag("both keys up — ending session. latched=\(vttReleaseToPolishLatched)")
                     vttReleaseLatchArmWorkItem?.cancel()
                     vttReleaseLatchArmWorkItem = nil
                     isVoiceToTextShortcutCurrentlyPressed = false
