@@ -2572,6 +2572,7 @@ async function handleVoiceCommandPolish(
       `- DO NOT paraphrase CONTENT-BEARING words. Proper nouns, distinctive verbs, concrete nouns, technical terms, and signature phrases stay verbatim. Restructuring is for grammar/flow, not for changing WHAT was said. (Function words and clause structure CAN change when needed for coherence — that's the priority-(1) carve-out.)\n` +
       `- DO NOT compress meaning-preserving phrases for TIGHTNESS. "Part of me feels like" stays "Part of me feels like", not "I think". "I was thinking maybe we should" stays as said. Only compress when the long form creates an actual coherence problem (rare).\n` +
       `- DO NOT drop modifiers, qualifiers, or hedge words that affect meaning ("really", "pretty", "kind of" used as degree, "sometimes", "maybe", "actually" when emphatic).\n` +
+      `- DO NOT drop a trailing noun like "thing"/"stuff" that is part of the user's actual phrasing. "move forward with the migration thing" stays "...the migration thing" — "thing" is how he said it, not filler to strip. (v15p4dz: observed polish wrongly trimming this. Preserve it.)\n` +
       `- DO NOT reorder PARAGRAPHS or major topic blocks. Restructuring is at the clause/sentence level only, and only when needed for coherence.\n` +
       `- DO NOT inject new ideas, transitions, or framing the speaker didn't imply.\n` +
       // v15p3bj (2026-05-12): em-dash rule hardened. The previous
