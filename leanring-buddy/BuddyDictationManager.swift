@@ -695,6 +695,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     // Used by the Deepgram A/B test hotkey — only this engage uses
     // Deepgram, everything else continues to use `transcriptionProvider`.
     private var activeTranscriptionProviderOverride: (any BuddyTranscriptionProvider)?
+    /// v16 (2026-06-04): resolves the currently-selected VTT provider
+    /// (Deepgram/Scribe/Parakeet) so prewarm warms the engine the next
+    /// engage will actually use — not the base factory provider. Set by
+    /// CompanionManager; falls back to the base provider when nil.
+    var activeVTTProviderResolver: (() -> (any BuddyTranscriptionProvider)?)?
     private var audioEngine = AVAudioEngine()
     private var audioEngineUsesVoiceProcessing = false
     private var audioEngineConfigurationObserver: NSObjectProtocol?
@@ -934,7 +939,11 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     /// `prewarmSession` in their protocol conformance.
     func prewarmTranscriptionProvider() {
         let keyterms = buildTranscriptionKeyterms()
-        transcriptionProvider.prewarmSession(keyterms: keyterms)
+        // v16: warm the SELECTED VTT engine (Scribe/Deepgram/Parakeet),
+        // not just the base factory provider — otherwise the override
+        // engine cold-starts its token + handshake on every engage.
+        let provider = activeVTTProviderResolver?() ?? transcriptionProvider
+        provider.prewarmSession(keyterms: keyterms)
     }
 
     /// v14 (2026-04-30): unified audio-capture cleanup. Was duplicated across

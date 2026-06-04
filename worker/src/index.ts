@@ -102,6 +102,10 @@ export default {
         return await handleDeepgramToken(env);
       }
 
+      if (url.pathname === "/scribe-token") {
+        return await handleScribeToken(env);
+      }
+
       if (url.pathname === "/repunctuate") {
         return await handleRepunctuate(request, env);
       }
@@ -394,6 +398,35 @@ async function handleTranscribeToken(env: Env): Promise<Response> {
  * Request:  GET (no body)
  * Response: { access_token: string, expires_in: number }
  */
+async function handleScribeToken(env: Env): Promise<Response> {
+  // v16 (2026-06-04): mint a single-use realtime_scribe token for the
+  // Mac client's Scribe v2 WSS handshake. Master ELEVENLABS_API_KEY
+  // (same key used for TTS) stays in Worker secrets. Token expires in
+  // 15 min / single use. Mirrors /deepgram-token + /transcribe-token.
+  const response = await fetch(
+    "https://api.elevenlabs.io/v1/single-use-token/realtime_scribe",
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": env.ELEVENLABS_API_KEY,
+        "content-type": "application/json",
+      },
+    }
+  );
+
+  if (!response.ok) {
+    const errorBody = await response.text();
+    console.error(`[/scribe-token] ElevenLabs token error ${response.status}: ${errorBody}`);
+    return sanitizedUpstreamError("/scribe-token", response.status, errorBody);
+  }
+
+  const data = await response.text();
+  return new Response(data, {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
 async function handleDeepgramToken(env: Env): Promise<Response> {
   const response = await fetch(
     "https://api.deepgram.com/v1/auth/grant",

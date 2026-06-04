@@ -444,18 +444,20 @@ final class CompanionManager: ObservableObject {
     // use, cached forever after. Zero API cost.
     private let assemblyAITranscriptionProvider = AssemblyAIStreamingTranscriptionProvider()
     private let parakeetTranscriptionProvider = ParakeetStreamingTranscriptionProvider()
+    // v16 (2026-06-04): ElevenLabs Scribe v2 Realtime — STT bake-off entrant.
+    private let scribeTranscriptionProvider = ScribeStreamingTranscriptionProvider()
 
     /// User-selected VTT provider. Persisted to UserDefaults. Reads
     /// the key on every call so panel toggles take effect immediately.
     /// Default "deepgram" preserves prior behavior. Values: "deepgram"
-    /// / "assemblyai" / "parakeet".
+    /// / "scribe" / "parakeet".
     @AppStorage("clicky.vtt.provider") private(set) var selectedVTTProvider: String = "deepgram"
 
     /// Returns the provider instance matching the current selection.
     /// Falls back to Deepgram if the stored value is unrecognized.
     fileprivate var activeVTTProvider: any BuddyTranscriptionProvider {
         switch selectedVTTProvider {
-        case "assemblyai": return assemblyAITranscriptionProvider
+        case "scribe": return scribeTranscriptionProvider
         case "parakeet": return parakeetTranscriptionProvider
         default: return deepgramTranscriptionProvider
         }
@@ -1219,6 +1221,9 @@ final class CompanionManager: ObservableObject {
         bindVoiceStateObservation()
         bindAudioPowerLevel()
         bindShortcutTransitions()
+        // v16 (2026-06-04): point prewarm at the SELECTED VTT engine so
+        // Scribe/Parakeet get warmed (not just the base factory provider).
+        buddyDictationManager.activeVTTProviderResolver = { [weak self] in self?.activeVTTProvider }
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI

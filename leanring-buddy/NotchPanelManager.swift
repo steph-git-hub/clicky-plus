@@ -798,7 +798,7 @@ private struct NotchPillView: View {
             // provider — cyan Deepgram or orange AssemblyAI.
             let vttTint: Color = {
                 switch companionManager.selectedVTTProvider {
-                case "assemblyai": return DS.Colors.overlayCursorOrange
+                case "scribe": return DS.Colors.overlayCursorOrange
                 default: return DS.Colors.overlayCursorCyan
                 }
             }()

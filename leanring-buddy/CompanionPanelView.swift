@@ -1153,7 +1153,7 @@ struct CompanionPanelView: View {
 
             HStack(spacing: 0) {
                 vttProviderButton(label: "Deepgram", providerID: "deepgram")
-                vttProviderButton(label: "AssemblyAI", providerID: "assemblyai")
+                vttProviderButton(label: "Scribe v2", providerID: "scribe")
                 vttProviderButton(label: "Parakeet", providerID: "parakeet")
             }
             .background(
@@ -1743,7 +1743,7 @@ struct CompanionPanelView: View {
     // cyan for Deepgram, orange for AssemblyAI.
     private var vttIndicatorColor: Color {
         switch companionManager.selectedVTTProvider {
-        case "assemblyai": return DS.Colors.overlayCursorOrange
+        case "scribe": return DS.Colors.overlayCursorOrange
         default: return DS.Colors.overlayCursorCyan
         }
     }

@@ -40,7 +40,18 @@ enum MarinResearchTools {
     }
 
     private static var clickyRoadmapPath: String {
-        NSString("~/Desktop/Claude Cowork/Obsidian/Steph Vault/Projects/Clicky Plus - Roadmap.md").expandingTildeInPath
+        // v16 (2026-06-04): live roadmap moved to vault root "Clicky+ Roadmap.md"
+        // (the old Projects/"Clicky Plus - Roadmap.md" was archived). The new doc
+        // is reconciled against git+memory by the clicky-roadmap skill.
+        NSString("~/Desktop/Claude Cowork/Obsidian/Steph Vault/Clicky+ Roadmap.md").expandingTildeInPath
+    }
+
+    /// v16 (2026-06-04): Local SKU master JSON for the lookup_sku tool.
+    /// Built by the SKU-master generator (Omni ⋈ DTC + Amazon sheets).
+    /// Data layer is decoupled — regenerate this file to update Marin
+    /// with no code change.
+    private static var skuMasterPath: String {
+        NSString("~/clicky-plus/data/sku-master.json").expandingTildeInPath
     }
 
     private static var claudeSessionsDir: String {
@@ -531,6 +542,53 @@ enum MarinResearchTools {
             "char_count": content.count,
             "truncated": truncated,
         ]
+    }
+
+    // MARK: - lookup_sku (v16, 2026-06-04)
+
+    /// Look up Glamnetic products from the local SKU master JSON.
+    /// Matches `query` against SKU, Amazon SKU, ASIN, product name,
+    /// description, and parent. Exact SKU/ASIN matches rank first.
+    /// Returns slimmed records (blank fields dropped) so Marin can
+    /// answer SKU questions and copy fields via write_clipboard.
+    static func lookupSku(query: String, limit: Int = 8) -> [String: Any] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !q.isEmpty else { return ["status": "error", "reason": "Empty query"] }
+        guard let data = FileManager.default.contents(atPath: skuMasterPath),
+              let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+            return ["status": "error", "reason": "Could not read SKU master at \(skuMasterPath)"]
+        }
+        func s(_ r: [String: Any], _ k: String) -> String { (r[k] as? String) ?? "" }
+        var exact: [[String: Any]] = []
+        var partial: [[String: Any]] = []
+        for r in arr {
+            let sku = s(r, "sku").lowercased()
+            let asku = s(r, "amazon_sku").lowercased()
+            let asin = s(r, "asin").lowercased()
+            let name = s(r, "name").lowercased()
+            let desc = s(r, "description").lowercased()
+            let parent = s(r, "parent").lowercased()
+            if sku == q || asku == q || asin == q {
+                exact.append(r)
+            } else if sku.contains(q) || asku.contains(q) || asin.contains(q)
+                        || name.contains(q) || desc.contains(q) || parent.contains(q) {
+                partial.append(r)
+            }
+        }
+        let total = exact.count + partial.count
+        let hits = Array((exact + partial).prefix(limit))
+        if hits.isEmpty {
+            return ["status": "ok", "match_count": 0, "results": [],
+                    "note": "No SKU matched '\(query)'. Try a SKU code, ASIN, or product name."]
+        }
+        let keys = ["sku", "amazon_sku", "asin", "name", "description", "category",
+                    "parent", "length", "shape", "msrp", "unit_cost", "upc", "variation", "source"]
+        let results: [[String: Any]] = hits.map { r in
+            var out: [String: Any] = [:]
+            for k in keys where !s(r, k).isEmpty { out[k] = s(r, k) }
+            return out
+        }
+        return ["status": "ok", "match_count": total, "returned": results.count, "results": results]
     }
 
     // MARK: - append_to_bridge (v15p2, 2026-05-03)

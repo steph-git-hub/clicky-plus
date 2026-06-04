@@ -19,6 +19,7 @@
 //  ~5-10s for ANE compilation. Warm sub-200ms.
 //
 
+import AppKit
 import AVFoundation
 import FluidAudio
 import Foundation
@@ -158,18 +159,16 @@ final class ParakeetStreamingTranscriptionProvider: BuddyTranscriptionProvider {
         let asr = AsrManager(config: .default)
         try await asr.loadModels(models)
 
-        // v15p4ce (2026-05-30): boosted-final path DISABLED. The
-        // SlidingWindow + vocab-boost engine was over-biasing toward
-        // keyterms — substituting them for common words ("both"→"Bodhi",
-        // "using"→"ASIN", "Sonnet"→"Sonic", "modes"→"Codex"), dropping
-        // words, mangling punctuation, and truncating long dictations —
-        // and the length-only drop-detection let same-length swaps win.
-        // The fast path + post-process alias map (Lukas/Shipmonk) is
-        // consistently cleaner, including on real proper nouns. With this
-        // flag false, boostedFinal stays nil and the existing fallback
-        // logic uses the fast transcript everywhere. Flip to true to
-        // restore the boosted engine (code retained, fully reversible).
-        let useBoostedFinalize = false
+        // v16 (2026-06-04): boosted-final path RE-ENABLED behind a token
+        // guard for the STT bake-off. The boosted vocab-boost engine
+        // fixes mistranscribed proper nouns but used to over-correct
+        // common words ("both"→"Bodhi", "using"→"ASIN") because finalize
+        // adopted the WHOLE boosted transcript whenever it wasn't a
+        // length-drop. Now Self.guardedMerge keeps the fast transcript as
+        // the base and only swaps in a boosted word where the fast word
+        // isn't a real English word — proper-noun fixes land, real words
+        // are never overwritten. Flip to false to fully revert.
+        let useBoostedFinalize = true
         var boostedFinal: SlidingWindowAsrManager?
         if useBoostedFinalize && !keyterms.isEmpty {
             do {
@@ -382,11 +381,36 @@ final class ParakeetStreamingTranscriptionSession: BuddyStreamingTranscriptionSe
             ("Scepter", "Sceptre"),
             ("Boonhang", "Bunheng"),
             ("Bunhang", "Bunheng"),
+            // v16 (2026-06-04): Scribe heard "Bunheng" as two words
+            // "Boon Hang". Patterns are case-SENSITIVE — cover the forms seen.
+            ("Boon Hang", "Bunheng"),
+            ("Boon hang", "Bunheng"),
+            ("boon hang", "Bunheng"),
             ("Maren", "Marin"),
             ("Marion", "Marin"),
             ("Bodie", "Bodhi"),
             ("Caitlyn", "Caitlin"),
             ("Cider", "Sider"),
+            // v15p4dz (2026-06-03): Steph says "D to C" / "D two C"
+            // (direct-to-consumer) and wants it written DTC, not "D to C"
+            // or "D2C". Cover the connector + capitalization variants the
+            // engines produce. Safe — these phrases have no other meaning.
+            ("D to C", "DTC"),
+            ("D To C", "DTC"),
+            ("d to c", "DTC"),
+            ("D two C", "DTC"),
+            ("D Two C", "DTC"),
+            ("d two c", "DTC"),
+            ("D 2 C", "DTC"),
+            ("D2C", "DTC"),
+            // Concatenated forms the engine actually emits (no spaces).
+            ("DToC", "DTC"),
+            ("DTOC", "DTC"),
+            ("DtoC", "DTC"),
+            ("Dtoc", "DTC"),
+            ("dtoc", "DTC"),
+            ("DTwoC", "DTC"),
+            ("DtwoC", "DTC"),
         ]
         return mappings.map { (wrong, right) in
             let pattern = "\\b" + NSRegularExpression.escapedPattern(for: wrong) + "\\b"
@@ -787,8 +811,11 @@ final class ParakeetStreamingTranscriptionSession: BuddyStreamingTranscriptionSe
                     chosen = fastText
                     chosenSource = "fast (drop_detected boosted=\(boostedText.count) fast=\(fastText.count))"
                 } else {
-                    chosen = boostedText
-                    chosenSource = "boosted"
+                    // v16: guarded merge instead of wholesale boosted —
+                    // keeps fast's real words, adopts boosted only for
+                    // non-dictionary (proper-noun) tokens.
+                    chosen = await Self.guardedMerge(fast: fastText, boosted: boostedText)
+                    chosenSource = "boosted_guarded"
                 }
             } else if !fastText.isEmpty {
                 chosen = fastText
@@ -815,6 +842,41 @@ final class ParakeetStreamingTranscriptionSession: BuddyStreamingTranscriptionSe
 
             self.onFinalTranscriptReady(finalText)
         }
+    }
+
+    /// v16 guard for the boosted (vocab-boost) engine. Boosted can fix
+    /// mistranscribed proper nouns (Gamnetic→Glamnetic) but also
+    /// over-corrects common words (both→Bodhi). Keep the fast transcript
+    /// as the base; adopt a boosted word ONLY when the fast word is NOT a
+    /// valid English word (a likely proper-noun mishearing). If word
+    /// counts diverge (misalignment), keep fast wholesale (safe).
+    @MainActor
+    static func guardedMerge(fast: String, boosted: String) -> String {
+        let fastWords = fast.split(separator: " ").map(String.init)
+        let boostedWords = boosted.split(separator: " ").map(String.init)
+        guard !fastWords.isEmpty, fastWords.count == boostedWords.count else {
+            return fast
+        }
+        let checker = NSSpellChecker.shared
+        var merged: [String] = []
+        merged.reserveCapacity(fastWords.count)
+        for (f, b) in zip(fastWords, boostedWords) {
+            if f.caseInsensitiveCompare(b) == .orderedSame {
+                merged.append(f)
+                continue
+            }
+            let core = f.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
+            if core.isEmpty {
+                merged.append(f)
+                continue
+            }
+            let misspell = checker.checkSpelling(of: core, startingAt: 0)
+            let fastIsRealWord = (misspell.location == NSNotFound)
+            // Real word → keep fast (don't overwrite). Not a real word →
+            // adopt boosted's keyterm candidate.
+            merged.append(fastIsRealWord ? f : b)
+        }
+        return merged.joined(separator: " ")
     }
 
     func cancel() {

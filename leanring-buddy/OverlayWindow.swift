@@ -456,7 +456,7 @@ struct BlueCursorView: View {
         // because the hotkey wiring hasn't been renamed.
         if companionManager.isVoiceToTextDeepgramModeActive {
             switch companionManager.selectedVTTProvider {
-            case "assemblyai": return DS.Colors.overlayCursorOrange
+            case "scribe": return DS.Colors.overlayCursorOrange
             default: return DS.Colors.overlayCursorCyan
             }
         }

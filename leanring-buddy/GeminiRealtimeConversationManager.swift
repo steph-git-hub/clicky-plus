@@ -515,6 +515,21 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "required": ["name"],
             ],
         ],
+        // ── SKU lookup (v16, 2026-06-04) ───────────────────────
+        [
+            "name": "lookup_sku",
+            "description": "Look up Glamnetic product info from Steph's local SKU master. Use whenever he asks anything about a product or SKU — 'what's the ASIN for [product]', 'what's the MSRP of [SKU]', 'what's the UPC for X', 'find the [product name] SKU', 'what category/parent is X', or 'copy the ASIN/MSRP/SKU/UPC for X to my clipboard'. Matches the query against SKU code, Amazon SKU, ASIN, and product name. Returns matched records with sku, amazon_sku, asin, name, category, parent, length, shape, msrp, unit_cost, upc, and variation. IF he asks you to COPY a field, call lookup_sku FIRST to get the value, then call write_clipboard with just that value. If several products match, read back the top matches and ask which one he means. Some fields may be blank — the dataset is still being completed; say so rather than inventing a value.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "query": [
+                        "type": "STRING",
+                        "description": "A SKU code (e.g. 'NAILS1187'), an ASIN (e.g. 'B099FK66CL'), or a product name (e.g. 'Ma Damn' or 'nail glue').",
+                    ],
+                ],
+                "required": ["query"],
+            ],
+        ],
         // ── Clipboard + bridge ─────────────────────────────────
         [
             "name": "write_clipboard",
@@ -1033,6 +1048,9 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         case "read_memory_file":
             let nm = (args["name"] as? String) ?? ""
             return await MainActor.run { MarinResearchTools.readMemoryFile(name: nm) }
+        case "lookup_sku":
+            let q = (args["query"] as? String) ?? ""
+            return await MainActor.run { MarinResearchTools.lookupSku(query: q) }
         case "write_clipboard":
             let content = (args["content"] as? String) ?? ""
             return await MainActor.run { () -> [String: Any] in
