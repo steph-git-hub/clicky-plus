@@ -386,6 +386,11 @@ final class ParakeetStreamingTranscriptionSession: BuddyStreamingTranscriptionSe
             ("Boon Hang", "Bunheng"),
             ("Boon hang", "Bunheng"),
             ("boon hang", "Bunheng"),
+            // Scribe produces "Boon Heng" (different vowel) — 2026-06-04.
+            ("Boon Heng", "Bunheng"),
+            ("Boon heng", "Bunheng"),
+            ("boon heng", "Bunheng"),
+            ("Boonheng", "Bunheng"),
             ("Maren", "Marin"),
             ("Marion", "Marin"),
             ("Bodie", "Bodhi"),
