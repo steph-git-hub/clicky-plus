@@ -746,6 +746,10 @@ final class CompanionManager: ObservableObject {
     /// Lazily created on first hotkey press so its setup cost doesn't
     /// hit app boot.
     private var realtimeManager: RealtimeConversationManager?
+    // v16 (2026-06-04): Apple Speech on-device wake word ("Marin").
+    private var speechWakeWordManager: SpeechWakeWordManager?
+    private var wakeWordGateTimer: Timer?
+    @AppStorage("clicky.wakeword.enabled") private var wakeWordEnabled: Bool = true
     private var realtimeManagerStateCancellable: AnyCancellable?
 
     /// v15p3di (2026-05-16): parallel Gemini Live provider for Marin.
@@ -1251,6 +1255,17 @@ final class CompanionManager: ObservableObject {
             self?.buddyDictationManager.prewarmTranscriptionProvider()
         }
 
+        // v16 (2026-06-04): Apple Speech wake word — listen for "Marin" while
+        // idle and engage Marin hands-free. Gated off during any capture mode
+        // (clickyHasActiveAction) for false-trigger prevention + mic arbitration.
+        if wakeWordEnabled {
+            let wm = SpeechWakeWordManager()
+            wm.onWake = { [weak self] in self?.handleOptionDoubleTapForRealtimeHandsFree() }
+            wm.isGatedOut = { [weak self] in self?.clickyHasActiveAction ?? true }
+            speechWakeWordManager = wm
+            startWakeWordGateTimer()
+        }
+
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions
         // were revoked (e.g. signing change), don't show the cursor — the
@@ -1528,6 +1543,23 @@ final class CompanionManager: ObservableObject {
     /// Polls all permissions frequently so the UI updates live after the
     /// user grants them in System Settings. Screen Recording is the exception —
     /// macOS requires an app restart for that one to take effect.
+    /// v16: drive the wake-word listener off Clicky's capture state — pause it
+    /// (freeing the mic) whenever any capture mode is active, resume when idle.
+    /// start()/stop() are idempotent, so polling every 0.5s is safe.
+    private func startWakeWordGateTimer() {
+        wakeWordGateTimer?.invalidate()
+        wakeWordGateTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, let wm = self.speechWakeWordManager else { return }
+                if self.clickyHasActiveAction {
+                    wm.pauseForCapture()
+                } else {
+                    wm.resumeAfterCapture()
+                }
+            }
+        }
+    }
+
     private func startPermissionPolling() {
         accessibilityCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
