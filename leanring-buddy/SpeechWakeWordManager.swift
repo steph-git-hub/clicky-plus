@@ -2,21 +2,11 @@
 //  SpeechWakeWordManager.swift
 //  leanring-buddy / Clicky+
 //
-//  v16 wake word: on-device "Marin" detection via Apple's Speech framework
-//  (no account, no model, no extra dependency). Runs a continuous on-device
-//  SFSpeechRecognizer while Clicky is idle; when "marin" appears in the
-//  transcript it fires `onWake` (CompanionManager engages Marin).
-//
-//  Design notes:
-//   - One AVAudioEngine kept running; only the recognition task/request is
-//     swapped on restart (gentler on CoreAudio than cycling the engine).
-//   - Periodic restart (~50s) dodges the on-device session length limit.
-//   - `isGatedOut` (CompanionManager's clickyHasActiveAction) suppresses
-//     firing while any capture mode is active — Steph only says "Marin"
-//     while dictating, so this kills the false-trigger case. Capture starts
-//     should also call stop()/pauseForCapture() for mic arbitration.
-//   - Requires on-device recognition; if unavailable we don't start (no
-//     always-on network STT).
+//  v16 wake word: on-device "Marin" detection via Apple's Speech framework.
+//  Continuous on-device SFSpeechRecognizer while idle; "marin" in the
+//  transcript fires `onWake` (CompanionManager engages Marin). Gated off
+//  during capture via `isGatedOut` (clickyHasActiveAction) + CompanionManager's
+//  0.5s pause/resume timer (mic arbitration). Diag → /tmp/clicky_wakeword.log
 //
 
 import AVFoundation
@@ -24,9 +14,7 @@ import Foundation
 import Speech
 
 final class SpeechWakeWordManager {
-    /// Called on the main thread when "marin" is detected AND not gated.
     var onWake: (() -> Void)?
-    /// Return true when a capture mode is active (clickyHasActiveAction).
     var isGatedOut: (() -> Bool)?
 
     private let recognizer: SFSpeechRecognizer?
@@ -37,10 +25,22 @@ final class SpeechWakeWordManager {
     private var isRunning = false
     private var firedThisSession = false
 
-    /// Word-bounded, case-insensitive "marin" so it ignores "marine",
-    /// "marina", etc. and mid-word matches.
     private let matchRegex = try? NSRegularExpression(
         pattern: "\\bmarin\\b", options: [.caseInsensitive])
+
+    private static func diag(_ s: String) {
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(s)\n"
+        let path = "/tmp/clicky_wakeword.log"
+        guard let data = line.data(using: .utf8) else { return }
+        if FileManager.default.fileExists(atPath: path),
+           let h = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
+            defer { try? h.close() }
+            try? h.seekToEnd()
+            try? h.write(contentsOf: data)
+        } else {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+    }
 
     init() {
         recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US")) ?? SFSpeechRecognizer()
@@ -49,11 +49,12 @@ final class SpeechWakeWordManager {
     func start() {
         guard !isRunning else { return }
         guard SFSpeechRecognizer.authorizationStatus() == .authorized else {
+            Self.diag("start blocked: not authorized (status=\(SFSpeechRecognizer.authorizationStatus().rawValue))")
             SFSpeechRecognizer.requestAuthorization { _ in }
             return
         }
         guard let recognizer, recognizer.isAvailable, recognizer.supportsOnDeviceRecognition else {
-            print("👂 wake word: on-device recognition unavailable — not starting")
+            Self.diag("start blocked: recognizer unavailable (available=\(recognizer?.isAvailable ?? false) onDevice=\(recognizer?.supportsOnDeviceRecognition ?? false))")
             return
         }
         let input = audioEngine.inputNode
@@ -66,13 +67,13 @@ final class SpeechWakeWordManager {
         do {
             try audioEngine.start()
         } catch {
-            print("👂 wake word: audio engine failed — \(error.localizedDescription)")
+            Self.diag("audio engine failed: \(error.localizedDescription)")
             input.removeTap(onBus: 0)
             return
         }
         isRunning = true
         startRecognition()
-        print("👂 wake word: listening for 'Marin'")
+        Self.diag("listening (engine started)")
     }
 
     private func startRecognition() {
@@ -82,19 +83,19 @@ final class SpeechWakeWordManager {
         req.shouldReportPartialResults = true
         req.taskHint = .search
         req.requiresOnDeviceRecognition = true
-        req.contextualStrings = ["Marin"]   // bias recognition toward the wake word
         request = req
         task = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self else { return }
             if let result {
                 let text = result.bestTranscription.formattedString
+                if !text.isEmpty { Self.diag("heard: \(text)") }
                 if !self.firedThisSession, self.matches(text) {
                     self.firedThisSession = true
-                    if self.isGatedOut?() == true {
-                        self.scheduleRestart(after: 0.3)   // capture active — keep listening, don't engage
+                    let gated = self.isGatedOut?() == true
+                    Self.diag("FIRE marin gated=\(gated)")
+                    if gated {
+                        self.scheduleRestart(after: 0.4)
                     } else {
-                        // Free the mic immediately for Marin (no 0.5s handoff lag
-                        // via the gate timer), THEN engage. Resumes when idle again.
                         DispatchQueue.main.async {
                             self.stop()
                             self.onWake?()
@@ -103,11 +104,12 @@ final class SpeechWakeWordManager {
                     return
                 }
             }
+            if let error { Self.diag("error: \(error.localizedDescription)") }
             if error != nil || (result?.isFinal ?? false) {
-                self.scheduleRestart(after: 0.1)   // tight restart to minimize the deaf gap
+                self.scheduleRestart(after: 0.4)
             }
         }
-        scheduleRestart(after: 50)   // dodge the on-device session-length limit
+        scheduleRestart(after: 50)
     }
 
     private func matches(_ text: String) -> Bool {
@@ -140,10 +142,9 @@ final class SpeechWakeWordManager {
         request = nil
         if audioEngine.isRunning { audioEngine.stop() }
         audioEngine.inputNode.removeTap(onBus: 0)
-        print("👂 wake word: stopped")
+        Self.diag("stopped")
     }
 
-    /// Mic arbitration — pause while Clicky captures, resume when idle.
     func pauseForCapture() { stop() }
     func resumeAfterCapture() { start() }
 }
