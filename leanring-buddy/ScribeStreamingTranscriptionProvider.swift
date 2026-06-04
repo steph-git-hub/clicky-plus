@@ -338,7 +338,11 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
     }
 
     private func handleTranscript(text rawText: String, isFinal: Bool) {
-        let transcriptText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        // v16pb: Scribe (unlike Deepgram/Parakeet) leaves "um/uh" fillers in
+        // and inserts "…" on pauses. Strip both so Scribe matches the other
+        // engines — done here at the source, not in the shared repunctuate
+        // prompt (which deliberately preserves fillers for other modes).
+        let transcriptText = Self.cleanScribeArtifacts(rawText)
 
         if !transcriptText.isEmpty {
             VTTLatencyDiag.markFirstProviderTurn(preview: transcriptText)
@@ -461,6 +465,27 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
                 continuation?.resume(throwing: error)
             }
         }
+    }
+
+    /// v16pb: strip Scribe's filler words ("um"/"uh" + lengthened variants,
+    /// with any trailing comma) and pause ellipses ("…"/"..."), then tidy
+    /// whitespace/punctuation. Word-bounded so it never touches "umbrella"
+    /// etc. Matches Deepgram/Parakeet, which arrive pre-stripped.
+    private static let scribeFillerRegex = try? NSRegularExpression(
+        pattern: "\\b([Uu]m+|[Uu]h+)\\b,?", options: [])
+    static func cleanScribeArtifacts(_ text: String) -> String {
+        var t = text.replacingOccurrences(of: "…", with: " ")
+        t = t.replacingOccurrences(of: "...", with: " ")
+        if let rx = scribeFillerRegex {
+            t = rx.stringByReplacingMatches(
+                in: t, options: [], range: NSRange(t.startIndex..., in: t), withTemplate: "")
+        }
+        // Collapse runs of whitespace + fix orphaned space-before-punctuation.
+        t = t.replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
+        t = t.replacingOccurrences(of: " ,", with: ",")
+        t = t.replacingOccurrences(of: " .", with: ".")
+        t = t.replacingOccurrences(of: ",,", with: ",")
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// v16 diag: per-engage phase timing to /tmp/clicky_scribe_timing.log
