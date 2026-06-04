@@ -82,6 +82,7 @@ final class SpeechWakeWordManager {
         req.shouldReportPartialResults = true
         req.taskHint = .search
         req.requiresOnDeviceRecognition = true
+        req.contextualStrings = ["Marin"]   // bias recognition toward the wake word
         request = req
         task = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self else { return }
@@ -89,15 +90,21 @@ final class SpeechWakeWordManager {
                 let text = result.bestTranscription.formattedString
                 if !self.firedThisSession, self.matches(text) {
                     self.firedThisSession = true
-                    if self.isGatedOut?() != true {
-                        DispatchQueue.main.async { self.onWake?() }
+                    if self.isGatedOut?() == true {
+                        self.scheduleRestart(after: 0.3)   // capture active — keep listening, don't engage
+                    } else {
+                        // Free the mic immediately for Marin (no 0.5s handoff lag
+                        // via the gate timer), THEN engage. Resumes when idle again.
+                        DispatchQueue.main.async {
+                            self.stop()
+                            self.onWake?()
+                        }
                     }
-                    self.scheduleRestart(after: 0.5)   // fresh session, don't re-fire
                     return
                 }
             }
             if error != nil || (result?.isFinal ?? false) {
-                self.scheduleRestart(after: 0.2)
+                self.scheduleRestart(after: 0.1)   // tight restart to minimize the deaf gap
             }
         }
         scheduleRestart(after: 50)   // dodge the on-device session-length limit
