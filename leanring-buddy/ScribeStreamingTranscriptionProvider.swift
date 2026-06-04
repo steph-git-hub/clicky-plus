@@ -471,8 +471,10 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
     /// with any trailing comma) and pause ellipses ("…"/"..."), then tidy
     /// whitespace/punctuation. Word-bounded so it never touches "umbrella"
     /// etc. Matches Deepgram/Parakeet, which arrive pre-stripped.
+    // Quote chars (straight + smart) hugging the filler are consumed WITH it,
+    // so "um" / ''um" don't leave orphaned quotes behind. Word-bounded.
     private static let scribeFillerRegex = try? NSRegularExpression(
-        pattern: "\\b([Uu]m+|[Uu]h+)\\b,?", options: [])
+        pattern: "[\"“”'‘’]*\\b([Uu]m+|[Uu]h+)\\b[\"“”'‘’]*,?", options: [])
     static func cleanScribeArtifacts(_ text: String) -> String {
         var t = text.replacingOccurrences(of: "…", with: " ")
         t = t.replacingOccurrences(of: "...", with: " ")
@@ -480,10 +482,16 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
             t = rx.stringByReplacingMatches(
                 in: t, options: [], range: NSRange(t.startIndex..., in: t), withTemplate: "")
         }
+        // Remove any empty quote pairs left behind (straight + smart).
+        for empty in ["\"\"", "''", "“”", "‘’"] {
+            t = t.replacingOccurrences(of: empty, with: "")
+        }
         // Collapse runs of whitespace + fix orphaned space-before-punctuation.
         t = t.replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
         t = t.replacingOccurrences(of: " ,", with: ",")
         t = t.replacingOccurrences(of: " .", with: ".")
+        t = t.replacingOccurrences(of: " ?", with: "?")
+        t = t.replacingOccurrences(of: " !", with: "!")
         t = t.replacingOccurrences(of: ",,", with: ",")
         return t.trimmingCharacters(in: .whitespacesAndNewlines)
     }
