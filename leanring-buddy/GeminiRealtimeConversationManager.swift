@@ -999,6 +999,21 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "required": [],
             ],
         ],
+        // ── sort_data: sort the highlighted range or the clipboard (v16ps)
+        [
+            "name": "sort_data",
+            "description": "Sort tabular data for Steph. source='selection' (DEFAULT) sorts the range he has HIGHLIGHTED in the sheet: you copy it, sort it, and paste it back OVER the selection in one step — he just highlights and says 'sort this', he does NOT copy first. source='clipboard' sorts whatever is already on his clipboard and leaves the result there for him to paste ('sort what's on my clipboard'). Specify column (1-based, default 1) and order ('asc' default, or 'desc'). Set has_header=true if the first row is a header to keep pinned on top. Numeric columns sort numerically, text sorts A–Z, decided automatically. After ok, give a one-word confirm like 'Sorted.'",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "source": ["type": "STRING", "description": "'selection' (default) to sort the highlighted range in place, or 'clipboard' to sort what's already on his clipboard."],
+                    "column": ["type": "INTEGER", "description": "Which column to sort by, 1-based (1 = first column). Default 1."],
+                    "order": ["type": "STRING", "description": "'asc' (default) or 'desc'."],
+                    "has_header": ["type": "BOOLEAN", "description": "True if the first row is a header that should stay on top (only rows below it get sorted). Default false."],
+                ],
+                "required": [],
+            ],
+        ],
     ]
 
     /// HTTP POST to the Cloudflare Worker for tools that need cloud
@@ -1344,6 +1359,9 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // ── fill_sku_details: verified product data into the sheet (v16pq)
         case "fill_sku_details":
             return await fillSkuDetails(args: args)
+        // ── sort_data: sort the highlighted selection or the clipboard (v16ps)
+        case "sort_data":
+            return await sortData(args: args)
         default:
             return ["status": "error", "reason": "Unknown tool: \(name)"]
         }
@@ -1435,6 +1453,81 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             result["note"] = "Pasted verified values; \(notFound.count) item(s) weren't in the SKU master and were left as blank rows: \(notFound.joined(separator: ", ")). Tell Steph which ones are blank. NEVER fill those from memory."
         }
         return result
+    }
+
+    /// v16ps (2026-06-05): sort_data — sort the highlighted range (copy →
+    /// sort → paste back over) or the clipboard. Numeric-aware per column.
+    private func sortData(args: [String: Any]) async -> [String: Any] {
+        let source = ((args["source"] as? String) ?? "selection").lowercased()
+        let descending = ((args["order"] as? String) ?? "asc").lowercased().hasPrefix("desc")
+        let hasHeader = (args["has_header"] as? Bool) ?? false
+        let colRaw = args["column"]
+        var col = (colRaw as? Int) ?? (colRaw as? Double).map { Int($0) } ?? Int("\(colRaw ?? "")") ?? 1
+        if col < 1 { col = 1 }
+
+        // 1) Get the text — copy the selection, or read the clipboard.
+        let raw: String
+        if source == "clipboard" {
+            raw = await MainActor.run { NSPasteboard.general.string(forType: .string) ?? "" }
+        } else {
+            // Reuses the app's existing selection-copy helper (Cmd+C +
+            // poll + restore original clipboard), falling back to the
+            // current clipboard if nothing is selected.
+            raw = await CompanionManager.captureSelectionOrClipboardText() ?? ""
+        }
+        let text = raw
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .trimmingCharacters(in: .newlines)
+        if text.isEmpty {
+            return ["status": "error", "reason": source == "clipboard"
+                ? "Clipboard is empty — nothing to sort."
+                : "Couldn't read a selection. Make sure the data is highlighted in the sheet, then try again."]
+        }
+
+        // 2) Parse into rows of cells; peel off a header if asked.
+        var rows = text.components(separatedBy: "\n").map { $0.components(separatedBy: "\t") }
+        var header: [String]? = nil
+        if hasHeader, rows.count > 1 { header = rows.removeFirst() }
+
+        // 3) Numeric vs text for the chosen column, then sort.
+        let idx = col - 1
+        func cell(_ r: [String]) -> String { idx >= 0 && idx < r.count ? r[idx] : "" }
+        func num(_ s: String) -> Double? {
+            let cleaned = s.trimmingCharacters(in: .whitespaces)
+                .replacingOccurrences(of: "$", with: "")
+                .replacingOccurrences(of: ",", with: "")
+                .replacingOccurrences(of: "%", with: "")
+            return Double(cleaned)
+        }
+        let allNumeric = !rows.isEmpty && rows.allSatisfy { num(cell($0)) != nil }
+        rows.sort { a, b in
+            if allNumeric {
+                let x = num(cell(a)) ?? 0, y = num(cell(b)) ?? 0
+                return descending ? x > y : x < y
+            }
+            let x = cell(a).lowercased(), y = cell(b).lowercased()
+            return descending ? x > y : x < y
+        }
+        if let header { rows.insert(header, at: 0) }
+        let sorted = rows.map { $0.joined(separator: "\t") }.joined(separator: "\n")
+        let dir = descending ? "high→low / Z→A" : "low→high / A→Z"
+        let dataRowCount = hasHeader ? max(0, rows.count - 1) : rows.count
+
+        // 4) Output: paste back over the selection, or leave on clipboard.
+        if source == "clipboard" {
+            await MainActor.run {
+                let pb = NSPasteboard.general
+                pb.clearContents()
+                pb.setString(sorted, forType: .string)
+            }
+            return ["status": "ok", "rows": dataRowCount,
+                    "note": "Sorted \(dataRowCount) rows by column \(col) (\(dir)). It's on Steph's clipboard — he pastes it. Give a one-word confirm like 'Sorted.'"]
+        } else {
+            await CompanionManager.typeTextViaClipboard(sorted)
+            return ["status": "ok", "rows": dataRowCount,
+                    "note": "Sorted \(dataRowCount) rows by column \(col) (\(dir)) and pasted back over the selection. Give a one-word confirm like 'Sorted.'"]
+        }
     }
 
     /// Send a tool result back to Gemini as a toolResponse message.

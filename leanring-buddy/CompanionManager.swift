@@ -3794,7 +3794,7 @@ final class CompanionManager: ObservableObject {
         let compressEnabled = UserDefaults.standard.bool(forKey: "clicky.speedRead.aiCompress")
 
         Task { @MainActor in
-            let capturedText = await self.captureSelectionOrClipboardText()
+            let capturedText = await Self.captureSelectionOrClipboardText()
             guard let text = capturedText,
                   !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 print("⚠️ Speed-read: no text captured (no selection, empty clipboard)")
@@ -3834,8 +3834,10 @@ final class CompanionManager: ObservableObject {
     /// Capture user's selected text via Cmd+C synth. If nothing was
     /// selected, fall back to whatever was already on the clipboard.
     /// Always restores the user's original clipboard before returning.
+    // v16ps (2026-06-05): static so Marin's sort_data tool can reuse it
+    // (uses only Self.* statics — no instance state).
     @MainActor
-    private func captureSelectionOrClipboardText() async -> String? {
+    static func captureSelectionOrClipboardText() async -> String? {
         let savedItems = Self.snapshotGeneralPasteboardItems()
         let originalText = NSPasteboard.general.string(forType: .string)
         let changeCountBeforeCopy = NSPasteboard.general.changeCount
