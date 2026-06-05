@@ -3426,7 +3426,21 @@ unless he asks for them).
                 // synthesis internally.
                 "tools": [
                     [
-                        "function_declarations": Self.geminiToolDefinitions,
+                        // v16pm (2026-06-05): helper delegation DISABLED by
+                        // default. Marin kept reflexively spawning a
+                        // delegate_to_helper sub-agent instead of doing the
+                        // task herself (e.g. ClickUp create), so it only ever
+                        // fired by accident. The tool, dispatch, and
+                        // MarinHelperSubAgent are all retained — we just drop
+                        // the declaration from her surface so she can't reach
+                        // for it. Re-enable with:
+                        //   defaults write com.stephenpierson.clickyplus clicky.helper.enabled -bool true
+                        "function_declarations": Self.geminiToolDefinitions.filter { def in
+                            if (def["name"] as? String) == "delegate_to_helper" {
+                                return UserDefaults.standard.bool(forKey: "clicky.helper.enabled")
+                            }
+                            return true
+                        },
                     ],
                     [
                         "google_search": [String: Any](),
