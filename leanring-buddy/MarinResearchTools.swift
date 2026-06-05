@@ -591,6 +591,78 @@ enum MarinResearchTools {
         return ["status": "ok", "match_count": total, "returned": results.count, "results": results]
     }
 
+    // MARK: - fill_sku_details (v16pq, 2026-06-05)
+
+    /// Resolve a list of identifiers (SKU, Amazon SKU, ASIN, UPC, FNSKU,
+    /// or product name) against the SKU master and build a TSV block of
+    /// the requested fields — ONE ROW PER ITEM, in input order. The
+    /// whole point: values come ONLY from the master, never from the
+    /// model, so product data can't be hallucinated. Items that don't
+    /// match get a blank row (so the paste stays aligned with the
+    /// on-screen SKU column) and are returned in `notFound`.
+    static func resolveSkuRows(items: [String], fields: [String])
+        -> (tsv: String, matched: [String], notFound: [String], resolvedFields: [String]) {
+        guard let data = FileManager.default.contents(atPath: skuMasterPath),
+              let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+            return ("", [], items, fields)
+        }
+        func s(_ r: [String: Any], _ k: String) -> String { (r[k] as? String) ?? "" }
+
+        // Map a user-facing field name to the master key.
+        func keyFor(_ field: String) -> String {
+            switch field.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "asin": return "asin"
+            case "description", "name", "product", "product name", "title": return "name"
+            case "collection", "parent": return "parent"
+            case "sku": return "sku"
+            case "amazon sku", "amazon_sku", "amazonsku": return "amazon_sku"
+            case "fnsku": return "fnsku"
+            case "upc": return "upc"
+            case "msrp", "price", "retail": return "msrp"
+            case "cost", "unit cost", "unit_cost": return "unit_cost"
+            case "category": return "category"
+            default: return field.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            }
+        }
+        let resolvedKeys = fields.map(keyFor)
+
+        func findRow(_ item: String) -> [String: Any]? {
+            let q = item.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if q.isEmpty { return nil }
+            // Exact match on identifier-ish fields first.
+            for r in arr {
+                if s(r, "sku").lowercased() == q || s(r, "amazon_sku").lowercased() == q
+                    || s(r, "asin").lowercased() == q || s(r, "upc").lowercased() == q
+                    || s(r, "fnsku").lowercased() == q || s(r, "name").lowercased() == q {
+                    return r
+                }
+            }
+            // Fall back to a name/description/parent contains match.
+            for r in arr {
+                if s(r, "name").lowercased().contains(q)
+                    || s(r, "description").lowercased().contains(q)
+                    || s(r, "parent").lowercased().contains(q) {
+                    return r
+                }
+            }
+            return nil
+        }
+
+        var rows: [String] = []
+        var matched: [String] = []
+        var notFound: [String] = []
+        for item in items {
+            if let r = findRow(item) {
+                matched.append(item)
+                rows.append(resolvedKeys.map { s(r, $0) }.joined(separator: "\t"))
+            } else {
+                notFound.append(item)
+                rows.append(Array(repeating: "", count: resolvedKeys.count).joined(separator: "\t"))
+            }
+        }
+        return (rows.joined(separator: "\n"), matched, notFound, resolvedKeys)
+    }
+
     // MARK: - append_to_bridge (v15p2, 2026-05-03)
 
     /// Append a message to the Claude–Marin Bridge file. Auto-stamps a

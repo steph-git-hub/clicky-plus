@@ -958,7 +958,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // in what's on my screen"; the `sheets` tool is for by-id work.
         [
             "name": "fill_cells",
-            "description": "Type values into the spreadsheet (or any field) Steph is LOOKING AT on screen — no spreadsheet id needed. It pastes at his CURRENTLY SELECTED cell, so first make sure he has clicked the starting cell (if unsure, ask him to click it). Pass `values` as a 2-D array (rows of cells); it's pasted as a tab/newline block so Google Sheets fans it across cells and rows starting at the active cell. Use this for 'fill in these details', 'put this list in', 'add these values', 'paste this into the sheet'. THIS IS THE TOOL FOR EDITING THE SHEET ON SCREEN — not the `sheets` tool (that one needs an id and is for remote/structured reads & writes). CRITICAL: this tool actually PASTES — it does not just copy. After it returns ok, give a one-word confirm like 'Filled.' NEVER stage to the clipboard and stop; that leaves the value unpasted. Even if Steph phrases it as 'copy these in' or 'copy the descriptions to the sheet,' when the destination is the sheet/field on screen use THIS tool (it copies AND pastes in one step) — not write_clipboard. He'll typically have clicked the starting cell; trust the focused cell as the paste origin.",
+            "description": "Type values into the spreadsheet (or any field) Steph is LOOKING AT on screen — no spreadsheet id needed. It pastes at his CURRENTLY SELECTED cell, so first make sure he has clicked the starting cell (if unsure, ask him to click it). Pass `values` as a 2-D array (rows of cells); it's pasted as a tab/newline block so Google Sheets fans it across cells and rows starting at the active cell. Use this for 'fill in these details', 'put this list in', 'add these values', 'paste this into the sheet'. THIS IS THE TOOL FOR EDITING THE SHEET ON SCREEN — not the `sheets` tool (that one needs an id and is for remote/structured reads & writes). CRITICAL: this tool actually PASTES — it does not just copy. After it returns ok, give a one-word confirm like 'Filled.' NEVER stage to the clipboard and stop; that leaves the value unpasted. Even if Steph phrases it as 'copy these in' or 'copy the descriptions to the sheet,' when the destination is the sheet/field on screen use THIS tool (it copies AND pastes in one step) — not write_clipboard. He'll typically have clicked the starting cell; trust the focused cell as the paste origin. EXCEPTION: for product attributes (ASIN, description, collection, price, etc.) for a list of SKUs/items, do NOT use this tool with values you typed yourself — use fill_sku_details, which looks them up so they can't be wrong.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
@@ -970,6 +970,31 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                     "text": ["type": "STRING", "description": "Alternative to values: a raw string to paste as-is (use \\t between columns, \\n between rows). Prefer `values` for grids."],
                 ],
                 "required": [],
+            ],
+        ],
+        // ── fill_sku_details: VERIFIED product data into the sheet (v16pq)
+        // Model supplies the item list + field names ONLY; values come
+        // from the SKU master, so ASIN/description/collection cannot be
+        // hallucinated. This is THE tool for "fill in details for these
+        // SKUs" — never let the model type product data itself.
+        [
+            "name": "fill_sku_details",
+            "description": "Fill VERIFIED product details into the sheet/field on screen for a list of items. You provide ONLY (a) the list of items and (b) which fields — you do NOT provide the values. The tool looks each item up in Steph's SKU master and pastes the real values at the focused cell, one row per item in input order. Items can be SKUs, Amazon SKUs, ASINs, UPCs, FNSKUs, or product NAMES — anything on the SKU list. Fields can be any column: asin, description, collection, sku, amazon_sku, upc, msrp, category, unit_cost, etc. USE THIS — not fill_cells or write_clipboard — whenever filling product attributes for a set of items. CRITICAL: you must NEVER type ASINs, descriptions, collections, prices, or any product data from your own memory — you do NOT know them and will get them wrong (this exact mistake happened: a batch was confabulated). This tool is the ONLY correct way to put product data in the sheet. Make sure Steph has clicked the starting cell. Items not found are left as blank rows and reported back — tell him which ones; never backfill them yourself. After ok, give a one-word confirm like 'Filled.'",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "items": [
+                        "type": "ARRAY",
+                        "description": "Identifiers to look up, in the order they should be pasted top-to-bottom. Each can be a SKU, Amazon SKU, ASIN, UPC, FNSKU, or product name. Read them off the column on screen if Steph is pointing at one.",
+                        "items": ["type": "STRING"],
+                    ],
+                    "fields": [
+                        "type": "ARRAY",
+                        "description": "Which fields to fill, left-to-right, e.g. [\"asin\", \"description\", \"collection\"]. Defaults to asin, description, collection if omitted. Any master column is allowed.",
+                        "items": ["type": "STRING"],
+                    ],
+                ],
+                "required": ["items"],
             ],
         ],
     ]
@@ -1314,6 +1339,9 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // ── fill_cells: paste into the focused cell on screen (v16po)
         case "fill_cells":
             return await fillCells(args: args)
+        // ── fill_sku_details: verified product data into the sheet (v16pq)
+        case "fill_sku_details":
+            return await fillSkuDetails(args: args)
         default:
             return ["status": "error", "reason": "Unknown tool: \(name)"]
         }
@@ -1354,6 +1382,37 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             "status": "ok",
             "note": "Pasted at the focused cell. Give Steph a one-word confirm like 'Filled.' If it didn't land, the block is on his clipboard so he can Cmd+V it himself.",
         ]
+    }
+
+    /// v16pq (2026-06-05): fill_sku_details — look each item up in the
+    /// SKU master and paste ONLY verified values. The model supplies the
+    /// item list + field names; it never authors the data, which kills
+    /// the hallucinated-batch failure (a confabulated set of ASINs /
+    /// descriptions got pasted before this existed).
+    private func fillSkuDetails(args: [String: Any]) async -> [String: Any] {
+        let items = (args["items"] as? [Any])?.compactMap { "\($0)".trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty } ?? []
+        let fields = (args["fields"] as? [Any])?.compactMap { "\($0)" } ?? ["asin", "description", "collection"]
+        if items.isEmpty {
+            return ["status": "error", "reason": "No items given — provide the SKUs / ASINs / UPCs / names to look up."]
+        }
+        let (tsv, matched, notFound, resolvedFields) =
+            MarinResearchTools.resolveSkuRows(items: items, fields: fields)
+        if tsv.isEmpty {
+            return ["status": "error", "reason": "Couldn't read the SKU master (no data)."]
+        }
+        await CompanionManager.typeTextViaClipboard(tsv)
+        var result: [String: Any] = [
+            "status": "ok",
+            "fields_filled": resolvedFields,
+            "matched_count": matched.count,
+            "note": "Pasted VERIFIED values from the SKU master at the focused cell. Give Steph a one-word confirm like 'Filled.'",
+        ]
+        if !notFound.isEmpty {
+            result["not_found"] = notFound
+            result["note"] = "Pasted verified values; \(notFound.count) item(s) weren't in the SKU master and were left as blank rows: \(notFound.joined(separator: ", ")). Tell Steph which ones are blank. NEVER fill those from memory."
+        }
+        return result
     }
 
     /// Send a tool result back to Gemini as a toolResponse message.
