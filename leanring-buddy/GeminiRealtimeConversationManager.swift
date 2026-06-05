@@ -915,11 +915,12 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // worker. Keeps the realtime tool surface small.
         [
             "name": "clickup",
-            "description": "Create or update a ClickUp task by voice. operation=\"create\" makes a new task (in Steph's default list unless list_id is given); operation=\"update\" changes an existing task by task_id. Use for 'make a task to…', 'add a ClickUp task', 'mark task X done' (status), 'bump the priority', 'change the due date'. For updates you need the task_id — if you don't have it, say so rather than guessing.",
+            "description": "Create, find, or update ClickUp tasks by voice. operation=\"create\" makes a new task (in Steph's default list unless list_id is given). operation=\"find\" lists tasks (optionally filtered by `query`) and returns each task's task_id + current status, plus the list's valid status names. operation=\"update\" changes an existing task by task_id — including its status (e.g. 'in progress', or the list's done status to mark complete), name, priority, or due date. TO MARK SOMETHING DONE OR CHANGE A STATUS: first call find to get the task_id and the exact status names, then call update with that task_id and status. Never guess a task_id.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
-                    "operation": ["type": "STRING", "description": "\"create\" or \"update\"."],
+                    "operation": ["type": "STRING", "description": "\"create\", \"find\", or \"update\"."],
+                    "query": ["type": "STRING", "description": "For find: optional name substring to match (e.g. 'Sankey'). Omit to list all tasks in the list."],
                     "name": ["type": "STRING", "description": "Task title. Required for create; optional rename for update."],
                     "description": ["type": "STRING", "description": "Optional task body / notes."],
                     "task_id": ["type": "STRING", "description": "ClickUp task id. Required for update."],

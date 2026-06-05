@@ -248,6 +248,7 @@ async function handleClickup(request: Request, env: Env): Promise<Response> {
     status?: string;
     priority?: number;
     due_date?: string;
+    query?: string;
   };
   try {
     payload = (await request.json()) as typeof payload;
@@ -256,11 +257,56 @@ async function handleClickup(request: Request, env: Env): Promise<Response> {
   }
 
   const operation = (payload.operation ?? "").trim();
-  if (operation !== "create" && operation !== "update") {
-    return jsonError('operation must be "create" or "update"', 400);
+  if (!["create", "update", "find"].includes(operation)) {
+    return jsonError('operation must be "create", "update", or "find"', 400);
   }
   if (!env.CLICKUP_API_TOKEN) {
     return jsonError("ClickUp not configured (missing CLICKUP_API_TOKEN secret)", 500);
+  }
+
+  // find — list tasks (optionally filtered by name substring) so Marin
+  // can resolve a spoken task name → task_id before an update, and learn
+  // the list's valid status names so "mark it done" uses a real status.
+  if (operation === "find") {
+    const listId = (payload.list_id ?? env.CLICKUP_DEFAULT_LIST_ID ?? "").trim();
+    if (!listId) {
+      return jsonError("No list_id given and CLICKUP_DEFAULT_LIST_ID is not set", 400);
+    }
+    const headers = { authorization: env.CLICKUP_API_TOKEN };
+    const tasksResp = await fetch(
+      `https://api.clickup.com/api/v2/list/${encodeURIComponent(listId)}/task?subtasks=true&include_closed=true`,
+      { headers }
+    );
+    if (!tasksResp.ok) {
+      const e = await tasksResp.text();
+      return sanitizedUpstreamError("/clickup find", tasksResp.status, e);
+    }
+    const tasksJson = (await tasksResp.json()) as {
+      tasks?: Array<{ id?: string; name?: string; url?: string; status?: { status?: string } }>;
+    };
+    const q = (payload.query ?? "").trim().toLowerCase();
+    let tasks = (tasksJson.tasks ?? []).map((t) => ({
+      task_id: t.id,
+      name: t.name,
+      task_status: t.status?.status,
+      url: t.url,
+    }));
+    if (q) tasks = tasks.filter((t) => (t.name ?? "").toLowerCase().includes(q));
+
+    // Surface the list's valid status names so updates use a real one.
+    let statuses: string[] = [];
+    const listResp = await fetch(
+      `https://api.clickup.com/api/v2/list/${encodeURIComponent(listId)}`,
+      { headers }
+    );
+    if (listResp.ok) {
+      const listJson = (await listResp.json()) as { statuses?: Array<{ status?: string }> };
+      statuses = (listJson.statuses ?? []).map((s) => s.status ?? "").filter(Boolean);
+    }
+    return new Response(
+      JSON.stringify({ status: "ok", tasks, list_statuses: statuses }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
   }
 
   // ClickUp wants due dates as Unix epoch milliseconds.
