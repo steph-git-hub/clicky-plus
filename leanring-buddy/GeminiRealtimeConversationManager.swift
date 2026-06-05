@@ -1014,6 +1014,22 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "required": [],
             ],
         ],
+        // ── fill_sku_column: bulk aligned verified fill via Sheets API (v16pu)
+        [
+            "name": "fill_sku_column",
+            "description": "Fill a whole column of VERIFIED product data aligned to an existing column of SKUs — directly via the Google Sheets API. NO copy/paste, NO reading off the screen, NO model-supplied values. THIS is the right tool for 'fill column J's ASINs from the SKUs in column I', 'fill in the ASIN column for these SKUs', or any 'fill column X to match the SKUs in column Y' across many rows — especially a whole collection. You provide: sku_range (A1 range of the existing SKU column, e.g. 'I18:I49'), target_start (top cell to write into, e.g. 'J18'), and fields (default ['asin']). The tool reads the SKU column ITSELF, looks each up in the master, and writes the result aligned row-for-row in the sheet's own order — complete, every row. You do NOT read the SKUs and do NOT supply any values; that's the whole point (it cannot be incomplete or fabricated). The spreadsheet + active tab are auto-detected from Steph's open browser. SKUs not in the master are left blank and reported. PREFER THIS over fill_sku_details/fill_cells for any multi-row column fill. After ok, one-word confirm like 'Done.'",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "sku_range": ["type": "STRING", "description": "A1 range of the existing SKU column, e.g. 'I18:I49'. Read the column letter + first/last row off the screen."],
+                    "target_start": ["type": "STRING", "description": "Top-left cell to write the looked-up values into, e.g. 'J18'. Line it up with the first SKU row."],
+                    "fields": ["type": "ARRAY", "description": "Fields to fill, left-to-right from target_start. Default ['asin']. e.g. ['asin'] or ['asin','description','collection'].", "items": ["type": "STRING"]],
+                    "spreadsheet_id": ["type": "STRING", "description": "Optional. Omit to auto-detect from Steph's open browser tab."],
+                    "sheet": ["type": "STRING", "description": "Optional tab name. Omit to auto-detect the active tab."],
+                ],
+                "required": ["sku_range", "target_start"],
+            ],
+        ],
     ]
 
     /// HTTP POST to the Cloudflare Worker for tools that need cloud
@@ -1362,6 +1378,9 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // ── sort_data: sort the highlighted selection or the clipboard (v16ps)
         case "sort_data":
             return await sortData(args: args)
+        // ── fill_sku_column: bulk aligned verified column fill via API (v16pu)
+        case "fill_sku_column":
+            return await fillSkuColumn(args: args)
         default:
             return ["status": "error", "reason": "Unknown tool: \(name)"]
         }
@@ -1396,6 +1415,13 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         }
         if block.count > 20_000 {
             return ["status": "error", "reason": "Too large (\(block.count) chars). Limit 20000."]
+        }
+        // Guard: block model-typed product IDs (ASINs). If the values contain
+        // multiple ASIN-shaped tokens, the model is authoring product data —
+        // which must come from the verified master, never from memory.
+        if let re = try? NSRegularExpression(pattern: "\\bB0[A-Z0-9]{8}\\b"),
+           re.numberOfMatches(in: block, range: NSRange(block.startIndex..., in: block)) >= 2 {
+            return ["status": "error", "reason": "That looks like product data (ASINs) you typed yourself — do NOT author product values. Use fill_sku_column (whole column from the SKUs in the sheet) or fill_sku_details, which pull verified values from the master."]
         }
         await CompanionManager.typeTextViaClipboard(block)
         return [
@@ -1528,6 +1554,113 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             return ["status": "ok", "rows": dataRowCount,
                     "note": "Sorted \(dataRowCount) rows by column \(col) (\(dir)) and pasted back over the selection. Give a one-word confirm like 'Sorted.'"]
         }
+    }
+
+    // MARK: - fill_sku_column (v16pu, 2026-06-05)
+    //
+    // Bulk, aligned, verified column fill via the Google Sheets API — the
+    // model never reads the SKUs or supplies any value, so it can't be
+    // incomplete OR fabricated (both failures we hit with paste-based fills).
+    // Flow: resolve spreadsheet id + active tab from the open browser →
+    // /sheets info (gid→tab name) → /sheets read the SKU column →
+    // resolveSkuRows looks each up → /sheets update writes the aligned block.
+
+    /// Read the URL of the frontmost browser tab (Chrome, else Safari).
+    @MainActor
+    private static func activeBrowserURL() -> String? {
+        let sources = [
+            "tell application \"Google Chrome\" to get URL of active tab of front window",
+            "tell application \"Safari\" to get URL of front document",
+        ]
+        for src in sources {
+            var err: NSDictionary?
+            if let script = NSAppleScript(source: src) {
+                let out = script.executeAndReturnError(&err)
+                if err == nil, let url = out.stringValue, !url.isEmpty { return url }
+            }
+        }
+        return nil
+    }
+
+    /// First capture group of `pattern` in `s`, or nil.
+    private static func firstMatch(_ s: String, _ pattern: String) -> String? {
+        guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(s.startIndex..., in: s)
+        guard let m = re.firstMatch(in: s, range: range), m.numberOfRanges > 1,
+              let g = Range(m.range(at: 1), in: s) else { return nil }
+        return String(s[g])
+    }
+
+    private func fillSkuColumn(args: [String: Any]) async -> [String: Any] {
+        let fields = (args["fields"] as? [Any])?.compactMap { "\($0)" } ?? ["asin"]
+        guard let skuRange = (args["sku_range"] as? String)?.trimmingCharacters(in: .whitespaces),
+              !skuRange.isEmpty else {
+            return ["status": "error", "reason": "Need sku_range, e.g. 'I18:I49' (the existing SKU column)."]
+        }
+        guard let targetStart = (args["target_start"] as? String)?.trimmingCharacters(in: .whitespaces),
+              !targetStart.isEmpty else {
+            return ["status": "error", "reason": "Need target_start, e.g. 'J18' (top cell to write into)."]
+        }
+
+        // 1) Resolve spreadsheet id (+ gid) from the open browser tab, unless given.
+        var spreadsheetId = (args["spreadsheet_id"] as? String) ?? ""
+        var gid: String? = nil
+        if spreadsheetId.isEmpty {
+            let url = await MainActor.run { Self.activeBrowserURL() } ?? ""
+            spreadsheetId = Self.firstMatch(url, "/spreadsheets/d/([a-zA-Z0-9_-]+)") ?? ""
+            gid = Self.firstMatch(url, "[#&?]gid=([0-9]+)")
+            if spreadsheetId.isEmpty {
+                return ["status": "error", "reason": "Couldn't find a Google Sheet in the front browser tab. Open the sheet in Chrome/Safari, or pass spreadsheet_id."]
+            }
+        }
+
+        // 2) Map gid → tab name via /sheets info.
+        var sheetName = (args["sheet"] as? String) ?? ""
+        if sheetName.isEmpty {
+            let info = await safeWorkerCall(path: "/sheets", body: ["operation": "info", "spreadsheet_id": spreadsheetId])
+            if let tabs = info["tabs"] as? [[String: Any]] {
+                if let gid, let match = tabs.first(where: { "\($0["id"] ?? "")" == gid }) {
+                    sheetName = "\(match["name"] ?? "")"
+                } else if let first = tabs.first {
+                    sheetName = "\(first["name"] ?? "")"
+                }
+            }
+        }
+        let prefix = sheetName.isEmpty ? "" : "'\(sheetName)'!"
+
+        // 3) Read the SKU column.
+        let readRes = await safeWorkerCall(path: "/sheets", body: [
+            "operation": "read", "spreadsheet_id": spreadsheetId, "range": "\(prefix)\(skuRange)"])
+        guard let rows = readRes["values"] as? [[Any]] else {
+            return ["status": "error", "reason": "Couldn't read \(skuRange): \(readRes["reason"] ?? readRes)"]
+        }
+        let skus = rows.map { ($0.first.map { "\($0)" } ?? "").trimmingCharacters(in: .whitespaces) }
+        if skus.allSatisfy({ $0.isEmpty }) {
+            return ["status": "error", "reason": "No SKUs found in \(skuRange)."]
+        }
+
+        // 4) Look up verified values, aligned (blank rows for misses).
+        let (tsv, _, notFound, _) = MarinResearchTools.resolveSkuRows(items: skus, fields: fields)
+        let values: [[String]] = tsv.components(separatedBy: "\n").map { $0.components(separatedBy: "\t") }
+
+        // 5) Write the aligned block, anchored at target_start.
+        let writeRes = await safeWorkerCall(path: "/sheets", body: [
+            "operation": "update", "spreadsheet_id": spreadsheetId,
+            "range": "\(prefix)\(targetStart)", "values": values])
+        if "\(writeRes["status"] ?? "")" != "updated" {
+            return ["status": "error", "reason": "Write failed: \(writeRes["reason"] ?? writeRes)"]
+        }
+
+        let filled = skus.filter { !$0.isEmpty }.count
+        var result: [String: Any] = [
+            "status": "ok", "filled": filled,
+            "note": "Wrote \(fields.joined(separator: ", ")) for \(filled) SKUs into \(targetStart), aligned to \(skuRange) via the API. Give Steph a one-word confirm like 'Done.'",
+        ]
+        if !notFound.isEmpty {
+            result["not_found"] = notFound
+            result["note"] = "Wrote verified values; \(notFound.count) SKU(s) weren't in the master and were left blank: \(notFound.prefix(10).joined(separator: ", ")). Tell Steph which are blank; NEVER fill them from memory."
+        }
+        return result
     }
 
     /// Send a tool result back to Gemini as a toolResponse message.
