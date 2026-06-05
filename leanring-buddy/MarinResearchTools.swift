@@ -663,6 +663,44 @@ enum MarinResearchTools {
         return (rows.joined(separator: "\n"), matched, notFound, resolvedKeys)
     }
 
+    /// v16pr (2026-06-05): enumerate ALL master rows whose `filterField`
+    /// matches `filterValue` (e.g. every SKU in the "Euro Summer"
+    /// collection), sorted by SKU, and build a TSV of the requested
+    /// fields. Powers "paste all the SKUs/ASINs for the X collection" —
+    /// the model can't enumerate a collection from memory, so the tool
+    /// does it from the trusted master. Values are still master-only.
+    static func resolveSkuRowsByFilter(filterField: String, filterValue: String, fields: [String])
+        -> (tsv: String, count: Int, resolvedFields: [String]) {
+        guard let data = FileManager.default.contents(atPath: skuMasterPath),
+              let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+            return ("", 0, fields)
+        }
+        func s(_ r: [String: Any], _ k: String) -> String { (r[k] as? String) ?? "" }
+        func keyFor(_ field: String) -> String {
+            switch field.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "asin": return "asin"
+            case "description", "name", "product", "product name", "title": return "name"
+            case "collection", "parent": return "parent"
+            case "sku": return "sku"
+            case "amazon sku", "amazon_sku", "amazonsku": return "amazon_sku"
+            case "fnsku": return "fnsku"
+            case "upc": return "upc"
+            case "msrp", "price", "retail": return "msrp"
+            case "cost", "unit cost", "unit_cost": return "unit_cost"
+            case "category": return "category"
+            default: return field.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            }
+        }
+        let fKey = keyFor(filterField.isEmpty ? "collection" : filterField)
+        let fVal = filterValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let resolvedKeys = fields.map(keyFor)
+        let matched = arr
+            .filter { !fVal.isEmpty && s($0, fKey).lowercased().contains(fVal) }
+            .sorted { s($0, "sku") < s($1, "sku") }
+        let rows = matched.map { r in resolvedKeys.map { s(r, $0) }.joined(separator: "\t") }
+        return (rows.joined(separator: "\n"), matched.count, resolvedKeys)
+    }
+
     // MARK: - append_to_bridge (v15p2, 2026-05-03)
 
     /// Append a message to the Claude–Marin Bridge file. Auto-stamps a

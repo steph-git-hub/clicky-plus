@@ -979,7 +979,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // SKUs" — never let the model type product data itself.
         [
             "name": "fill_sku_details",
-            "description": "Fill VERIFIED product details into the sheet/field on screen for a list of items. You provide ONLY (a) the list of items and (b) which fields — you do NOT provide the values. The tool looks each item up in Steph's SKU master and pastes the real values at the focused cell, one row per item in input order. Items can be SKUs, Amazon SKUs, ASINs, UPCs, FNSKUs, or product NAMES — anything on the SKU list. Fields can be any column: asin, description, collection, sku, amazon_sku, upc, msrp, category, unit_cost, etc. USE THIS — not fill_cells or write_clipboard — whenever filling product attributes for a set of items. CRITICAL: you must NEVER type ASINs, descriptions, collections, prices, or any product data from your own memory — you do NOT know them and will get them wrong (this exact mistake happened: a batch was confabulated). This tool is the ONLY correct way to put product data in the sheet. Make sure Steph has clicked the starting cell. Items not found are left as blank rows and reported back — tell him which ones; never backfill them yourself. After ok, give a one-word confirm like 'Filled.'",
+            "description": "Fill VERIFIED product details into the sheet/field on screen for a list of items. You provide ONLY (a) the list of items and (b) which fields — you do NOT provide the values. The tool looks each item up in Steph's SKU master and pastes the real values at the focused cell, one row per item in input order. TO FILL AN ENTIRE COLLECTION (or every item matching a field) — e.g. 'paste all the SKUs / ASINs for the Euro Summer collection' — do NOT try to list the members yourself (you don't know them and will guess wrong). Instead set filter_value='Euro Summer' (filter_field defaults to 'collection') and leave items empty; the tool enumerates every matching SKU from the master, sorted, and pastes them. Items can be SKUs, Amazon SKUs, ASINs, UPCs, FNSKUs, or product NAMES — anything on the SKU list. Fields can be any column: asin, description, collection, sku, amazon_sku, upc, msrp, category, unit_cost, etc. USE THIS — not fill_cells or write_clipboard — whenever filling product attributes for a set of items. CRITICAL: you must NEVER type ASINs, descriptions, collections, prices, or any product data from your own memory — you do NOT know them and will get them wrong (this exact mistake happened: a batch was confabulated). This tool is the ONLY correct way to put product data in the sheet. Make sure Steph has clicked the starting cell. Items not found are left as blank rows and reported back — tell him which ones; never backfill them yourself. After ok, give a one-word confirm like 'Filled.' Call this tool BY ITSELF for a product fill — do NOT also call fill_cells (or write_clipboard) in the same turn; calling both double-pastes and makes a mess. One tool, one paste.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
@@ -993,8 +993,10 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                         "description": "Which fields to fill, left-to-right, e.g. [\"asin\", \"description\", \"collection\"]. Defaults to asin, description, collection if omitted. Any master column is allowed.",
                         "items": ["type": "STRING"],
                     ],
+                    "filter_value": ["type": "STRING", "description": "Fill an ENTIRE group instead of a named item list: every master row whose filter_field matches this value is pasted, sorted by SKU. e.g. 'Euro Summer' to fill the whole Euro Summer collection. When set, `items` is ignored — use this for 'all the SKUs/ASINs in the X collection.'"],
+                    "filter_field": ["type": "STRING", "description": "Which field filter_value matches against. Defaults to 'collection' (the parent). Could also be category, etc."],
                 ],
-                "required": ["items"],
+                "required": [],
             ],
         ],
     ]
@@ -1390,11 +1392,31 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
     /// the hallucinated-batch failure (a confabulated set of ASINs /
     /// descriptions got pasted before this existed).
     private func fillSkuDetails(args: [String: Any]) async -> [String: Any] {
+        let fields = (args["fields"] as? [Any])?.compactMap { "\($0)" } ?? ["asin", "description", "collection"]
+
+        // ── Filter mode: enumerate a whole collection (or any field=value)
+        // straight from the master. This is what "paste all the SKUs /
+        // ASINs for the Euro Summer collection" needs — the model can't
+        // list a collection's members, so the tool does.
+        if let filterValue = (args["filter_value"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !filterValue.isEmpty {
+            let filterField = (args["filter_field"] as? String) ?? "collection"
+            let (tsv, count, resolvedFields) = MarinResearchTools.resolveSkuRowsByFilter(
+                filterField: filterField, filterValue: filterValue, fields: fields)
+            if count == 0 {
+                return ["status": "ok", "matched_count": 0,
+                        "note": "Nothing in the SKU master matched \(filterField)='\(filterValue)'. Tell Steph nothing was found — do NOT fill anything from memory."]
+            }
+            await CompanionManager.typeTextViaClipboard(tsv)
+            return ["status": "ok", "matched_count": count, "fields_filled": resolvedFields,
+                    "note": "Pasted \(count) VERIFIED rows for \(filterField)='\(filterValue)' at the focused cell. Give Steph a one-word confirm like 'Filled.'"]
+        }
+
+        // ── Explicit item-list mode.
         let items = (args["items"] as? [Any])?.compactMap { "\($0)".trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty } ?? []
-        let fields = (args["fields"] as? [Any])?.compactMap { "\($0)" } ?? ["asin", "description", "collection"]
         if items.isEmpty {
-            return ["status": "error", "reason": "No items given — provide the SKUs / ASINs / UPCs / names to look up."]
+            return ["status": "error", "reason": "No items or filter given — provide `items` (SKUs/ASINs/names) OR `filter_value` (e.g. a collection name)."]
         }
         let (tsv, matched, notFound, resolvedFields) =
             MarinResearchTools.resolveSkuRows(items: items, fields: fields)
