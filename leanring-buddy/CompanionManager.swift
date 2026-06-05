@@ -7479,8 +7479,10 @@ final class CompanionManager: ObservableObject {
     /// whatever view has focus, then restores the previous clipboard
     /// contents. Runs entirely on the main actor because NSPasteboard
     /// and CGEvent synthesis both want the main thread.
+    // v16po (2026-06-05): de-private'd so Marin's `fill_cells` tool can
+    // reuse this exact paste path (clipboard + Cmd+V + Electron latch).
     @MainActor
-    private static func typeTextViaClipboard(_ text: String) async {
+    static func typeTextViaClipboard(_ text: String) async {
         let pasteboard = NSPasteboard.general
 
         // Write our text to the clipboard.

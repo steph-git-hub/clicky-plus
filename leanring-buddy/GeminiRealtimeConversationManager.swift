@@ -952,6 +952,26 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "required": ["operation", "spreadsheet_id"],
             ],
         ],
+        // ── Fill the sheet/field Steph is LOOKING AT (v16po) ───
+        // Stages values + PASTES them at the focused cell in one shot.
+        // No spreadsheet id needed. This is the right tool for "fill
+        // in what's on my screen"; the `sheets` tool is for by-id work.
+        [
+            "name": "fill_cells",
+            "description": "Type values into the spreadsheet (or any field) Steph is LOOKING AT on screen — no spreadsheet id needed. It pastes at his CURRENTLY SELECTED cell, so first make sure he has clicked the starting cell (if unsure, ask him to click it). Pass `values` as a 2-D array (rows of cells); it's pasted as a tab/newline block so Google Sheets fans it across cells and rows starting at the active cell. Use this for 'fill in these details', 'put this list in', 'add these values', 'paste this into the sheet'. THIS IS THE TOOL FOR EDITING THE SHEET ON SCREEN — not the `sheets` tool (that one needs an id and is for remote/structured reads & writes). CRITICAL: this tool actually PASTES — it does not just copy. After it returns ok, give a one-word confirm like 'Filled.' NEVER stage to the clipboard and stop; that leaves the value unpasted.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "values": [
+                        "type": "ARRAY",
+                        "description": "2-D array: rows of cell values, e.g. [[\"SKU\",\"Price\"],[\"NAILS1187\",\"14.99\"]]. Pasted starting at the selected cell — columns split on tab, rows on newline.",
+                        "items": ["type": "ARRAY", "items": ["type": "STRING"]],
+                    ],
+                    "text": ["type": "STRING", "description": "Alternative to values: a raw string to paste as-is (use \\t between columns, \\n between rows). Prefer `values` for grids."],
+                ],
+                "required": [],
+            ],
+        ],
     ]
 
     /// HTTP POST to the Cloudflare Worker for tools that need cloud
@@ -1291,6 +1311,9 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             return await safeWorkerCall(path: "/clickup", body: args)
         case "sheets":
             return await safeWorkerCall(path: "/sheets", body: args)
+        // ── fill_cells: paste into the focused cell on screen (v16po)
+        case "fill_cells":
+            return await fillCells(args: args)
         default:
             return ["status": "error", "reason": "Unknown tool: \(name)"]
         }
@@ -1302,6 +1325,35 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         } catch {
             return ["status": "error", "reason": error.localizedDescription]
         }
+    }
+
+    /// v16po (2026-06-05): fill_cells — paste a grid of values into the
+    /// cell Steph has selected on screen. Builds a TSV block (tab between
+    /// columns, newline between rows) which Google Sheets fans out across
+    /// cells from the active cell, then pastes it via the same clipboard
+    /// + Cmd+V path VTT uses. This is the "edit what I'm looking at" path
+    /// that needs no spreadsheet id, and it PASTES (not just copies) so
+    /// the "she said Copied and stopped" failure can't happen.
+    private func fillCells(args: [String: Any]) async -> [String: Any] {
+        var block = ""
+        if let values = args["values"] as? [[Any]] {
+            block = values
+                .map { row in row.map { "\($0)" }.joined(separator: "\t") }
+                .joined(separator: "\n")
+        } else if let text = args["text"] as? String {
+            block = text
+        }
+        if block.isEmpty {
+            return ["status": "error", "reason": "Nothing to fill — provide `values` (2-D array) or `text`."]
+        }
+        if block.count > 20_000 {
+            return ["status": "error", "reason": "Too large (\(block.count) chars). Limit 20000."]
+        }
+        await CompanionManager.typeTextViaClipboard(block)
+        return [
+            "status": "ok",
+            "note": "Pasted at the focused cell. Give Steph a one-word confirm like 'Filled.' If it didn't land, the block is on his clipboard so he can Cmd+V it himself.",
+        ]
     }
 
     /// Send a tool result back to Gemini as a toolResponse message.
