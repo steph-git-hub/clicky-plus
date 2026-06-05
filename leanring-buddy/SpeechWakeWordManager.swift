@@ -25,8 +25,11 @@ final class SpeechWakeWordManager {
     private var isRunning = false
     private var firedThisSession = false
 
+    // The on-device recognizer transcribes "Marin" as "Marin" OR "Maren"
+    // (observed in the wake-word diag log). Accept both; \b stops it from
+    // matching "marine"/"marina". "Hey Marin" matches via the inner word.
     private let matchRegex = try? NSRegularExpression(
-        pattern: "\\bmarin\\b", options: [.caseInsensitive])
+        pattern: "\\bmar[ie]n\\b", options: [.caseInsensitive])
 
     private static func diag(_ s: String) {
         let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(s)\n"
@@ -113,7 +116,7 @@ final class SpeechWakeWordManager {
     }
 
     private func matches(_ text: String) -> Bool {
-        guard let rx = matchRegex else { return text.lowercased().contains("marin") }
+        guard let rx = matchRegex else { let t = text.lowercased(); return t.contains("marin") || t.contains("maren") }
         return rx.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) != nil
     }
 
