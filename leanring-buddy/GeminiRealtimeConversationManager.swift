@@ -193,6 +193,23 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
     /// queued pre-setup messages; it does not.
     private var setupAcknowledged: Bool = false
 
+    /// v16pk (2026-06-04): buffer-and-drain for cold-start mic audio
+    /// (Farza pattern — see [[project_clicky_farza_realtime_hints]]).
+    /// The mic tap starts capturing at engage (startMicCapture, before
+    /// waitForSetupComplete), but the server rejects any realtime_input
+    /// sent before setupComplete (close 1007). Previously those early
+    /// chunks were sent-and-rejected or effectively lost, so whatever
+    /// Steph said in the ~1-2s cold-start window vanished — the first
+    /// words of a hands-free turn got clipped. Now: while
+    /// !setupAcknowledged we STASH mic chunks here instead of sending,
+    /// then flush them in order the instant setupComplete arrives. The
+    /// cap bounds memory if setup stalls — we keep only the most recent
+    /// chunks (drop oldest), so a long spin-up keeps the freshest speech.
+    private var bufferedMicChunks: [Data] = []
+    /// ~21ms per tap buffer (1024 frames @ ~48kHz hw) → 250 chunks ≈ 5s
+    /// of pre-connect audio retained. Setup normally completes in ~1s.
+    private static let maxBufferedMicChunks = 250
+
     /// v15p3ed (2026-05-16): hands-free continuous-listening mode.
     /// When true: setup uses automatic VAD (server segments turns),
     /// hotkey press/release is a no-op, no auto-close timer, mic
@@ -3235,6 +3252,9 @@ unless he asks for them).
         await MainActor.run {
             self.setupAcknowledged = false
             self.pressWindowPeakLevel = 0
+            // v16pk (2026-06-04): clear any stale cold-start buffer from
+            // a prior connection so it can't leak into this new session.
+            self.bufferedMicChunks.removeAll()
         }
         task.resume()
         RealtimeConversationManager.appendDiag("[gemini] websocket task.resume() called")
@@ -3702,6 +3722,9 @@ unless he asks for them).
             RealtimeConversationManager.appendDiag("[gemini] received setupComplete")
             Task { @MainActor in
                 self.setupAcknowledged = true
+                // v16pk (2026-06-04): flush any mic audio captured
+                // during cold-start now that the server will accept it.
+                self.flushBufferedMicChunks()
             }
             return
         }
@@ -4105,6 +4128,18 @@ unless he asks for them).
 
     private func sendMicChunk(_ pcmData: Data) {
         guard let task = websocketTask else { return }
+        // v16pk (2026-06-04): buffer-and-drain. The server hasn't
+        // acknowledged setup yet → sending realtime_input now would be
+        // rejected (close 1007). Stash the chunk and return; it gets
+        // flushed in order by flushBufferedMicChunks() the moment
+        // setupComplete arrives, so cold-start speech isn't clipped.
+        if !setupAcknowledged {
+            bufferedMicChunks.append(pcmData)
+            if bufferedMicChunks.count > Self.maxBufferedMicChunks {
+                bufferedMicChunks.removeFirst(bufferedMicChunks.count - Self.maxBufferedMicChunks)
+            }
+            return
+        }
         // v15p3et (2026-05-17): mic suppression during Marin's speech
         // in continuous mode. AEC via setVoiceProcessingEnabled didn't
         // work on Steph's 9-channel built-in mic (see v15p3em/eo/er).
@@ -4153,6 +4188,36 @@ unless he asks for them).
         }
         Task {
             try? await self.sendJSON(payload, task: task)
+        }
+    }
+
+    /// v16pk (2026-06-04): drain the cold-start mic buffer. Called once
+    /// setupComplete arrives. Sends every stashed chunk in capture order
+    /// (oldest → newest) so Marin hears the words Steph spoke during the
+    /// ~1-2s session spin-up. Bypasses sendMicChunk's setupAcknowledged
+    /// gate (we ARE now acknowledged) and its Marin-speaking suppression
+    /// (she can't be speaking yet at setup time). No-op if empty.
+    private func flushBufferedMicChunks() {
+        guard !bufferedMicChunks.isEmpty else { return }
+        guard let task = websocketTask else { bufferedMicChunks.removeAll(); return }
+        let chunks = bufferedMicChunks
+        bufferedMicChunks.removeAll()
+        RealtimeConversationManager.appendDiag(
+            "[gemini] draining \(chunks.count) buffered mic chunks (cold-start audio)"
+        )
+        for pcmData in chunks {
+            let payload: [String: Any] = [
+                "realtime_input": [
+                    "audio": [
+                        "data": pcmData.base64EncodedString(),
+                        "mime_type": "audio/pcm;rate=16000",
+                    ],
+                ],
+            ]
+            sentChunkCount += 1
+            Task {
+                try? await self.sendJSON(payload, task: task)
+            }
         }
     }
 
