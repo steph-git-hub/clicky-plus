@@ -749,7 +749,11 @@ final class CompanionManager: ObservableObject {
     // v16 (2026-06-04): Apple Speech on-device wake word ("Marin").
     private var speechWakeWordManager: SpeechWakeWordManager?
     private var wakeWordGateTimer: Timer?
-    @AppStorage("clicky.wakeword.enabled") private var wakeWordEnabled: Bool = true
+    // v16pj (2026-06-04): PARKED — Apple-Speech wake word works but isn't worth it
+    // for desk use (hotkey toggle is already low-friction; detection has deaf gaps;
+    // activation delay is Marin's cold-start). Flip to true / `defaults write
+    // com.stephenpierson.clickyplus clicky.wakeword.enabled -bool true` to re-enable.
+    @AppStorage("clicky.wakeword.enabled") private var wakeWordEnabled: Bool = false
     private var realtimeManagerStateCancellable: AnyCancellable?
 
     /// v15p3di (2026-05-16): parallel Gemini Live provider for Marin.
