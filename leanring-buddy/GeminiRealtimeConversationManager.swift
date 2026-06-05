@@ -985,7 +985,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "properties": [
                     "items": [
                         "type": "ARRAY",
-                        "description": "Identifiers to look up, in the order they should be pasted top-to-bottom. Each can be a SKU, Amazon SKU, ASIN, UPC, FNSKU, or product name. Read them off the column on screen if Steph is pointing at one.",
+                        "description": "Identifiers to look up, in the order they should be pasted top-to-bottom. Each can be a SKU, Amazon SKU, ASIN, UPC, FNSKU, or product name. Use this ONLY for a short, specific set Steph names. IMPORTANT: if the items are an entire collection or group (e.g. 'all the Euro Summer SKUs', 'fill the ASINs for this collection'), do NOT read them one-by-one off the screen — you WILL miss some (you filled only 4 of 24 once doing this). Use filter_value instead to enumerate the whole group from the master, completely and deterministically.",
                         "items": ["type": "STRING"],
                     ],
                     "fields": [
