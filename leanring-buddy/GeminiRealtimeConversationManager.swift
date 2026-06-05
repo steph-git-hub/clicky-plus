@@ -910,6 +910,47 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "required": ["note"]
             ]
         ],
+        // ── Web-app control: ClickUp (2026-06-05) ──────────────
+        // Gateway tool: one declaration, `operation` fans out in the
+        // worker. Keeps the realtime tool surface small.
+        [
+            "name": "clickup",
+            "description": "Create or update a ClickUp task by voice. operation=\"create\" makes a new task (in Steph's default list unless list_id is given); operation=\"update\" changes an existing task by task_id. Use for 'make a task to…', 'add a ClickUp task', 'mark task X done' (status), 'bump the priority', 'change the due date'. For updates you need the task_id — if you don't have it, say so rather than guessing.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "operation": ["type": "STRING", "description": "\"create\" or \"update\"."],
+                    "name": ["type": "STRING", "description": "Task title. Required for create; optional rename for update."],
+                    "description": ["type": "STRING", "description": "Optional task body / notes."],
+                    "task_id": ["type": "STRING", "description": "ClickUp task id. Required for update."],
+                    "list_id": ["type": "STRING", "description": "Optional target list id for create. Omit to use Steph's default list."],
+                    "status": ["type": "STRING", "description": "Optional status name, e.g. 'to do', 'in progress', 'complete'."],
+                    "priority": ["type": "INTEGER", "description": "Optional priority: 1=urgent, 2=high, 3=normal, 4=low."],
+                    "due_date": ["type": "STRING", "description": "Optional due date as ISO8601, e.g. 2026-06-10T17:00:00-07:00."],
+                ],
+                "required": ["operation"],
+            ],
+        ],
+        // ── Web-app control: Google Sheets (2026-06-05) ────────
+        // Gateway tool. Non-destructive ops only (no clear/delete).
+        [
+            "name": "sheets",
+            "description": "Read or write Google Sheets by voice. operation=\"read\" returns the values in a range; \"update\" overwrites a range with values; \"append\" adds rows after the existing table; \"info\" lists the tab names + ids in a spreadsheet. Always needs spreadsheet_id. read/update/append need an A1 range like 'Amazon!B2:B20'. values is a 2-D array (rows of cells). No destructive operations exist here (no clearing or deleting) — by design.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "operation": ["type": "STRING", "description": "\"read\", \"update\", \"append\", or \"info\"."],
+                    "spreadsheet_id": ["type": "STRING", "description": "The spreadsheet id (the long token in its URL). Required."],
+                    "range": ["type": "STRING", "description": "A1 notation, e.g. 'Amazon!B2:B20'. Required for read/update/append."],
+                    "values": [
+                        "type": "ARRAY",
+                        "description": "2-D array of rows for update/append. Each inner array is one row of cell values.",
+                        "items": ["type": "ARRAY", "items": ["type": "STRING"]],
+                    ],
+                ],
+                "required": ["operation", "spreadsheet_id"],
+            ],
+        ],
     ]
 
     /// HTTP POST to the Cloudflare Worker for tools that need cloud
@@ -1242,6 +1283,13 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                     ? "Captured to Idea Inbox. Tell Steph in past tense — short. \"Captured.\" or \"Added to your inbox.\" Do NOT say \"added to your roadmap\" — this is the Idea Inbox, a different place. Do NOT confirm if this returned an error."
                     : "Failed: \(result). Tell Steph plainly that the inbox append errored."
             ]
+        // ── Web-app control gateways (2026-06-05) ──────────────
+        // Pass args straight through; the worker validates `operation`
+        // and the per-op required fields.
+        case "clickup":
+            return await safeWorkerCall(path: "/clickup", body: args)
+        case "sheets":
+            return await safeWorkerCall(path: "/sheets", body: args)
         default:
             return ["status": "error", "reason": "Unknown tool: \(name)"]
         }

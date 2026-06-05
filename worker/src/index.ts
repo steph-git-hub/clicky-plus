@@ -67,6 +67,20 @@ interface Env {
   /// list_recent_meetings). Stored via
   /// `npx wrangler secret put FIREFLIES_API_KEY`.
   FIREFLIES_API_KEY: string;
+  /// ClickUp connector (2026-06-05). Personal API token (pk_...) from
+  /// ClickUp → Settings → Apps → API Token. Backs Marin's `clickup`
+  /// gateway tool (create/update tasks). Sent as the raw Authorization
+  /// header value (ClickUp does NOT use a Bearer prefix).
+  CLICKUP_API_TOKEN: string;
+  /// Default ClickUp list id used when `clickup.create` is called
+  /// without an explicit list_id — so "make me a task" just works.
+  CLICKUP_DEFAULT_LIST_ID: string;
+  /// Sheets connector (2026-06-05). Separate Google OAuth refresh token
+  /// scoped to https://www.googleapis.com/auth/spreadsheets, minted on
+  /// the SAME OAuth client as Gmail/Calendar. Backs Marin's `sheets`
+  /// gateway tool (read/update/append/info). Worker-side token exchange,
+  /// same pattern as getCalendarAccessToken.
+  SHEETS_REFRESH_TOKEN: string;
 }
 
 export default {
@@ -182,6 +196,18 @@ export default {
       if (url.pathname === "/fireflies/list-recent") {
         return await handleFirefliesListRecent(request, env);
       }
+
+      // ── Web-app control gateways (2026-06-05) ───────────────
+      // Single endpoint per service; the `operation` field fans out
+      // inside the handler. Keeps Marin's Gemini tool surface to ONE
+      // declaration per service instead of N.
+      if (url.pathname === "/clickup") {
+        return await handleClickup(request, env);
+      }
+
+      if (url.pathname === "/sheets") {
+        return await handleSheets(request, env);
+      }
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
       return new Response(
@@ -193,6 +219,238 @@ export default {
     return new Response("Not found", { status: 404 });
   },
 };
+
+// ═══════════════════════════════════════════════════════════════════
+// Web-app control gateways (2026-06-05)
+//
+// Gateway pattern: one worker endpoint + one Gemini tool per service,
+// with an `operation` discriminator, instead of one tool per action.
+// This keeps Marin's realtime tool surface small (bloat hurts a
+// realtime model's latency + tool-selection accuracy more than a text
+// model's). DESTRUCTIVE Sheets ops (clear, delete-dimensions,
+// remove-duplicates) are intentionally NOT exposed — too dangerous to
+// trigger from a misheard voice command.
+// ═══════════════════════════════════════════════════════════════════
+
+/// /clickup — create or update ClickUp tasks.
+/// body: { operation: "create" | "update", ... }
+///   create: { name (required), description?, list_id?, status?,
+///             priority?(1=urgent..4=low), due_date?(ISO8601) }
+///   update: { task_id (required), name?, description?, status?,
+///             priority?, due_date? }
+async function handleClickup(request: Request, env: Env): Promise<Response> {
+  let payload: {
+    operation?: string;
+    name?: string;
+    description?: string;
+    list_id?: string;
+    task_id?: string;
+    status?: string;
+    priority?: number;
+    due_date?: string;
+  };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+
+  const operation = (payload.operation ?? "").trim();
+  if (operation !== "create" && operation !== "update") {
+    return jsonError('operation must be "create" or "update"', 400);
+  }
+  if (!env.CLICKUP_API_TOKEN) {
+    return jsonError("ClickUp not configured (missing CLICKUP_API_TOKEN secret)", 500);
+  }
+
+  // ClickUp wants due dates as Unix epoch milliseconds.
+  let dueMs: number | undefined;
+  if (payload.due_date) {
+    const t = Date.parse(payload.due_date);
+    if (!Number.isNaN(t)) dueMs = t;
+  }
+
+  const taskBody: Record<string, unknown> = {};
+  if (payload.name) taskBody.name = payload.name;
+  if (payload.description) taskBody.description = payload.description;
+  if (payload.status) taskBody.status = payload.status;
+  if (typeof payload.priority === "number") taskBody.priority = payload.priority;
+  if (dueMs) taskBody.due_date = dueMs;
+
+  let endpoint: string;
+  let method: string;
+  if (operation === "create") {
+    if (!payload.name) return jsonError("name is required to create a task", 400);
+    const listId = (payload.list_id ?? env.CLICKUP_DEFAULT_LIST_ID ?? "").trim();
+    if (!listId) {
+      return jsonError("No list_id given and CLICKUP_DEFAULT_LIST_ID is not set", 400);
+    }
+    endpoint = `https://api.clickup.com/api/v2/list/${encodeURIComponent(listId)}/task`;
+    method = "POST";
+  } else {
+    if (!payload.task_id) return jsonError("task_id is required to update a task", 400);
+    endpoint = `https://api.clickup.com/api/v2/task/${encodeURIComponent(payload.task_id)}`;
+    method = "PUT";
+  }
+
+  const response = await fetch(endpoint, {
+    method,
+    headers: {
+      authorization: env.CLICKUP_API_TOKEN, // ClickUp: raw token, no Bearer prefix
+      "content-type": "application/json",
+    },
+    body: JSON.stringify(taskBody),
+  });
+  if (!response.ok) {
+    const errorBody = await response.text();
+    return sanitizedUpstreamError("/clickup", response.status, errorBody);
+  }
+  const task = (await response.json()) as {
+    id?: string;
+    name?: string;
+    url?: string;
+    status?: { status?: string };
+  };
+  return new Response(
+    JSON.stringify({
+      status: operation === "create" ? "created" : "updated",
+      task_id: task.id,
+      name: task.name,
+      task_status: task.status?.status,
+      url: task.url,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+/// Mint a Google access token scoped to Sheets. Mirrors
+/// getCalendarAccessToken but uses SHEETS_REFRESH_TOKEN — a separate
+/// refresh token carrying the spreadsheets scope, on the same OAuth
+/// client. The refresh token is the persistent credential and never
+/// leaves the Worker.
+async function getSheetsAccessToken(env: Env): Promise<string> {
+  const params = new URLSearchParams({
+    client_id: env.GOOGLE_OAUTH_CLIENT_ID,
+    client_secret: env.GOOGLE_OAUTH_CLIENT_SECRET,
+    refresh_token: env.SHEETS_REFRESH_TOKEN,
+    grant_type: "refresh_token",
+  });
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+  if (!tokenResponse.ok) {
+    const errorBody = await tokenResponse.text();
+    throw new Error(`Sheets token exchange failed (${tokenResponse.status}): ${errorBody}`);
+  }
+  const tokenJSON = (await tokenResponse.json()) as { access_token?: string };
+  if (!tokenJSON.access_token) {
+    throw new Error("Sheets token response missing access_token");
+  }
+  return tokenJSON.access_token;
+}
+
+/// /sheets — read / update / append / info on Google Sheets.
+/// body: { operation, spreadsheet_id (required), range?, values? }
+///   read:   { spreadsheet_id, range }           → returns the cell values
+///   update: { spreadsheet_id, range, values }    → writes values (overwrite)
+///   append: { spreadsheet_id, range, values }    → appends rows after the table
+///   info:   { spreadsheet_id }                   → lists tab names + ids
+/// `values` is a 2-D array (rows of cells). No destructive ops by design.
+async function handleSheets(request: Request, env: Env): Promise<Response> {
+  let payload: {
+    operation?: string;
+    spreadsheet_id?: string;
+    range?: string;
+    values?: unknown[][];
+  };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+
+  const operation = (payload.operation ?? "").trim();
+  const validOps = ["read", "update", "append", "info"];
+  if (!validOps.includes(operation)) {
+    return jsonError(`operation must be one of: ${validOps.join(", ")}`, 400);
+  }
+  const spreadsheetId = (payload.spreadsheet_id ?? "").trim();
+  if (!spreadsheetId) return jsonError("spreadsheet_id is required", 400);
+  if (!env.SHEETS_REFRESH_TOKEN) {
+    return jsonError("Sheets not configured (missing SHEETS_REFRESH_TOKEN secret)", 500);
+  }
+  if ((operation === "read" || operation === "update" || operation === "append") && !payload.range) {
+    return jsonError(`range is required for "${operation}"`, 400);
+  }
+  if ((operation === "update" || operation === "append") && !Array.isArray(payload.values)) {
+    return jsonError(`values (2-D array) is required for "${operation}"`, 400);
+  }
+
+  let accessToken: string;
+  try {
+    accessToken = await getSheetsAccessToken(env);
+  } catch (err) {
+    console.error(`[/sheets] token exchange failed: ${err}`);
+    return jsonError(`Sheets auth failed: ${err}`, 500);
+  }
+
+  const base = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}`;
+  const authHeaders = { authorization: `Bearer ${accessToken}`, "content-type": "application/json" };
+
+  let upstream: Response;
+  if (operation === "read") {
+    const url = `${base}/values/${encodeURIComponent(payload.range!)}`;
+    upstream = await fetch(url, { headers: authHeaders });
+  } else if (operation === "update") {
+    const url = `${base}/values/${encodeURIComponent(payload.range!)}?valueInputOption=USER_ENTERED`;
+    upstream = await fetch(url, {
+      method: "PUT",
+      headers: authHeaders,
+      body: JSON.stringify({ values: payload.values }),
+    });
+  } else if (operation === "append") {
+    const url = `${base}/values/${encodeURIComponent(payload.range!)}:append?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS`;
+    upstream = await fetch(url, {
+      method: "POST",
+      headers: authHeaders,
+      body: JSON.stringify({ values: payload.values }),
+    });
+  } else {
+    // info
+    const url = `${base}?fields=${encodeURIComponent("properties.title,sheets.properties(sheetId,title,gridProperties(rowCount,columnCount))")}`;
+    upstream = await fetch(url, { headers: authHeaders });
+  }
+
+  if (!upstream.ok) {
+    const errorBody = await upstream.text();
+    return sanitizedUpstreamError("/sheets", upstream.status, errorBody);
+  }
+  const data = (await upstream.json()) as Record<string, unknown>;
+
+  // Trim each response to what Marin actually needs to speak.
+  let result: Record<string, unknown>;
+  if (operation === "read") {
+    result = { status: "ok", range: data.range, values: data.values ?? [] };
+  } else if (operation === "update") {
+    result = { status: "updated", updated_range: data.updatedRange, updated_cells: data.updatedCells };
+  } else if (operation === "append") {
+    const upd = (data.updates ?? {}) as Record<string, unknown>;
+    result = { status: "appended", updated_range: upd.updatedRange, updated_rows: upd.updatedRows };
+  } else {
+    const sheets = (data.sheets ?? []) as Array<{ properties?: { title?: string; sheetId?: number } }>;
+    result = {
+      status: "ok",
+      title: (data.properties as { title?: string } | undefined)?.title,
+      tabs: sheets.map((s) => ({ name: s.properties?.title, id: s.properties?.sheetId })),
+    };
+  }
+  return new Response(JSON.stringify(result), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
 
 /// v15p3u (2026-05-09): web search via Anthropic's web_search tool. Marin
 /// calls this when she needs current web information. We make a single
