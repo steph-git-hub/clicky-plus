@@ -29,8 +29,8 @@ Usage:
     Amazon:1zva8IzCHQRNUasuBZcI4Cz9tQduvOtxyFSN0p-5bhvE  "MASTER"!A3:V3230
 
 Current sheet column layout (A=0 … N=13):
-  A  SKU             B  FBA SKU            C  FNSKU
-  D  ASIN            E  Name               F  Category
+  A  SKU             B  ASIN               C  FBA SKU
+  D  FNSKU           E  Name               F  Category
   G  Parent          H  Length             I  Shape
   J  MSRP            K  Unit Cost          L  UPC
   M  Amazon Variation  N  Source
@@ -47,10 +47,15 @@ TOKEN_PATH    = os.path.expanduser("~/.config/sheets-mcp/token.json")
 JSON_OUT      = os.path.expanduser("~/clicky-plus/data/sku-master.json")
 
 # Column indices in curated sheet (0-based, matching current header row)
-# A=SKU  B=FBA SKU  C=FNSKU  D=ASIN  E=Name  F=Category  G=Parent
+# v3.1 (2026-06-05): sheet columns B/C/D were reordered to ASIN / FBA SKU /
+# FNSKU (was FBA SKU / FNSKU / ASIN) but this map wasn't updated — so the
+# generator was loading the FNSKU column into `asin`, the ASIN column into
+# `amazon_sku`, and the FBA SKU column into `fnsku`. Fixed to match the live
+# header below.
+# A=SKU  B=ASIN  C=FBA SKU  D=FNSKU  E=Name  F=Category  G=Parent
 # H=Length  I=Shape  J=MSRP  K=Unit Cost  L=UPC  M=Amazon Variation  N=Source
 COL = {
-    "sku": 0, "amazon_sku": 1, "fnsku": 2, "asin": 3, "name": 4,
+    "sku": 0, "asin": 1, "amazon_sku": 2, "fnsku": 3, "name": 4,
     "category": 5, "parent": 6, "length": 7, "shape": 8,
     "msrp": 9, "unit_cost": 10, "upc": 11, "variation": 12, "source": 13,
 }
