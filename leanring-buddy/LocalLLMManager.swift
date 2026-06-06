@@ -284,7 +284,22 @@ final class LocalLLMManager {
             )
         }
 
-        let output = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        var output = content.trimmingCharacters(in: .whitespacesAndNewlines)
+        // v16pw (2026-06-06): qwen occasionally wraps the whole output in
+        // quotes despite the prompt's "no quotes around it" rule (caught
+        // live on bake-off line 14). Deterministic guard: if the output
+        // is fully wrapped in a quote pair the INPUT didn't start with,
+        // strip the wrapper. Interior quotes are untouched.
+        let quotePairs: [(Character, Character)] = [("\"", "\""), ("“", "”"), ("'", "'"), ("‘", "’")]
+        for (openQuote, closeQuote) in quotePairs {
+            if output.count >= 2,
+               output.first == openQuote, output.last == closeQuote,
+               rawText.first != openQuote {
+                output = String(output.dropFirst().dropLast())
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                break
+            }
+        }
         guard !output.isEmpty else {
             throw NSError(
                 domain: "ClickyLocalLLMError", code: -4,
