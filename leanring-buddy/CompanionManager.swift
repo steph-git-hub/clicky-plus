@@ -4740,9 +4740,35 @@ final class CompanionManager: ObservableObject {
             // response intent. Lifted from CompanionScreenCaptureUtility
             // (same path Marin uses for vision). Runs before the Worker
             // call so we can include it in the request.
+            // v16qb (2026-06-06): local intent normalization. If the
+            // spoken modifier isn't an exact known phrase, ask the
+            // on-device model whether it's a paraphrase of toggle/full/
+            // format-response polish (~0.2s, tiny prompt). OTHER and any
+            // failure pass the modifier through verbatim — pre-v16qb
+            // behavior. "Organize this mess" now triggers toggle polish
+            // instead of being treated as a literal edit instruction.
+            var effectiveModifier = residualModifier
+            var effectiveFormatResponse = isFormatResponseIntent
+            if !effectiveFormatResponse, let spokenModifier = modifier {
+                switch await LocalLLMManager.shared.classifyPolishModifier(spokenModifier) {
+                case .toggle:
+                    effectiveModifier = "toggle polish"
+                    print("🧠 Intent: \"\(spokenModifier)\" → toggle polish (local classifier)")
+                case .full:
+                    effectiveModifier = "full polish"
+                    print("🧠 Intent: \"\(spokenModifier)\" → full polish (local classifier)")
+                case .formatResponse:
+                    effectiveFormatResponse = true
+                    effectiveModifier = nil
+                    print("🧠 Intent: \"\(spokenModifier)\" → format response (local classifier)")
+                case nil:
+                    break
+                }
+            }
+
             let captureStartedAt = Date()
             var screenshotJPEG: Data? = nil
-            if isFormatResponseIntent {
+            if effectiveFormatResponse {
                 do {
                     let capture = try await CompanionScreenCaptureUtility.captureActiveScreenAsJPEG()
                     screenshotJPEG = capture.imageData
@@ -4757,13 +4783,13 @@ final class CompanionManager: ObservableObject {
                 let detailed = try await Self.sendPolishCommandToWorkerDetailed(
                     workerBaseURL: resolvedWorkerBaseURL,
                     fieldText: textToPolish,
-                    modifier: residualModifier,
+                    modifier: effectiveModifier,
                     appName: fieldContent?.appName,
                     role: fieldContent?.role,
                     windowTitle: fieldContent?.windowTitle,
                     personalFacts: Self.loadCurrentObsidianMemoryContents(),
                     contextImageJPEG: screenshotJPEG,
-                    intent: isFormatResponseIntent ? "format-response" : nil
+                    intent: effectiveFormatResponse ? "format-response" : nil
                 )
                 let rawPolishedText = detailed.output
                 let networkCompletedAt = Date()
@@ -4788,8 +4814,8 @@ final class CompanionManager: ObservableObject {
                 // changed. Critical for debugging the "polish did nothing"
                 // reports — at-a-glance diff between input and output.
                 Self.appendPolishOutputDiag(
-                    modifier: modifier,
-                    intent: isFormatResponseIntent ? "format-response" : "default",
+                    modifier: effectiveModifier ?? modifier,
+                    intent: effectiveFormatResponse ? "format-response" : "default",
                     input: textToPolish,
                     rawOutput: rawPolishedText,
                     cleanedOutput: trimmedPolishedText
