@@ -72,6 +72,8 @@ final class LocalLLMManager {
     private var serverReady = false
     private var professionalPrompt: String?
     private var casualPrompt: String?
+    /// v16pz: dedupe flag for background prompt-cache re-warming.
+    private var isRewarmingPromptCache = false
 
     /// True when both the server is health-checked AND the prompt cache
     /// is populated — i.e. a local repunctuate call can be attempted.
@@ -122,6 +124,7 @@ final class LocalLLMManager {
         if await healthCheck() {
             stateLock.lock(); serverReady = true; stateLock.unlock()
             print("🧠 LocalLLM: adopted already-running server on :\(port)")
+            await warmUpPromptCache()
             return
         }
 
@@ -157,6 +160,7 @@ final class LocalLLMManager {
             if await healthCheck() {
                 stateLock.lock(); serverReady = true; stateLock.unlock()
                 print("🧠 LocalLLM: server ready")
+                await warmUpPromptCache()
                 return
             }
             if !process.isRunning {
@@ -165,6 +169,51 @@ final class LocalLLMManager {
             }
         }
         print("🧠 LocalLLM: server never became healthy — Worker path only")
+    }
+
+    // MARK: - Prompt-cache warming (v16pz, 2026-06-06)
+    //
+    // Rapid-MLX caches processed prompts in memory, but the cache can be
+    // evicted (other prompts run through the server, memory pressure).
+    // A COLD repunctuate call pays ~7-8s of prompt processing — well over
+    // the 4s inference timeout — and a timed-out (cancelled) call never
+    // re-populates the cache, so without warming, eviction puts every
+    // dictation into a permanent timeout→worker-fallback loop (caught
+    // live 2026-06-06: pastes went 3-8x slower after the polish bench
+    // ran foreign prompts through the server). Fix: warm both prompt
+    // variants with a tiny long-timeout call at launch, and re-warm in
+    // the background whenever a real call times out.
+
+    private func warmUpPromptCache() async {
+        stateLock.lock()
+        let prompts = [professionalPrompt, casualPrompt].compactMap { $0 }
+        stateLock.unlock()
+        for prompt in prompts {
+            _ = try? await runInference(
+                systemPrompt: prompt, userText: "warm up.",
+                maxTokens: 8, timeout: 90
+            )
+        }
+        if !prompts.isEmpty {
+            print("🧠 LocalLLM: prompt cache warmed (\(prompts.count) variant(s))")
+        }
+    }
+
+    /// Fire-and-forget re-warm after a timeout. Deduped so a burst of
+    /// slow dictations doesn't stack warmup calls.
+    private func scheduleBackgroundRewarm() {
+        stateLock.lock()
+        let alreadyRunning = isRewarmingPromptCache
+        if !alreadyRunning { isRewarmingPromptCache = true }
+        stateLock.unlock()
+        guard !alreadyRunning else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            await self.warmUpPromptCache()
+            self.stateLock.lock()
+            self.isRewarmingPromptCache = false
+            self.stateLock.unlock()
+        }
     }
 
     private func healthCheck() async -> Bool {
@@ -240,48 +289,19 @@ final class LocalLLMManager {
             )
         }
 
-        guard let url = URL(string: "\(baseURL)/v1/chat/completions") else {
-            throw NSError(
-                domain: "ClickyLocalLLMError", code: -2,
-                userInfo: [NSLocalizedDescriptionKey: "Invalid local LLM URL"]
+        // Benchmarked well under 2s on real dictations (warm cache); 4s
+        // means something is wrong (prompt cache evicted, swap storm) —
+        // fall back to the worker, and re-warm the cache in the
+        // background so the NEXT dictation is fast again (v16pz).
+        let content: String
+        do {
+            content = try await runInference(
+                systemPrompt: systemPrompt, userText: rawText,
+                maxTokens: 1024, timeout: 4
             )
-        }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        // Benchmarked well under 2s on real dictations; 4s means
-        // something is wrong (model evicted, swap storm) — fall back.
-        request.timeoutInterval = 4
-        let body: [String: Any] = [
-            "model": modelAlias,
-            "temperature": 0,
-            "max_tokens": 1024,
-            "messages": [
-                ["role": "system", "content": systemPrompt],
-                ["role": "user", "content": rawText],
-            ],
-            // Qwen3.5 hybrid reasoning: thinking would add seconds of
-            // latency for zero benefit on a mechanical transform.
-            "chat_template_kwargs": ["enable_thinking": false],
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
-            throw NSError(
-                domain: "ClickyLocalLLMError", code: status,
-                userInfo: [NSLocalizedDescriptionKey: "Local LLM returned status \(status)"]
-            )
-        }
-        guard let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = parsed["choices"] as? [[String: Any]],
-              let message = choices.first?["message"] as? [String: Any],
-              let content = message["content"] as? String else {
-            throw NSError(
-                domain: "ClickyLocalLLMError", code: -3,
-                userInfo: [NSLocalizedDescriptionKey: "Local LLM response missing content"]
-            )
+        } catch let error as URLError where error.code == .timedOut {
+            scheduleBackgroundRewarm()
+            throw error
         }
 
         var output = content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -307,5 +327,55 @@ final class LocalLLMManager {
             )
         }
         return output
+    }
+
+    /// Shared OpenAI-compatible chat call against the local server.
+    /// Returns the raw assistant text (trimmed by callers as needed).
+    private func runInference(
+        systemPrompt: String, userText: String,
+        maxTokens: Int, timeout: TimeInterval
+    ) async throws -> String {
+        guard let url = URL(string: "\(baseURL)/v1/chat/completions") else {
+            throw NSError(
+                domain: "ClickyLocalLLMError", code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "Invalid local LLM URL"]
+            )
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.timeoutInterval = timeout
+        let body: [String: Any] = [
+            "model": modelAlias,
+            "temperature": 0,
+            "max_tokens": maxTokens,
+            "messages": [
+                ["role": "system", "content": systemPrompt],
+                ["role": "user", "content": userText],
+            ],
+            // Qwen3.5 hybrid reasoning: thinking would add seconds of
+            // latency for zero benefit on a mechanical transform.
+            "chat_template_kwargs": ["enable_thinking": false],
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw NSError(
+                domain: "ClickyLocalLLMError", code: status,
+                userInfo: [NSLocalizedDescriptionKey: "Local LLM returned status \(status)"]
+            )
+        }
+        guard let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let choices = parsed["choices"] as? [[String: Any]],
+              let message = choices.first?["message"] as? [String: Any],
+              let content = message["content"] as? String else {
+            throw NSError(
+                domain: "ClickyLocalLLMError", code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "Local LLM response missing content"]
+            )
+        }
+        return content
     }
 }
