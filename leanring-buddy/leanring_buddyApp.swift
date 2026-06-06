@@ -86,6 +86,8 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         companionManager.stop()
+        // v16pv (2026-06-06): kill the on-device LLM server we spawned.
+        LocalLLMManager.shared.stop()
     }
 
     /// Registers the app as a login item so it launches automatically on

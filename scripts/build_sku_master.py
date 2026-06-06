@@ -303,10 +303,12 @@ def main():
 
     # ── Step 8: regenerate sku-master.json ──
     os.makedirs(os.path.dirname(JSON_OUT), exist_ok=True)
+    # Exclude retired rows from JSON — they stay in the sheet for reference
+    # but Marin's lookup_sku should only see canonical, active SKUs.
     json_records = [
         {k: rec.get(k, "") for k in COL_ORDER}
         for rec in final_rows
-        if rec.get("sku")
+        if rec.get("sku") and not (rec.get("source","") or "").lower().startswith("retired")
     ]
     json.dump(json_records, open(JSON_OUT, "w"), indent=2)
     print(f"Wrote {len(json_records)} records → {JSON_OUT}")

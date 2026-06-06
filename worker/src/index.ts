@@ -3410,15 +3410,22 @@ async function handleVoiceCommandPolish(
  */
 async function handleRepunctuate(request: Request, env: Env): Promise<Response> {
   const rawBody = await request.text();
-  let payload: { text?: unknown; appName?: unknown };
+  let payload: { text?: unknown; appName?: unknown; promptOnly?: unknown };
   try {
-    payload = JSON.parse(rawBody) as { text?: unknown; appName?: unknown };
+    payload = JSON.parse(rawBody) as { text?: unknown; appName?: unknown; promptOnly?: unknown };
   } catch {
     return jsonError("Invalid JSON body", 400);
   }
 
+  // v16pv (2026-06-06): promptOnly=true returns the system prompt text
+  // instead of executing. The Swift app fetches this at launch so it can
+  // run repunctuate against a local Rapid-MLX server (on-device LLM)
+  // while the worker stays the single source of truth for the prompt
+  // and the fallback executor.
+  const promptOnlyRequested = payload.promptOnly === true;
+
   const inputTextRaw = typeof payload.text === "string" ? payload.text.trim() : "";
-  if (inputTextRaw.length === 0) {
+  if (inputTextRaw.length === 0 && !promptOnlyRequested) {
     return new Response(JSON.stringify({ output: "" }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -3628,6 +3635,16 @@ async function handleRepunctuate(request: Request, env: Env): Promise<Response> 
     "- For short fragments or single-word utterances (\"got it\", \"yes\", \"okay\"), preserve them as fragments — don't force them into full sentences. End with a period if it sounds complete.",
     "- Output ONLY the punctuated text. No commentary, no quotes around it, no explanation.",
   ].join("\n");
+
+  // v16pv (2026-06-06): see promptOnly note above — return the prompt
+  // for the requested context (appName decides casual vs professional)
+  // without calling Anthropic.
+  if (promptOnlyRequested) {
+    return new Response(
+      JSON.stringify({ prompt: repunctuateSystemPrompt, casual: isCasualContext }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
 
   const anthropicRequestBody = {
     model: "claude-haiku-4-5-20251001",

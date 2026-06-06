@@ -1245,8 +1245,15 @@ final class CompanionManager: ObservableObject {
         // VTT-SPEED v15o (2026-05-01): warm Haiku 4.5 itself by firing
         // a tiny /repunctuate call. Skips the model cold-start tax on
         // the first real VTT after launch (saves ~200-400ms). Fires on
-        // a background task so it doesn't block app boot.
+        // a background task so it doesn't block app boot. Still wanted
+        // with the local LLM (v16pv) — Haiku remains the fallback path.
         Self.warmUpHaikuModelIfNeeded()
+
+        // v16pv (2026-06-06): start the on-device repunctuate LLM
+        // (Rapid-MLX, qwen3.5-4b). Spawns the localhost server and
+        // fetches the prompt cache from the Worker. Async; silent on
+        // failure (Worker path keeps working as before).
+        LocalLLMManager.shared.startIfEnabled(workerBaseURL: Self.workerBaseURL)
 
         // v15p3bk (2026-05-12): pre-open an AssemblyAI streaming
         // session so the first VTT/polish-modifier engage after
@@ -5715,19 +5722,40 @@ final class CompanionManager: ObservableObject {
                 let wordCount = preSubstitutedText.split(whereSeparator: { $0.isWhitespace }).count
                 print("✏️ Repunctuate: skipped (short utterance: \(wordCount) word(s), \(preSubstitutedText.count) chars — AssemblyAI punctuation sufficient)")
             } else {
-                do {
-                    punctuatedText = try await Self.repunctuateTextViaWorker(
-                        workerBaseURL: workerBaseURL,
+                // v16pv (2026-06-06): local-first repunctuate. Try the
+                // on-device Rapid-MLX model (qwen3.5-4b); on ANY local
+                // failure fall through to the Worker/Haiku path, which
+                // keeps its own raw-text fallback. Benchmarked at parity
+                // on real dictations, ~0.4s faster, $0, private.
+                var localText: String? = nil
+                if LocalLLMManager.shared.isAvailable {
+                    localText = try? await LocalLLMManager.shared.repunctuate(
                         rawText: preSubstitutedText,
                         appName: focusedContext?.appName
                     )
+                    if localText == nil {
+                        print("⚠️ Repunctuate (local) failed — falling back to Worker")
+                    }
+                }
+                if let localText {
+                    punctuatedText = localText
                     repunctuateSkipped = false
-                    print("✏️ Repunctuate: \(preSubstitutedText.count) chars → \(punctuatedText.count) chars")
-                } catch {
-                    print("⚠️ Repunctuate failed (\(error)) — falling back to pre-substituted text")
-                    punctuatedText = preSubstitutedText
-                    repunctuateSkipped = false
-                    pipelineStatus = "failed:repunctuate:\((error as NSError).localizedDescription.prefix(80))"
+                    print("✏️ Repunctuate (local): \(preSubstitutedText.count) chars → \(punctuatedText.count) chars")
+                } else {
+                    do {
+                        punctuatedText = try await Self.repunctuateTextViaWorker(
+                            workerBaseURL: workerBaseURL,
+                            rawText: preSubstitutedText,
+                            appName: focusedContext?.appName
+                        )
+                        repunctuateSkipped = false
+                        print("✏️ Repunctuate: \(preSubstitutedText.count) chars → \(punctuatedText.count) chars")
+                    } catch {
+                        print("⚠️ Repunctuate failed (\(error)) — falling back to pre-substituted text")
+                        punctuatedText = preSubstitutedText
+                        repunctuateSkipped = false
+                        pipelineStatus = "failed:repunctuate:\((error as NSError).localizedDescription.prefix(80))"
+                    }
                 }
             }
             let phaseRepunctuateCompleteAt = Date()
