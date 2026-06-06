@@ -334,49 +334,6 @@ final class LocalLLMManager {
         return output
     }
 
-    // MARK: - Intent classification (v16qb, 2026-06-06)
-
-    enum PolishModifierIntent {
-        case toggle, full, formatResponse
-    }
-
-    /// Classify a spoken polish modifier into one of the known modes, or
-    /// nil for free-form instructions (which pass through verbatim) and
-    /// any failure (caller keeps pre-v16qb behavior).
-    ///
-    /// Prompt is deliberately TINY: small prompts don't evict the big
-    /// repunctuate prompt from the server's single-slot cache (measured
-    /// 2026-06-06); large ones do. Keep it under ~1K chars forever.
-    /// Bench 2026-06-06: 12/13 on paraphrase set, ~0.2s per call.
-    func classifyPolishModifier(_ spoken: String) async -> PolishModifierIntent? {
-        let trimmed = spoken.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, isAvailable else { return nil }
-        let lower = trimmed.lowercased()
-        // Exact/prefix phrases are already handled by the worker's
-        // string match (with Deepgram clip tolerance) — skip the model.
-        if lower.hasPrefix("toggle pol") || lower.hasPrefix("full pol")
-            || lower.hasPrefix("format response") {
-            return nil
-        }
-        let system = """
-        You classify a spoken instruction for a text-polishing tool. Reply with exactly one word:
-        TOGGLE — wants rambling dictation reorganized into coherent text ("smart polish", "organize this", "make it flow", "clean this up properly").
-        FULL — wants a deeper editorial rewrite, tighter and sharper ("deep polish", "editor pass", "tighten this", "make it read really polished").
-        FORMAT — wants the draft reformatted to match the structure of the message being replied to ("match the format", "format it like their message").
-        OTHER — anything else, especially specific edit instructions ("make it shorter", "remove the last sentence", "change X to Y", "make it friendlier").
-        When unsure, reply OTHER.
-        """
-        guard let reply = try? await runInference(
-            systemPrompt: system, userText: trimmed, maxTokens: 4, timeout: 2
-        ) else { return nil }
-        switch reply.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
-        case "TOGGLE": return .toggle
-        case "FULL": return .full
-        case "FORMAT": return .formatResponse
-        default: return nil
-        }
-    }
-
     /// Shared OpenAI-compatible chat call against the local server.
     /// Returns the raw assistant text (trimmed by callers as needed).
     private func runInference(
