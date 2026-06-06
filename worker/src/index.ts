@@ -3604,6 +3604,21 @@ async function handleRepunctuate(request: Request, env: Env): Promise<Response> 
     "    • Input: \"That's the plan. Let's ship it tomorrow.\" → Output: same (two complete sentences, capitalized second half, no continuation signal — keep).",
     "- **Em-dashes (—) and en-dashes (–)**: these are ALWAYS pause artifacts. REMOVE every one. Replace with whatever punctuation grammar requires — usually nothing (just a single space), occasionally a comma. Never preserve an em-dash, never produce one in your output.",
     "",
+    // v16px (2026-06-06): narrow currency rule. STT engines transcribe
+    // spoken prices inconsistently — sometimes \"$17.99\", sometimes bare
+    // \"17.99\". The DECIMAL case is safe to repair (a decimal number in
+    // price context is unambiguously currency); the collapsed case
+    // (\"1799\") is NOT recoverable and must be left alone — Haiku once
+    // turned spoken \"seventeen ninety-nine\" logged as \"1799\" into
+    // \"$1,799\", manufacturing a 100x error. This rule allows ONLY the
+    // safe repair and explicitly forbids the rest.
+    "- **CURRENCY SYMBOL — DECIMAL PRICES ONLY** (NARROW RULE): when a number containing a decimal point (e.g. 17.99, 2.44) appears in an obvious money context (near words like MSRP, COGS, price, cost, costs, paid, charged, fee, budget, revenue) and has no currency symbol, prepend \"$\". The DECIMAL POINT is the REQUIRED trigger — money context alone is NOT enough. A number with NO decimal point NEVER gets a \"$\", not even directly after MSRP/COGS/price (\"MSRP is 1,799\" stays \"MSRP is 1,799\"). Why this is absolute: speech-to-text sometimes collapses spoken prices (\"seventeen ninety-nine\" → \"1799\" or \"1,799\") — the true value is unrecoverable, and adding \"$\" manufactures a number the user never said. NEVER change digits. NEVER add, move, or remove a decimal point or comma. NEVER add \"$\" to decimal numbers outside money context (\"98.6 degrees\", \"version 2.5\").",
+    "CONCRETE FORBIDDEN-RESPONSE EXAMPLE 4 (this actually happened, do NOT repeat):",
+    "  Input: \"MSRP is 1,799. COGS is 244, up 19% over Q3 across four marketplaces.\"",
+    "  WRONG output: \"MSRP is $1,799. COGS is $244, up 19% over Q3 across four marketplaces.\" (added \"$\" to whole numbers — the user actually said \"seventeen ninety-nine\" and \"two forty-four\"; \"$1,799\" is a 100x error you just created.)",
+    "  CORRECT output: \"MSRP is 1,799. COGS is 244, up 19% over Q3 across four marketplaces.\" (no decimal point → no \"$\", period.)",
+    "  CORRECT example of the rule firing: \"MSRP is 17.99. COGS is 2.44\" → \"MSRP is $17.99. COGS is $2.44.\" (decimal point present + money context → safe.)",
+    "",
     // v15p3bl (2026-05-12): added explicit terminal-punctuation rule.
     // Symptom: Haiku occasionally ended whole outputs with a trailing
     // comma when the utterance was an interrogative with a clause-y
