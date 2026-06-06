@@ -71,7 +71,6 @@ final class LocalLLMManager {
     private var serverProcess: Process?
     private var serverReady = false
     private var professionalPrompt: String?
-    private var casualPrompt: String?
     /// v16pz: dedupe flag for background prompt-cache re-warming.
     private var isRewarmingPromptCache = false
 
@@ -80,7 +79,7 @@ final class LocalLLMManager {
     var isAvailable: Bool {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return serverReady && professionalPrompt != nil && casualPrompt != nil
+        return serverReady && professionalPrompt != nil
     }
 
     // MARK: - Lifecycle
@@ -186,17 +185,14 @@ final class LocalLLMManager {
 
     private func warmUpPromptCache() async {
         stateLock.lock()
-        let prompts = [professionalPrompt, casualPrompt].compactMap { $0 }
+        let prompt = professionalPrompt
         stateLock.unlock()
-        for prompt in prompts {
-            _ = try? await runInference(
-                systemPrompt: prompt, userText: "warm up.",
-                maxTokens: 8, timeout: 90
-            )
-        }
-        if !prompts.isEmpty {
-            print("🧠 LocalLLM: prompt cache warmed (\(prompts.count) variant(s))")
-        }
+        guard let prompt else { return }
+        _ = try? await runInference(
+            systemPrompt: prompt, userText: "warm up.",
+            maxTokens: 8, timeout: 90
+        )
+        print("🧠 LocalLLM: prompt cache warmed")
     }
 
     /// Fire-and-forget re-warm after a timeout. Deduped so a burst of
@@ -234,22 +230,26 @@ final class LocalLLMManager {
     /// Worker repunctuate path is down too; next launch refetches.
     private func fetchPromptsIfNeeded(workerBaseURL: String) async {
         stateLock.lock()
-        let alreadyCached = professionalPrompt != nil && casualPrompt != nil
+        let alreadyCached = professionalPrompt != nil
         stateLock.unlock()
         guard !alreadyCached else { return }
 
-        async let professional = fetchPrompt(workerBaseURL: workerBaseURL, appName: nil)
-        async let casual = fetchPrompt(workerBaseURL: workerBaseURL, appName: "Messages")
-        let (pro, cas) = await (professional, casual)
-        guard let pro, let cas else {
+        // v16qa (2026-06-06): professional variant ONLY. The Rapid-MLX
+        // prompt cache effectively holds one large prompt at a time —
+        // measured 2026-06-06: alternating professional/casual variants
+        // costs ~7s on EVERY switch (each evicts the other), which put
+        // real dictations into a permanent cold-start timeout loop while
+        // warmups (which ran casual last) kept "succeeding". One local
+        // prompt = cache permanently warm. Casual-app dictations
+        // (Messages/WhatsApp/etc — rare) take the Worker path instead.
+        guard let pro = await fetchPrompt(workerBaseURL: workerBaseURL, appName: nil) else {
             print("🧠 LocalLLM: prompt fetch failed — Worker path only")
             return
         }
         stateLock.lock()
         professionalPrompt = pro
-        casualPrompt = cas
         stateLock.unlock()
-        print("🧠 LocalLLM: prompt cache loaded (\(pro.count) / \(cas.count) chars)")
+        print("🧠 LocalLLM: prompt cache loaded (\(pro.count) chars, professional only)")
     }
 
     private func fetchPrompt(workerBaseURL: String, appName: String?) async -> String? {
@@ -279,13 +279,18 @@ final class LocalLLMManager {
         stateLock.lock()
         let ready = serverReady
         let isCasual = Self.casualMessagingApps.contains(appName ?? "")
-        let systemPrompt = isCasual ? casualPrompt : professionalPrompt
+        let systemPrompt = professionalPrompt
         stateLock.unlock()
 
-        guard ready, let systemPrompt else {
+        // v16qa: casual-messaging contexts take the Worker path — running
+        // a second prompt variant locally thrashes the single-slot prompt
+        // cache (see fetchPromptsIfNeeded comment).
+        guard ready, !isCasual, let systemPrompt else {
             throw NSError(
                 domain: "ClickyLocalLLMError", code: -1,
-                userInfo: [NSLocalizedDescriptionKey: "Local LLM not available"]
+                userInfo: [NSLocalizedDescriptionKey: isCasual
+                    ? "Casual context — Worker path by design"
+                    : "Local LLM not available"]
             )
         }
 
