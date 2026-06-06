@@ -124,6 +124,10 @@ export default {
         return await handleRepunctuate(request, env);
       }
 
+      if (url.pathname === "/memory-extract") {
+        return await handleMemoryExtract(request, env);
+      }
+
       if (url.pathname === "/realtime-session") {
         return await handleRealtimeSession(request, env);
       }
@@ -3917,6 +3921,121 @@ async function handleRepunctuate(request: Request, env: Env): Promise<Response> 
     status: 200,
     headers: { "content-type": "application/json" },
   });
+}
+
+/**
+ * /memory-extract — Marin Memory write-path distiller (v16qc, 2026-06-06).
+ *
+ * Turns a spoken "remember this for me…" utterance into one clean
+ * memory line + category for the Marin Memory repository. Same
+ * local-first architecture as /repunctuate: the Mac app fetches this
+ * prompt at launch (promptOnly:true) and runs it on the local
+ * Rapid-MLX server; this endpoint's Haiku execution is the fallback.
+ * The prompt is deliberately TINY (<1K chars) so the local run can
+ * never evict the big repunctuate prompt from the single-slot
+ * Rapid-MLX cache (v16qa rule). Keep it tiny.
+ *
+ * Request:  { utterance: string, promptOnly?: boolean }
+ * Response: { category: string, memory: string }
+ *        or { prompt: string, userText: string } when promptOnly
+ */
+function buildMemoryExtractPrompt(): string {
+  const today = new Date().toISOString().slice(0, 10);
+  return [
+    "You convert a spoken 'remember this' request into one stored memory line.",
+    'Output ONLY JSON: {"category":"files|todos|personal|references","memory":"<one line>"}',
+    "Rules:",
+    '- memory = one concise line, keep the speaker\'s perspective ("my"/"I" stay as-is).',
+    "- Keep every concrete identifier VERBATIM: names, file/doc names, numbers, dates, places.",
+    '- Strip only filler and meta-talk ("remember that", "for me", "can you", "uh").',
+    `- Today is ${today}. Resolve relative dates to absolute (YYYY-MM-DD).`,
+    "- category: files = file/doc/deck names + where they live; todos = things to do; personal = personal/life facts; references = everything else.",
+    "No prose, no markdown, JSON only.",
+  ].join("\n");
+}
+
+async function handleMemoryExtract(request: Request, env: Env): Promise<Response> {
+  let payload: { utterance?: unknown; promptOnly?: unknown };
+  try {
+    payload = (await request.json()) as { utterance?: unknown; promptOnly?: unknown };
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+
+  const systemPrompt = buildMemoryExtractPrompt();
+  const utterance = typeof payload.utterance === "string" ? payload.utterance.trim() : "";
+
+  if (payload.promptOnly === true) {
+    return new Response(
+      JSON.stringify({ prompt: systemPrompt, userText: utterance }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  if (utterance.length === 0) {
+    return jsonError("Missing utterance", 400);
+  }
+
+  const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": env.ANTHROPIC_API_KEY,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 300,
+      system: systemPrompt,
+      messages: [{ role: "user", content: utterance }],
+    }),
+  });
+
+  if (!anthropicResponse.ok) {
+    const errorBody = await anthropicResponse.text();
+    return sanitizedUpstreamError("/memory-extract", anthropicResponse.status, errorBody);
+  }
+
+  const responseJson = (await anthropicResponse.json()) as {
+    content?: Array<{ type: string; text?: string }>;
+  };
+  const rawText = (responseJson.content ?? [])
+    .filter((block) => block.type === "text" && typeof block.text === "string")
+    .map((block) => block.text as string)
+    .join("")
+    .trim();
+
+  const parsed = parseMemoryExtractJSON(rawText);
+  if (!parsed) {
+    // Model returned non-JSON — degrade gracefully: caller stores the
+    // raw utterance verbatim. Capture is never blocked.
+    return new Response(
+      JSON.stringify({ category: "references", memory: utterance, parseFallback: true }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+  return new Response(JSON.stringify(parsed), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function parseMemoryExtractJSON(rawText: string): { category: string; memory: string } | null {
+  // Tolerate code fences or stray prose around the JSON object.
+  const match = rawText.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    const obj = JSON.parse(match[0]) as { category?: unknown; memory?: unknown };
+    const validCategories = new Set(["files", "todos", "personal", "references"]);
+    const category = typeof obj.category === "string" && validCategories.has(obj.category)
+      ? obj.category
+      : "references";
+    const memory = typeof obj.memory === "string" ? obj.memory.trim() : "";
+    if (memory.length === 0) return null;
+    return { category, memory };
+  } catch {
+    return null;
+  }
 }
 
 function jsonError(errorMessage: string, statusCode: number): Response {

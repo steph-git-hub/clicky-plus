@@ -7,6 +7,8 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		9BAECA042FCB4D0400D9DDA4 /* VecturaKit in Frameworks */ = {isa = PBXBuildFile; productRef = 9BAECA022FCB4D0200D9DDA2 /* VecturaKit */; };
+		9BAECA052FCB4D0500D9DDA5 /* VecturaNLKit in Frameworks */ = {isa = PBXBuildFile; productRef = 9BAECA032FCB4D0300D9DDA3 /* VecturaNLKit */; };
 		9BBEA0A82FCA4E91008D9DDA /* FluidAudio in Frameworks */ = {isa = PBXBuildFile; productRef = 9BBEA0A72FCA4E91008D9DDA /* FluidAudio */; };
 		AA00BB032F6500030039DA55 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = AA00BB022F6500020039DA55 /* Sparkle */; };
 		AA00BB062F6500060039DA55 /* PostHog in Frameworks */ = {isa = PBXBuildFile; productRef = AA00BB052F6500050039DA55 /* PostHog */; };
@@ -61,6 +63,8 @@
 				AA00BB032F6500030039DA55 /* Sparkle in Frameworks */,
 				9BBEA0A82FCA4E91008D9DDA /* FluidAudio in Frameworks */,
 				AA00BB062F6500060039DA55 /* PostHog in Frameworks */,
+				9BAECA042FCB4D0400D9DDA4 /* VecturaKit in Frameworks */,
+				9BAECA052FCB4D0500D9DDA5 /* VecturaNLKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -132,6 +136,8 @@
 				AA00BB022F6500020039DA55 /* Sparkle */,
 				AA00BB052F6500050039DA55 /* PostHog */,
 				9BBEA0A72FCA4E91008D9DDA /* FluidAudio */,
+				9BAECA022FCB4D0200D9DDA2 /* VecturaKit */,
+				9BAECA032FCB4D0300D9DDA3 /* VecturaNLKit */,
 			);
 			productName = "leanring-buddy";
 			productReference = 28F22CBF2F56440300A0FC59 /* Clicky.app */;
@@ -219,6 +225,7 @@
 				AA00BB012F6500010039DA55 /* XCRemoteSwiftPackageReference "Sparkle" */,
 				AA00BB042F6500040039DA55 /* XCRemoteSwiftPackageReference "posthog-ios" */,
 				9BBEA0A32FCA4CAD008D9DDA /* XCRemoteSwiftPackageReference "FluidAudio" */,
+				9BAECA012FCB4D0100D9DDA1 /* XCRemoteSwiftPackageReference "VecturaKit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 28F22CC02F56440300A0FC59 /* Products */;
@@ -348,7 +355,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.2;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -406,7 +413,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.2;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = macosx;
@@ -498,7 +505,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.2;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.stephenpierson.clickyplusTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -519,7 +526,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.2;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.stephenpierson.clickyplusTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -612,6 +619,14 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
+		9BAECA012FCB4D0100D9DDA1 /* XCRemoteSwiftPackageReference "VecturaKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/rryam/VecturaKit.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 6.0.0;
+			};
+		};
 		9BBEA0A32FCA4CAD008D9DDA /* XCRemoteSwiftPackageReference "FluidAudio" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/FluidInference/FluidAudio.git";
@@ -639,6 +654,16 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		9BAECA022FCB4D0200D9DDA2 /* VecturaKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 9BAECA012FCB4D0100D9DDA1 /* XCRemoteSwiftPackageReference "VecturaKit" */;
+			productName = VecturaKit;
+		};
+		9BAECA032FCB4D0300D9DDA3 /* VecturaNLKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 9BAECA012FCB4D0100D9DDA1 /* XCRemoteSwiftPackageReference "VecturaKit" */;
+			productName = VecturaNLKit;
+		};
 		9BBEA0A72FCA4E91008D9DDA /* FluidAudio */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 9BBEA0A32FCA4CAD008D9DDA /* XCRemoteSwiftPackageReference "FluidAudio" */;

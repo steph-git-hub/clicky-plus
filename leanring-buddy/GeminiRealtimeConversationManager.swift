@@ -532,6 +532,29 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "required": ["name"],
             ],
         ],
+        // ── Marin memory repository (v16qc, 2026-06-06) ────────
+        [
+            "name": "memory",
+            "description": "Steph's voice memory repository — one gateway tool, four operations. USE operation='remember' whenever he says 'remember this/that…', 'remember for me…', 'don't let me forget…', 'make a note that…' — pass his words as `content`; the app distills and files them. USE operation='recall' BEFORE ever saying you don't know/don't remember, whenever he asks 'what did I call X', 'where did I save Y', 'what did I say about Z', 'do you remember…' — pass the question as `content`; it searches his stored memories AND his Claude Memory notes by meaning. USE operation='forget' when he says to forget/delete a memory. USE operation='list' to read back stored memories (optional `category` filter: files, todos, personal, references). CONFIRMATION RULE for remember/forget: a '✓ Saved' indicator appears on screen automatically — you MUST stay completely SILENT. No 'saved', no 'got it', no 'on it', not one word; just wait for his next words. For recall: answer in ONE short sentence from the best match; mention the source only if he asks. If matches are weak/irrelevant, say you don't have it — never invent a memory.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "operation": [
+                        "type": "STRING",
+                        "description": "One of: remember, recall, forget, list.",
+                    ],
+                    "content": [
+                        "type": "STRING",
+                        "description": "For remember: what to store (his words, lightly trimmed). For recall/forget: the search query. Unused for list.",
+                    ],
+                    "category": [
+                        "type": "STRING",
+                        "description": "Optional. One of: files, todos, personal, references. For remember: override the auto-picked category. For list: filter.",
+                    ],
+                ],
+                "required": ["operation"],
+            ],
+        ],
         // ── SKU lookup (v16, 2026-06-04) ───────────────────────
         [
             "name": "lookup_sku",
@@ -1185,6 +1208,25 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         case "read_memory_file":
             let nm = (args["name"] as? String) ?? ""
             return await MainActor.run { MarinResearchTools.readMemoryFile(name: nm) }
+        case "memory":
+            // v16qc (2026-06-06): Marin memory repository gateway.
+            // Actor-isolated store — no MainActor hop needed; file IO
+            // and vector search run off the main thread by design.
+            let op = (args["operation"] as? String) ?? ""
+            let content = (args["content"] as? String) ?? ""
+            let category = args["category"] as? String
+            switch op {
+            case "remember":
+                return await MarinMemoryStore.shared.remember(utterance: content, categoryOverride: category)
+            case "recall":
+                return await MarinMemoryStore.shared.recall(query: content)
+            case "forget":
+                return await MarinMemoryStore.shared.forget(query: content)
+            case "list":
+                return await MarinMemoryStore.shared.list(categoryKey: category)
+            default:
+                return ["status": "error", "reason": "Unknown memory operation '\(op)'. Valid: remember, recall, forget, list."]
+            }
         case "lookup_sku":
             let q = (args["query"] as? String) ?? ""
             return await MainActor.run { MarinResearchTools.lookupSku(query: q) }

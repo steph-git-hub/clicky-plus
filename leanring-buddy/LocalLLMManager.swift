@@ -334,6 +334,34 @@ final class LocalLLMManager {
         return output
     }
 
+    // MARK: - Small auxiliary tasks (v16qc, 2026-06-06)
+
+    /// Run a TINY auxiliary prompt on the local model. Tiny prompts
+    /// (<~1K chars) do NOT evict the big repunctuate prompt from the
+    /// single-slot Rapid-MLX cache (measured, v16qa) — so this is safe
+    /// for ride-along features like Marin memory extraction. NEVER pass
+    /// a large prompt here; large prompts need a separate server/port.
+    func runSmallTask(
+        systemPrompt: String, userText: String,
+        maxTokens: Int = 300, timeout: TimeInterval = 6
+    ) async throws -> String {
+        stateLock.lock()
+        let ready = serverReady
+        stateLock.unlock()
+        guard ready, systemPrompt.count < 2_000 else {
+            throw NSError(
+                domain: "ClickyLocalLLMError", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: ready
+                    ? "Prompt too large for runSmallTask — use a separate server (v16qa cache rule)"
+                    : "Local LLM not available"]
+            )
+        }
+        return try await runInference(
+            systemPrompt: systemPrompt, userText: userText,
+            maxTokens: maxTokens, timeout: timeout
+        )
+    }
+
     /// Shared OpenAI-compatible chat call against the local server.
     /// Returns the raw assistant text (trimmed by callers as needed).
     private func runInference(

@@ -694,6 +694,21 @@ private struct NotchPillView: View {
         // optional transcript. transcript drops the pill down; status
         // alone keeps it flush.
 
+        // 0. Memory-save badge (v16qc, 2026-06-06): transient "✓ Saved"
+        // after a Marin memory write. Highest priority — it lives ~2.5s
+        // and is the ONLY confirmation (silent + visual by design:
+        // chime banned v15p4dk, spoken ack vetoed by Steph 2026-06-06).
+        if let badge = companionManager.memorySaveBadge {
+            return PillStateView(
+                id: "memory.saved",
+                tint: .green,
+                kind: .live,
+                statusLabel: badge,
+                transcript: nil,
+                showsWaveform: false
+            )
+        }
+
         // 1. Watch mode (highest — single hotkey, dominates screen).
         if companionManager.isVideoWatchModeActive {
             return PillStateView(

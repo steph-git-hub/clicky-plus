@@ -407,6 +407,15 @@ final class CompanionManager: ObservableObject {
     /// BlueCursorView uses this instead of a random pointer phrase.
     @Published var detectedElementBubbleText: String?
 
+    /// v16qc (2026-06-06): transient "✓ Saved" badge shown in the notch
+    /// pill after a Marin memory write. Confirmation is SILENT + VISUAL:
+    /// code-played chimes are banned during realtime sessions (v15p4dk —
+    /// audio collides with Gemini Live and hangs the notch voiceState)
+    /// and Steph vetoed spoken acks 2026-06-06 (tone comes out wrong).
+    @Published var memorySaveBadge: String?
+    private var memorySaveBadgeClearTask: Task<Void, Never>?
+    private var memorySavedObserver: NSObjectProtocol?
+
     // MARK: - Onboarding Video State (shared across all screen overlays)
 
     @Published var onboardingVideoPlayer: AVPlayer?
@@ -1254,6 +1263,27 @@ final class CompanionManager: ObservableObject {
         // fetches the prompt cache from the Worker. Async; silent on
         // failure (Worker path keeps working as before).
         LocalLLMManager.shared.startIfEnabled(workerBaseURL: Self.workerBaseURL)
+
+        // v16qc (2026-06-06): Marin memory repository — build/sync the
+        // on-device vector index (VecturaKit + Apple NL embeddings) in
+        // the background, and flash a silent "✓ Saved" notch badge when
+        // Marin stores a memory (no chime — v15p4dk; no spoken ack —
+        // Steph's call 2026-06-06).
+        MarinMemoryStore.shared.launchSync(workerBaseURL: Self.workerBaseURL)
+        memorySavedObserver = NotificationCenter.default.addObserver(
+            forName: MarinMemoryStore.memorySavedNotification,
+            object: nil, queue: .main
+        ) { [weak self] note in
+            guard let self else { return }
+            let updated = (note.userInfo?["updated"] as? Bool) ?? false
+            self.memorySaveBadge = updated ? "✓ Updated" : "✓ Saved"
+            self.memorySaveBadgeClearTask?.cancel()
+            self.memorySaveBadgeClearTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                guard !Task.isCancelled else { return }
+                self?.memorySaveBadge = nil
+            }
+        }
 
         // v15p3bk (2026-05-12): pre-open an AssemblyAI streaming
         // session so the first VTT/polish-modifier engage after

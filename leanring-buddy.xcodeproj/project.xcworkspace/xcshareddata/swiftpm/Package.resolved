@@ -1,5 +1,5 @@
 {
-  "originHash" : "2590a4516bbc3dad082de706f79d45dfbe48beed3980515d23c5ccfe3f4c7dbe",
+  "originHash" : "035c43384f683eee530f581420d3efe99006c57eeaf50fb0162e2323504be3dd",
   "pins" : [
     {
       "identity" : "fluidaudio",
@@ -35,6 +35,24 @@
       "state" : {
         "revision" : "21d8df80440b1ca3b65fa82e40782f1e5a9e6ba2",
         "version" : "2.9.0"
+      }
+    },
+    {
+      "identity" : "swift-argument-parser",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-argument-parser.git",
+      "state" : {
+        "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
+        "version" : "1.8.2"
+      }
+    },
+    {
+      "identity" : "vecturakit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/rryam/VecturaKit.git",
+      "state" : {
+        "revision" : "0259266d6975b551b9bb2b1a6202500129aa4a01",
+        "version" : "6.1.0"
       }
     }
   ],
