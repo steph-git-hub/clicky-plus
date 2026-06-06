@@ -2760,6 +2760,12 @@ interface VoiceCommandRequestPayload {
   /// (using the screenshot). Default polish (no intent) keeps the
   /// behavior described in styleGuidance above.
   intent?: "format-response";
+
+  /// v16py (2026-06-06): when true, return the assembled system prompt +
+  /// user message instead of calling Anthropic — lets the Mac app run
+  /// text-only polish on the local LLM while the worker stays the single
+  /// source of truth for the prompt. Same pattern as /repunctuate.
+  promptOnly?: boolean;
 }
 
 async function handleVoiceCommandPolish(
@@ -3326,6 +3332,24 @@ async function handleVoiceCommandPolish(
       type: "text",
       text: userMessageLines.join("\n"),
     });
+  }
+
+  // v16py (2026-06-06): promptOnly — return the assembled prompts for
+  // local-LLM execution instead of calling Anthropic. Screenshot input
+  // is intentionally ignored here: local polish is text-only by design
+  // (vision stays on the Haiku/Sonnet path).
+  if (payload.promptOnly === true) {
+    const systemText = polishSystemBlocks
+      .map((block) => (typeof block.text === "string" ? block.text : ""))
+      .join("\n\n---\n\n");
+    return new Response(
+      JSON.stringify({
+        prompt: systemText,
+        userText: userMessageLines.join("\n"),
+        styleMode: polishStyleMode,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
   }
 
   const anthropicRequestBody = {
