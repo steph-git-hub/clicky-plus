@@ -196,7 +196,6 @@ def main():
 
     # ── Step 5: merge DTC + Amazon into curated rows ──
     final_rows   = [row_to_rec(row) for row in sheet_rows]
-    row_changed  = [False] * len(final_rows)
     matched_upcs = set()
 
     for r in dtc_rows:
@@ -229,27 +228,9 @@ def main():
             source     = "dtc+amazon"   if a else "dtc-only",
         )
 
-        if sku in by_sku:
-            idx, existing = by_sku[sku]
-            changed = False
-            for field, master_val in master_rec.items():
-                if field == "name":
-                    continue  # NEVER overwrite the clean name
-                if field in MASTER_AUTH:
-                    if master_val and existing[field] != master_val:
-                        final_rows[idx][field] = master_val
-                        changed = True
-                else:
-                    # Gap-fill: only write when sheet cell is empty
-                    if master_val and not existing[field]:
-                        final_rows[idx][field] = master_val
-                        changed = True
-            if changed:
-                row_changed[idx] = True
-        else:
-            # New SKU — append
+        if sku not in by_sku:
+            # New SKU — append only; existing rows are never modified
             final_rows.append(master_rec)
-            row_changed.append(True)
             by_sku[sku] = (len(final_rows) - 1, master_rec)
 
     # ── Step 6: handle Amazon-only rows ──
@@ -271,26 +252,9 @@ def main():
             parent=rec["parent"], length="", shape="", msrp="", unit_cost="",
             upc=rec["gs1_upc"], variation=rec["variation"], source="amazon-only",
         ))
-        row_changed.append(True)
 
-    # ── Step 7: write changed rows back to sheet ──
-    n_changed = sum(row_changed[:len(sheet_rows)])
-    n_added   = len(final_rows) - len(sheet_rows)
-
-    update_data = []
-    for i, (rec, changed) in enumerate(
-            zip(final_rows[:len(sheet_rows)], row_changed[:len(sheet_rows)])):
-        if changed:
-            update_data.append({
-                "range" : f"'SKU Master'!A{i + 2}",
-                "values": [rec_to_row(rec)],
-            })
-
-    if update_data:
-        api.values().batchUpdate(
-            spreadsheetId=CURATED_ID,
-            body={"valueInputOption": "RAW", "data": update_data},
-        ).execute()
+    # ── Step 7: append new rows only (existing rows never modified) ──
+    n_added = len(final_rows) - len(sheet_rows)
 
     if n_added > 0:
         api.values().append(
@@ -312,7 +276,7 @@ def main():
     ]
     json.dump(json_records, open(JSON_OUT, "w"), indent=2)
     print(f"Wrote {len(json_records)} records → {JSON_OUT}")
-    print(f"Sheet updates: {n_changed} rows changed, {n_added} rows added")
+    print(f"Sheet updates: {n_added} rows appended (existing rows untouched)")
 
 
 if __name__ == "__main__":
