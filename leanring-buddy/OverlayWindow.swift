@@ -704,6 +704,33 @@ struct BlueCursorView: View {
                 .animation(.easeOut(duration: 0.12), value: companionManager.isBurstModeActive)
                 .animation(.easeOut(duration: 0.12), value: companionManager.isCaptureToInboxModeActive)
 
+            // v16qd (2026-06-07): action-confirmation capsule AT THE
+            // CURSOR. Steph misses the notch badge ("I need the visual
+            // indicator to be where my mouse goes") and spoken acks are
+            // out (tone) — so memory saves / ClickUp creates flash a
+            // small green labeled capsule beside the pointer for ~2.5s.
+            // Label says WHAT happened ("✓ Saved" / "✓ ClickUp task")
+            // so the confirmation is never ambiguous. Rendered for every
+            // indicator style; rides memorySaveBadge (auto-clears).
+            Text(companionManager.memorySaveBadge ?? " ")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundColor(.white)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(Capsule().fill(Color.green.opacity(0.92)))
+                .shadow(color: .black.opacity(0.25), radius: 4, y: 1)
+                .opacity(
+                    companionManager.memorySaveBadge != nil && isCursorOnThisScreen
+                        ? 1 : 0
+                )
+                .scaleEffect(companionManager.memorySaveBadge != nil ? 1.0 : 0.6)
+                .position(
+                    x: cursorPosition.x + 12,
+                    y: cursorPosition.y - 32
+                )
+                .animation(.spring(response: 0.25, dampingFraction: 0.8), value: companionManager.memorySaveBadge != nil)
+                .animation(.linear(duration: 0.04), value: cursorPosition)
+
             // v15p3z (2026-05-10): cursor dot + sonar ring variant.
             // Same dot as `cursorDot` but the dot itself stays a fixed
             // small size; an expanding faint ring around it (sonar-style)

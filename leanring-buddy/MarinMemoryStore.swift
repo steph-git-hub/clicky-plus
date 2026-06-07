@@ -25,12 +25,13 @@
 //  just voice-captured lines — capability-gap #3.
 //
 //  WRITE PATH — the spoken ramble is distilled to one fact line +
-//  category by the LOCAL qwen3.5-4b server (tiny prompt <1K chars —
-//  cache-safe per the v16qa single-slot rule; tiny prompts do NOT
-//  evict the big repunctuate prompt). Prompt source of truth is the
-//  Worker (`/memory-extract` with promptOnly:true, same pattern as
-//  /repunctuate); Worker/Haiku executes as fallback; if both fail the
-//  raw utterance is stored verbatim — capture is never blocked.
+//  category by the Worker (`/memory-extract`, Haiku); raw utterance
+//  stored verbatim if the Worker is unreachable — capture is never
+//  blocked. v16qd (2026-06-07): the v16qc local-qwen extract path was
+//  REMOVED after live measurement showed even the ~0.8K-char extract
+//  prompt evicted the repunctuate prompt from Rapid-MLX's single-slot
+//  cache (next paste: 5.5s). The production server serves repunctuate
+//  ONLY — no exceptions, regardless of prompt size.
 //
 //  CONFIRMATION — SILENT + VISUAL ("✓ Saved" notch badge via
 //  NotificationCenter → CompanionManager). Code-played chimes are
@@ -63,9 +64,11 @@ actor MarinMemoryStore {
 
     // MARK: - Categories
 
+    // v16qd (2026-06-07): To-Dos first — Steph uses the note as his
+    // personal list, so open items belong at the top.
     static let categories: [(key: String, heading: String)] = [
-        ("files", "Files & Locations"),
         ("todos", "To-Dos"),
+        ("files", "Files & Locations"),
         ("personal", "Personal"),
         ("references", "References"),
     ]
@@ -77,7 +80,6 @@ actor MarinMemoryStore {
     /// can hash-diff against the note + vault files on every sync. Saved
     /// as JSON next to the DB; both are disposable together.
     private var sidecar: [String: ChunkMeta] = [:]
-    private var extractPrompt: String?
     private var workerBaseURL = "https://clicky-proxy.sapierso.workers.dev"
     private var syncedOnce = false
 
@@ -101,7 +103,6 @@ actor MarinMemoryStore {
 
     private func performLaunchSync(workerBaseURL: String) async {
         self.workerBaseURL = workerBaseURL
-        await fetchExtractPromptIfNeeded()
         do {
             try await syncIndex()
         } catch {
@@ -309,42 +310,20 @@ actor MarinMemoryStore {
     // MARK: - Extraction (local-first, worker fallback)
 
     private func extractMemory(utterance: String) async -> (memory: String, category: String, engine: String)? {
-        await fetchExtractPromptIfNeeded()
-        // Local path — TINY prompt, cache-safe (v16qa single-slot rule:
-        // tiny prompts don't evict the big repunctuate prompt).
-        if let prompt = extractPrompt, LocalLLMManager.shared.isAvailable {
-            if let raw = try? await LocalLLMManager.shared.runSmallTask(
-                systemPrompt: prompt, userText: utterance, maxTokens: 200, timeout: 6
-            ), let parsed = Self.parseExtractJSON(raw) {
-                return (parsed.memory, parsed.category, "local")
-            }
-        }
-        // Worker/Haiku fallback.
+        // v16qd (2026-06-07): LOCAL PATH REMOVED. v16qc ran extraction on
+        // the local qwen server assuming the ~0.8K-char prompt fell under
+        // the v16qa "tiny prompts don't evict" margin. MEASURED OTHERWISE
+        // during Steph's first live test: each memory save evicted the
+        // repunctuate prompt → his next dictation paste went 5.5s (4s
+        // local timeout + worker fallback; 01:08:15Z in the timing log).
+        // The single-slot cache rule wins: the production server serves
+        // repunctuate ONLY. Extraction is not latency-critical (the save
+        // is async; nobody is waiting on a paste), so it runs on the
+        // Worker/Haiku, with verbatim storage as the only fallback.
         if let result = await workerExtract(utterance: utterance) {
             return (result.memory, result.category, "worker")
         }
         return nil
-    }
-
-    /// Fetch the extract prompt from the Worker (single source of
-    /// truth, promptOnly pattern — same as repunctuate/polish).
-    private func fetchExtractPromptIfNeeded() async {
-        guard extractPrompt == nil else { return }
-        guard let url = URL(string: "\(workerBaseURL)/memory-extract") else { return }
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "content-type")
-        request.timeoutInterval = 10
-        request.httpBody = try? JSONSerialization.data(withJSONObject: ["promptOnly": true])
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let prompt = parsed["prompt"] as? String, !prompt.isEmpty else {
-            print("🧠 MarinMemory: extract-prompt fetch failed — worker fallback only")
-            return
-        }
-        extractPrompt = prompt
-        print("🧠 MarinMemory: extract prompt loaded (\(prompt.count) chars)")
     }
 
     private func workerExtract(utterance: String) async -> (memory: String, category: String)? {
@@ -419,7 +398,15 @@ actor MarinMemoryStore {
             }
             let trimmed = rawLine.trimmingCharacters(in: .whitespaces)
             guard trimmed.hasPrefix("- "), !currentHeading.isEmpty else { continue }
-            let line = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+            var line = String(trimmed.dropFirst(2)).trimmingCharacters(in: .whitespaces)
+            // v16qd (2026-06-07): to-dos are Obsidian checkboxes so Steph
+            // can use the note as his personal list. `- [ ]` = open (strip
+            // the box, keep the item); `- [x]` = done (skip entirely — it
+            // drops out of the index and out of "what do I have to do").
+            if line.hasPrefix("[x]") || line.hasPrefix("[X]") { continue }
+            if line.hasPrefix("[ ]") {
+                line = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+            }
             guard line.count >= 3 else { continue }
             results.append(NoteLine(line: line, heading: currentHeading, categoryKey: currentKey))
         }
@@ -449,7 +436,9 @@ actor MarinMemoryStore {
         while insertIdx > headingIdx + 1, lines[insertIdx - 1].trimmingCharacters(in: .whitespaces).isEmpty {
             insertIdx -= 1
         }
-        lines.insert("- \(line)", at: insertIdx)
+        // To-dos get a checkbox so the section works as a personal list.
+        let bullet = categoryKey == "todos" ? "- [ ] \(line)" : "- \(line)"
+        lines.insert(bullet, at: insertIdx)
         try lines.joined(separator: "\n").write(toFile: notePath, atomically: true, encoding: .utf8)
     }
 
@@ -457,7 +446,8 @@ actor MarinMemoryStore {
         let content = try String(contentsOfFile: notePath, encoding: .utf8)
         var lines = content.components(separatedBy: "\n")
         guard let idx = lines.firstIndex(where: {
-            $0.trimmingCharacters(in: .whitespaces) == "- \(line)"
+            let t = $0.trimmingCharacters(in: .whitespaces)
+            return t == "- \(line)" || t == "- [ ] \(line)"
         }) else { return }
         lines.remove(at: idx)
         try lines.joined(separator: "\n").write(toFile: notePath, atomically: true, encoding: .utf8)

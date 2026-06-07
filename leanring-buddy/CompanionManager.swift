@@ -1275,8 +1275,11 @@ final class CompanionManager: ObservableObject {
             object: nil, queue: .main
         ) { [weak self] note in
             guard let self else { return }
+            // v16qd (2026-06-07): explicit label wins (e.g. "✓ ClickUp
+            // task" from the clickup create path); else Saved/Updated.
             let updated = (note.userInfo?["updated"] as? Bool) ?? false
-            self.memorySaveBadge = updated ? "✓ Updated" : "✓ Saved"
+            self.memorySaveBadge = (note.userInfo?["label"] as? String)
+                ?? (updated ? "✓ Updated" : "✓ Saved")
             self.memorySaveBadgeClearTask?.cancel()
             self.memorySaveBadgeClearTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 2_500_000_000)

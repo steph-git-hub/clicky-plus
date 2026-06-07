@@ -535,7 +535,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // ── Marin memory repository (v16qc, 2026-06-06) ────────
         [
             "name": "memory",
-            "description": "Steph's voice memory repository — one gateway tool, four operations. USE operation='remember' whenever he says 'remember this/that…', 'remember for me…', 'don't let me forget…', 'make a note that…' — pass his words as `content`; the app distills and files them. USE operation='recall' BEFORE ever saying you don't know/don't remember, whenever he asks 'what did I call X', 'where did I save Y', 'what did I say about Z', 'do you remember…' — pass the question as `content`; it searches his stored memories AND his Claude Memory notes by meaning. USE operation='forget' when he says to forget/delete a memory. USE operation='list' to read back stored memories (optional `category` filter: files, todos, personal, references). CONFIRMATION RULE for remember/forget: a '✓ Saved' indicator appears on screen automatically — you MUST stay completely SILENT. No 'saved', no 'got it', no 'on it', not one word; just wait for his next words. For recall: answer in ONE short sentence from the best match; mention the source only if he asks. If matches are weak/irrelevant, say you don't have it — never invent a memory.",
+            "description": "Steph's voice memory repository — one gateway tool, four operations. USE operation='remember' whenever he says 'remember this/that…', 'remember for me…', 'don't let me forget…', 'make a note that…', 'add X to my to-dos', 'put X on my to-do list', 'add that to my memory/memory file' — pass his words as `content`; the app distills and files them (to-do phrasing → category='todos'). HIS TO-DOS LIVE HERE, NOT IN CLICKUP: never create a ClickUp task for 'to-dos'/'to-do list'/'remember to' phrasing — only use the clickup tool when he explicitly says 'ClickUp' or 'task'. USE operation='recall' BEFORE ever saying you don't know/don't remember, whenever he asks 'what did I call X', 'where did I save Y', 'what did I say about Z', 'do you remember…' — pass the question as `content`; it searches his stored memories AND his Claude Memory notes by meaning. USE operation='forget' when he says to forget/delete a memory. USE operation='list' to read back stored memories (optional `category` filter: files, todos, personal, references). CONFIRMATION RULE for remember/forget: a '✓ Saved' indicator appears on screen automatically — you MUST stay completely SILENT. No 'saved', no 'got it', no 'on it', not one word; just wait for his next words. For recall: answer in ONE short sentence from the best match; mention the source only if he asks. If matches are weak/irrelevant, say you don't have it — never invent a memory.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
@@ -938,7 +938,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // worker. Keeps the realtime tool surface small.
         [
             "name": "clickup",
-            "description": "Create, find, or update ClickUp tasks by voice. operation=\"create\" makes a new task (in Steph's default list unless list_id is given). operation=\"find\" lists tasks (optionally filtered by `query`) and returns each task's task_id + current status, plus the list's valid status names. operation=\"update\" changes an existing task by task_id — including its status (e.g. 'in progress', or the list's done status to mark complete), name, priority, or due date. TO MARK SOMETHING DONE OR CHANGE A STATUS: first call find to get the task_id and the exact status names, then call update with that task_id and status. Never guess a task_id.",
+            "description": "Create, find, or update ClickUp tasks by voice. ROUTING: only use this when Steph explicitly says 'ClickUp' or 'task' ('make a task', 'ClickUp it'). If he says 'to-dos', 'to-do list', 'remember to', 'don't let me forget' — that is the `memory` tool (operation='remember'), NOT ClickUp. CONFIRMATION RULE for create: a '✓ ClickUp task' indicator appears on his screen automatically — stay completely SILENT after a successful create; no 'Created', no 'Done', not one word. operation=\"create\" makes a new task (in Steph's default list unless list_id is given). operation=\"find\" lists tasks (optionally filtered by `query`) and returns each task's task_id + current status, plus the list's valid status names. operation=\"update\" changes an existing task by task_id — including its status (e.g. 'in progress', or the list's done status to mark complete), name, priority, or due date. TO MARK SOMETHING DONE OR CHANGE A STATUS: first call find to get the task_id and the exact status names, then call update with that task_id and status. Never guess a task_id.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
@@ -1408,7 +1408,19 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // Pass args straight through; the worker validates `operation`
         // and the per-op required fields.
         case "clickup":
-            return await safeWorkerCall(path: "/clickup", body: args)
+            let clickupResult = await safeWorkerCall(path: "/clickup", body: args)
+            // v16qd (2026-06-07): silent + visual confirmation for creates —
+            // same rule as memory saves. Spoken "Created." was ambiguous
+            // (Steph couldn't tell WHAT she did); the labeled cursor badge
+            // carries the what.
+            if (args["operation"] as? String) == "create",
+               (clickupResult["status"] as? String) != "error" {
+                NotificationCenter.default.post(
+                    name: MarinMemoryStore.memorySavedNotification, object: nil,
+                    userInfo: ["label": "✓ ClickUp task"]
+                )
+            }
+            return clickupResult
         case "sheets":
             return await safeWorkerCall(path: "/sheets", body: args)
         // ── fill_cells: paste into the focused cell on screen (v16po)
