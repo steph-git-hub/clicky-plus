@@ -195,8 +195,10 @@ def main():
             amz_by_upc.setdefault(k, []).append(rec)
 
     # ── Step 5: merge DTC + Amazon into curated rows ──
-    final_rows   = [row_to_rec(row) for row in sheet_rows]
-    matched_upcs = set()
+    final_rows        = [row_to_rec(row) for row in sheet_rows]
+    matched_upcs      = set()
+    variations_updated = 0
+    variation_updates  = []  # (sheet_row_index, new_variation) for batchUpdate
 
     for r in dtc_rows:
         if g(r, 0).upper() != "YES":
@@ -229,9 +231,17 @@ def main():
         )
 
         if sku not in by_sku:
-            # New SKU — append only; existing rows are never modified
+            # New SKU — append only
             final_rows.append(master_rec)
             by_sku[sku] = (len(final_rows) - 1, master_rec)
+        else:
+            # Existing SKU — only update variation, since Amazon changes these
+            idx, existing = by_sku[sku]
+            new_variation = master_rec["variation"]
+            if new_variation and existing["variation"] != new_variation:
+                final_rows[idx]["variation"] = new_variation
+                variation_updates.append((idx, new_variation))
+                variations_updated += 1
 
     # ── Step 6: handle Amazon-only rows ──
     seen_amz = set()
@@ -253,8 +263,25 @@ def main():
             upc=rec["gs1_upc"], variation=rec["variation"], source="amazon-only",
         ))
 
-    # ── Step 7: append new rows only (existing rows never modified) ──
+    # ── Step 7: write variation updates + append new rows ──
     n_added = len(final_rows) - len(sheet_rows)
+    variation_col = COL["variation"]  # column index for the variation field
+
+    if variation_updates:
+        var_col_letter = chr(ord("A") + variation_col)
+        api.values().batchUpdate(
+            spreadsheetId=CURATED_ID,
+            body={
+                "valueInputOption": "RAW",
+                "data": [
+                    {
+                        "range": f"'SKU Master'!{var_col_letter}{idx + 2}",
+                        "values": [[new_var]],
+                    }
+                    for idx, new_var in variation_updates
+                ],
+            },
+        ).execute()
 
     if n_added > 0:
         api.values().append(
@@ -276,7 +303,7 @@ def main():
     ]
     json.dump(json_records, open(JSON_OUT, "w"), indent=2)
     print(f"Wrote {len(json_records)} records → {JSON_OUT}")
-    print(f"Sheet updates: {n_added} rows appended (existing rows untouched)")
+    print(f"Sheet updates: {n_added} rows appended, {variations_updated} variation(s) updated")
 
 
 if __name__ == "__main__":
