@@ -535,17 +535,17 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // ── Marin memory repository (v16qc, 2026-06-06) ────────
         [
             "name": "memory",
-            "description": "Steph's voice memory repository — one gateway tool, four operations. USE operation='remember' whenever he says 'remember this/that…', 'remember for me…', 'don't let me forget…', 'make a note that…', 'add X to my to-dos', 'put X on my to-do list', 'add that to my memory/memory file' — pass his words as `content`; the app distills and files them (to-do phrasing → category='todos'). HIS TO-DOS LIVE HERE, NOT IN CLICKUP: never create a ClickUp task for 'to-dos'/'to-do list'/'remember to' phrasing — only use the clickup tool when he explicitly says 'ClickUp' or 'task'. USE operation='recall' BEFORE ever saying you don't know/don't remember, whenever he asks 'what did I call X', 'where did I save Y', 'what did I say about Z', 'do you remember…' — pass the question as `content`; it searches his stored memories AND his Claude Memory notes by meaning. USE operation='forget' when he says to forget/delete a memory. USE operation='list' to read back stored memories (optional `category` filter: files, todos, personal, references). CONFIRMATION RULE for remember/forget: a '✓ Saved' indicator appears on screen automatically — you MUST stay completely SILENT. No 'saved', no 'got it', no 'on it', not one word; just wait for his next words. For recall: answer in ONE short sentence from the best match; mention the source only if he asks. If matches are weak/irrelevant, say you don't have it — never invent a memory.",
+            "description": "Steph's voice memory repository — one gateway tool, four operations. USE operation='remember' whenever he says 'remember this/that…', 'remember for me…', 'don't let me forget…', 'make a note that…', 'add X to my to-dos', 'put X on my to-do list', 'add that to my memory/memory file' — pass his words as `content`; the app distills and files them (to-do phrasing → category='todos'). HIS TO-DOS LIVE HERE, NOT IN CLICKUP: never create a ClickUp task for 'to-dos'/'to-do list'/'remember to' phrasing — only use the clickup tool when he explicitly says 'ClickUp' or 'task'. USE operation='recall' BEFORE ever saying you don't know/don't remember, whenever he asks 'what did I call X', 'where did I save Y', 'what did I say about Z', 'do you remember…' — pass the question as `content`; it searches his stored memories AND his Claude Memory notes by meaning. USE operation='complete' when he says a to-do is done — 'mark it as done', 'check that off', 'I did X', 'that's done', 'finished that' — it checks the box and KEEPS the line. USE operation='forget' ONLY when he explicitly says forget/delete/remove a memory — it deletes the line permanently; NEVER use forget for 'done' phrasing. USE operation='list' to read back stored memories (optional `category` filter: files, todos, personal, references). CONFIRMATION RULE for remember/forget/complete: a labeled indicator ('✓ Saved' / '✓ Forgot' / '✓ Done') appears at his cursor automatically — you MUST stay completely SILENT. No 'saved', no 'forgotten', no 'done', no 'got it', not one word; just wait for his next words. For recall: answer in ONE short sentence from the best match; mention the source only if he asks. If matches are weak/irrelevant, say you don't have it — never invent a memory.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
                     "operation": [
                         "type": "STRING",
-                        "description": "One of: remember, recall, forget, list.",
+                        "description": "One of: remember, recall, complete, forget, list.",
                     ],
                     "content": [
                         "type": "STRING",
-                        "description": "For remember: what to store (his words, lightly trimmed). For recall/forget: the search query. Unused for list.",
+                        "description": "For remember: what to store (his words, lightly trimmed). For recall/complete/forget: the search query. Unused for list.",
                     ],
                     "category": [
                         "type": "STRING",
@@ -1222,6 +1222,8 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 return await MarinMemoryStore.shared.recall(query: content)
             case "forget":
                 return await MarinMemoryStore.shared.forget(query: content)
+            case "complete":
+                return await MarinMemoryStore.shared.complete(query: content)
             case "list":
                 return await MarinMemoryStore.shared.list(categoryKey: category)
             default:

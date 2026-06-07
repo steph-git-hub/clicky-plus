@@ -284,7 +284,61 @@ actor MarinMemoryStore {
         try? await db.deleteDocuments(ids: [target.id])
         sidecar.removeValue(forKey: target.id.uuidString)
         saveSidecar()
+        NotificationCenter.default.post(
+            name: Self.memorySavedNotification, object: nil,
+            userInfo: ["label": "✓ Forgot"]
+        )
         return ["status": "ok", "forgot": line]
+    }
+
+    /// v16qe (2026-06-07): mark a to-do DONE — checks the box in the
+    /// note (`- [ ]` → `- [x]`) so the record survives, and drops it
+    /// from the index/read-backs. This is what "mark it as done" means;
+    /// forget (deletion) is only for memories Steph wants GONE. Born
+    /// from a live miss: Marin routed "mark it as done" to forget and
+    /// deleted the line.
+    func complete(query: String) async -> [String: Any] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else {
+            return ["status": "error", "reason": "Empty query"]
+        }
+        guard let db = try? await database() else {
+            return ["status": "error", "reason": "Memory index unavailable"]
+        }
+        if !syncedOnce { try? await syncIndex() }
+        guard let results = try? await db.search(query: .text(q), numResults: 8, threshold: 0),
+              let target = results.first(where: {
+                  guard let m = sidecar[$0.id.uuidString] else { return false }
+                  return m.kind == "marin" && m.category == "todos"
+              }),
+              let meta = sidecar[target.id.uuidString], let line = meta.line else {
+            return ["status": "not_found", "reason": "No open to-do matched that. Use operation='list' with category 'todos' to see open items."]
+        }
+        do {
+            try checkOffLineInNote(line)
+        } catch {
+            return ["status": "error", "reason": "Could not edit note: \(error.localizedDescription)"]
+        }
+        try? await db.deleteDocuments(ids: [target.id])
+        sidecar.removeValue(forKey: target.id.uuidString)
+        saveSidecar()
+        NotificationCenter.default.post(
+            name: Self.memorySavedNotification, object: nil,
+            userInfo: ["label": "✓ Done"]
+        )
+        return ["status": "ok", "completed": line]
+    }
+
+    private func checkOffLineInNote(_ line: String) throws {
+        let content = try String(contentsOfFile: notePath, encoding: .utf8)
+        var lines = content.components(separatedBy: "\n")
+        guard let idx = lines.firstIndex(where: {
+            let t = $0.trimmingCharacters(in: .whitespaces)
+            return t == "- [ ] \(line)" || t == "- \(line)"
+        }) else { return }
+        let indent = lines[idx].prefix(while: { $0 == " " || $0 == "\t" })
+        lines[idx] = "\(indent)- [x] \(line)"
+        try lines.joined(separator: "\n").write(toFile: notePath, atomically: true, encoding: .utf8)
     }
 
     func list(categoryKey: String?) -> [String: Any] {

@@ -3939,8 +3939,34 @@ async function handleRepunctuate(request: Request, env: Env): Promise<Response> 
  * Response: { category: string, memory: string }
  *        or { prompt: string, userText: string } when promptOnly
  */
+/// v16qe: the next 14 days as "Weekday MM-DD" pairs so the model
+/// resolves "next Friday" by lookup instead of (reliably wrong)
+/// weekday arithmetic.
+function upcomingDatesLine(): string {
+  const parts: string[] = [];
+  for (let i = 1; i <= 14; i++) {
+    const d = new Date(Date.now() + i * 86_400_000);
+    const w = new Intl.DateTimeFormat("en-US", { timeZone: "America/Los_Angeles", weekday: "short" }).format(d);
+    const ymd = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+    }).format(d);
+    parts.push(`${w}=${ymd}`);
+  }
+  return parts.join(" ");
+}
+
 function buildMemoryExtractPrompt(): string {
-  const today = new Date().toISOString().slice(0, 10);
+  // v16qe (2026-06-07): Steph's LOCAL date + weekday, not UTC. Evening
+  // saves were resolving relative dates off tomorrow's date, and
+  // "next Friday" landed on a Sunday with no weekday anchor.
+  const now = new Date();
+  const today = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/Los_Angeles",
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(now);
+  const weekday = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Los_Angeles", weekday: "long",
+  }).format(now);
   return [
     "You convert a spoken 'remember this' request into one stored memory line.",
     'Output ONLY JSON: {"category":"files|todos|personal|references","memory":"<one line>"}',
@@ -3948,7 +3974,8 @@ function buildMemoryExtractPrompt(): string {
     '- memory = one concise line, keep the speaker\'s perspective ("my"/"I" stay as-is).',
     "- Keep every concrete identifier VERBATIM: names, file/doc names, numbers, dates, places.",
     '- Strip only filler and meta-talk ("remember that", "for me", "can you", "uh").',
-    `- Today is ${today}. Resolve relative dates to absolute (YYYY-MM-DD).`,
+    `- Today is ${weekday}, ${today}. Resolve relative dates to absolute (YYYY-MM-DD) using this calendar (LOOK UP, don't compute): ${upcomingDatesLine()}`,
+    '- Prepend "$" to decimal prices in money context (MSRP, price, cost, e.g. 17.99 → $17.99). Never add "$" to whole numbers.',
     "- category: files = file/doc/deck names + where they live; todos = things to do; personal = personal/life facts; references = everything else.",
     "No prose, no markdown, JSON only.",
   ].join("\n");
