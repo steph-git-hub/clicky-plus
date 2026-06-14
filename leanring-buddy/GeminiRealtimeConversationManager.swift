@@ -1147,7 +1147,40 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                     RealtimeConversationManager.appendDiag("[gemini] tool_response \(name) result=\(truncated)")
                 }
                 await self.sendToolResponse(id: id, name: name, result: result)
+                self.scheduleSilentActionWatchdog(name: name, args: args)
             }
+        }
+    }
+
+    /// v16qk (2026-06-14): silent-action turn watchdog. Memory saves,
+    /// reminders, and ClickUp creates instruct Marin to say NOTHING
+    /// (Steph vetoed spoken acks — tone). But with no audio, Gemini
+    /// Live sometimes never emits `turnComplete`, so the turn never
+    /// drains and the notch spinner sticks in `.responding` forever
+    /// (Steph had to press Escape after every save). This fires 2.5s
+    /// after the tool response for a KNOWN-SILENT action: if no audio
+    /// has started and we're still `.responding`, force the turn closed
+    /// so the spinner clears. Speaking ops (recall, list, clickup find)
+    /// are excluded so we never cut off a real answer.
+    private func scheduleSilentActionWatchdog(name: String, args: [String: Any]) {
+        let op = (args["operation"] as? String) ?? ""
+        let isSilent: Bool
+        switch name {
+        case "create_reminder": isSilent = true
+        case "memory":          isSilent = ["remember", "forget", "complete"].contains(op)
+        case "clickup":         isSilent = (op == "create")
+        default:                isSilent = false
+        }
+        guard isSilent else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 2_500_000_000)
+            guard let self else { return }
+            guard !self.marinAudioStartedThisTurn, case .responding = self.state else { return }
+            RealtimeConversationManager.appendDiag(
+                "[gemini] silent-action watchdog (\(name)/\(op)): no audio after 2.5s — forcing turn close"
+            )
+            self.serverSignaledTurnEnd = true
+            self.maybeTransitionToIdle()
         }
     }
 

@@ -199,16 +199,28 @@ actor MarinMemoryStore {
             category = "references"
         }
 
-        // 2. Dedupe — a near-identical existing voice memory gets
-        // replaced instead of duplicated.
+        // 2. Dedupe / update-detection — a near-identical existing voice
+        // memory gets REPLACED instead of duplicated. v16qk (2026-06-14):
+        // the old single 0.92 cosine gate missed real updates — "team
+        // meeting is Wednesday" → "team meeting moved to Thursday" scored
+        // below 0.92 and got added as a 2nd line in a different section.
+        // Dual gate now: very-high similarity alone, OR moderate
+        // similarity PLUS ≥2 shared significant words. The word gate
+        // prevents false merges of things that merely share a topic word
+        // ("Ulta deck" vs "Ulta budget" share only "ulta" → not merged).
         var replacedLine: String?
         if syncedOnce, let db = try? await database(),
-           let results = try? await db.search(query: .text(memoryLine), numResults: 3, threshold: 0) {
+           let results = try? await db.search(query: .text(memoryLine), numResults: 5, threshold: 0) {
+            let newWords = Self.significantWords(memoryLine)
             for r in results {
                 guard let meta = sidecar[r.id.uuidString], meta.kind == "marin",
-                      let line = meta.line, r.score >= 0.92 else { continue }
-                replacedLine = line
-                break
+                      let line = meta.line else { continue }
+                let shared = newWords.intersection(Self.significantWords(line)).count
+                let isUpdate = r.score >= 0.93 || (r.score >= 0.85 && shared >= 2)
+                if isUpdate {
+                    replacedLine = line
+                    break
+                }
             }
         }
 
@@ -614,6 +626,22 @@ actor MarinMemoryStore {
     private static func chunkHash(kind: String, text: String) -> String {
         let digest = SHA256.hash(data: Data("\(kind)\u{1F}\(text)".utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Significant words for update-detection: lowercased alphanumeric
+    /// tokens ≥4 chars, excluding pure-digit tokens (years, dates) and a
+    /// leading "[YYYY-MM-DD]" stamp. Used to gate the dedupe so only
+    /// memories that share real subject words merge.
+    private static func significantWords(_ s: String) -> Set<String> {
+        let stripped = s.replacingOccurrences(
+            of: #"^\s*\[\d{4}-\d{2}-\d{2}\]\s*"#, with: "", options: .regularExpression)
+        let tokens = stripped.lowercased().split { !$0.isLetter && !$0.isNumber }
+        var out: Set<String> = []
+        for t in tokens {
+            let w = String(t)
+            if w.count >= 4 && !w.allSatisfy({ $0.isNumber }) { out.insert(w) }
+        }
+        return out
     }
 
     private static func dateStamp() -> String {

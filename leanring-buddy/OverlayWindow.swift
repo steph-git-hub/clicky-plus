@@ -729,19 +729,23 @@ struct BlueCursorView: View {
             // title and is COLORED + icon'd by destination (blue=memory,
             // orange=reminder, pink=ClickUp, green=done, gray=forgot) so
             // Steph sees what got saved AND where, at a glance.
-            HStack(spacing: 5) {
+            HStack(alignment: .top, spacing: 5) {
                 Image(systemName: actionBadgeStyle(companionManager.memorySaveBadgeKind).icon)
                     .font(.system(size: 11, weight: .bold))
-                Text(companionManager.memorySaveBadge.map {
-                    $0.count > 42 ? String($0.prefix(40)) + "…" : $0
-                } ?? " ")
+                    .padding(.top, 1)
+                // v16qk (2026-06-14): show the FULL saved text — Steph
+                // wants to read the whole task, not a truncated preview.
+                // Wraps to as many lines as needed within a bounded width
+                // so the badge grows in height, not absurd width.
+                Text(companionManager.memorySaveBadge ?? " ")
                     .font(.system(size: 12, weight: .semibold))
-                    .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: 280, alignment: .leading)
             }
                 .foregroundColor(.white)
                 .padding(.horizontal, 11)
-                .padding(.vertical, 5)
-                .background(Capsule().fill(actionBadgeStyle(companionManager.memorySaveBadgeKind).tint.opacity(0.95)))
+                .padding(.vertical, 6)
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(actionBadgeStyle(companionManager.memorySaveBadgeKind).tint.opacity(0.95)))
                 .shadow(color: .black.opacity(0.25), radius: 4, y: 1)
                 .opacity(
                     companionManager.memorySaveBadge != nil && isCursorOnThisScreen
