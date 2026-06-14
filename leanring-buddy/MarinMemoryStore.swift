@@ -238,7 +238,7 @@ actor MarinMemoryStore {
         Self.logMemoryAction("remember", "category=\(category) engine=\(engine) action=\(replacedLine != nil ? "updated" : "added") line=\"\(memoryLine)\"")
         NotificationCenter.default.post(
             name: Self.memorySavedNotification, object: nil,
-            userInfo: ["updated": replacedLine != nil]
+            userInfo: ["kind": replacedLine != nil ? "memory-updated" : "memory", "text": memoryLine]
         )
         return [
             "status": "ok",
@@ -316,7 +316,7 @@ actor MarinMemoryStore {
         Self.logMemoryAction("forget", "removed=\"\(line)\"")
         NotificationCenter.default.post(
             name: Self.memorySavedNotification, object: nil,
-            userInfo: ["label": "✓ Forgot"]
+            userInfo: ["kind": "forget", "text": line]
         )
         return ["status": "ok", "forgot": line]
     }
@@ -355,7 +355,7 @@ actor MarinMemoryStore {
         Self.logMemoryAction("complete", "checked=\"\(line)\"")
         NotificationCenter.default.post(
             name: Self.memorySavedNotification, object: nil,
-            userInfo: ["label": "✓ Done"]
+            userInfo: ["kind": "done", "text": line]
         )
         return ["status": "ok", "completed": line]
     }

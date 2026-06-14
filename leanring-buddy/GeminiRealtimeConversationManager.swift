@@ -558,7 +558,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // ── Timed reminders (v16qi, 2026-06-14) ────────────────
         [
             "name": "create_reminder",
-            "description": "Set a TIMED reminder in Steph's macOS Reminders app — it alerts at the time and syncs to his iPhone/Watch even when Clicky+ is closed. USE THIS (not run_applescript, not memory) whenever he says 'remind me to X', 'set/create a reminder to X', 'reminder to X' — especially with a time ('tomorrow at 3pm', 'in an hour', 'Friday morning'). Pass `text` = what to be reminded of, in his words, spelled correctly. Pass `due_iso` = the absolute LOCAL datetime as 'YYYY-MM-DDTHH:MM:SS' that YOU compute from his spoken time and today's date (e.g. he says 'tomorrow at 3' and today is 2026-06-14 → '2026-06-15T15:00:00'). If he gives no time at all, omit due_iso. Call this EXACTLY ONCE per request — never twice for the same reminder. Confirmation is SILENT: a '✓ Reminder' badge appears on his screen — say NOTHING ('set', 'done', etc.), just wait for his next words. NOTE: 'remember X' / 'add to my to-dos' is the separate `memory` tool (a passive list), NOT this.",
+            "description": "Set a TIMED reminder in Steph's macOS Reminders app — it alerts at the time and syncs to his iPhone/Watch even when Clicky+ is closed. USE THIS (not run_applescript, not memory) whenever he says 'remind me to X', 'set/create a reminder to X', 'reminder to X' — especially with a time ('tomorrow at 3pm', 'in an hour', 'Friday morning'). Pass `text` = what to be reminded of, in his words, spelled correctly. Pass `due_iso` = the absolute LOCAL datetime as 'YYYY-MM-DDTHH:MM:SS' that YOU compute from his spoken time and today's date (e.g. he says 'tomorrow at 3' and today is 2026-06-14 → '2026-06-15T15:00:00'). CRITICAL: compute due_iso ONLY from a time he ACTUALLY said. If he did not say a time, OMIT due_iso entirely — never invent, guess, or default one (no 3pm, no 9am, nothing). A reminder with no spoken time is created untimed. Call this EXACTLY ONCE per request — never twice for the same reminder. Confirmation is SILENT: a '✓ Reminder' badge appears on his screen — say NOTHING ('set', 'done', etc.), just wait for his next words. NOTE: 'remember X' / 'add to my to-dos' is the separate `memory` tool (a passive list), NOT this.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
@@ -1438,9 +1438,10 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             // carries the what.
             if (args["operation"] as? String) == "create",
                (clickupResult["status"] as? String) != "error" {
+                let taskName = (args["name"] as? String) ?? "ClickUp task"
                 NotificationCenter.default.post(
                     name: MarinMemoryStore.memorySavedNotification, object: nil,
-                    userInfo: ["label": "✓ ClickUp task"]
+                    userInfo: ["kind": "clickup", "text": taskName]
                 )
             }
             return clickupResult
@@ -1738,28 +1739,30 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             script = "tell application \"Reminders\" to make new reminder with properties {name:\"\(safe)\"}"
         }
 
-        let outcome: String = await MainActor.run {
+        // v16qj (2026-06-14): run the AppleScript OFF the tool's return
+        // path. The Reminders round-trip takes 1-3s on the main thread,
+        // which froze Marin's notch spinner (stuck-on, same class of bug
+        // as the memory index write). Fire it as a non-awaited main-actor
+        // task and post the badge on success; the tool returns instantly
+        // so the turn closes and the spinner clears.
+        let badgeText = text
+        Task { @MainActor in
             var err: NSDictionary?
-            if let s = NSAppleScript(source: script) {
-                s.executeAndReturnError(&err)
-            } else {
-                return "could not compile reminder script"
+            let compiled = NSAppleScript(source: script)
+            compiled?.executeAndReturnError(&err)
+            let outcome = (compiled == nil)
+                ? "could not compile reminder script"
+                : (err == nil ? "ok" : ((err?[NSAppleScript.errorMessage] as? String) ?? "\(err!)"))
+            Self.logFillAction("create_reminder", "text=\"\(badgeText)\" due=\(dueISO.isEmpty ? "none" : dueISO) result=\(outcome)")
+            if outcome == "ok" {
+                NotificationCenter.default.post(
+                    name: MarinMemoryStore.memorySavedNotification, object: nil,
+                    userInfo: ["kind": "reminder", "text": badgeText]
+                )
             }
-            if let err { return (err[NSAppleScript.errorMessage] as? String) ?? "\(err)" }
-            return "ok"
-        }
-        Self.logFillAction("create_reminder", "text=\"\(text)\" due=\(dueISO.isEmpty ? "none" : dueISO) result=\(outcome)")
-        if outcome != "ok" {
-            return ["status": "error", "reason": "Couldn't create the reminder: \(outcome)"]
-        }
-        await MainActor.run {
-            NotificationCenter.default.post(
-                name: MarinMemoryStore.memorySavedNotification, object: nil,
-                userInfo: ["label": "✓ Reminder"]
-            )
         }
         return ["status": "ok",
-                "note": "Reminder created in Apple Reminders\(dueISO.isEmpty ? "" : " for \(dueISO)"). Stay SILENT — the ✓ badge confirms it. Do not announce or repeat."]
+                "note": "Reminder being created in Apple Reminders\(dueISO.isEmpty ? "" : " for \(dueISO)"). Stay SILENT — the badge confirms it. Do not announce or repeat."]
     }
 
     /// Read the URL of the frontmost browser tab (Chrome, else Safari).

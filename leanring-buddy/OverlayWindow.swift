@@ -112,6 +112,22 @@ enum BuddyNavigationMode {
 // triangle when it is. During voice interaction, the triangle is
 // replaced by a waveform (listening), spinner (processing), or
 // streaming text bubble (responding).
+/// v16qj (2026-06-14): maps an action-badge `kind` to its cursor-capsule
+/// color + SF Symbol. Color is the at-a-glance "where did it go" signal:
+/// blue = Marin memory, orange = Apple reminder, pink = ClickUp task,
+/// green = to-do completed, gray = forgotten.
+fileprivate func actionBadgeStyle(_ kind: String?) -> (tint: Color, icon: String) {
+    switch kind {
+    case "reminder":       return (.orange, "bell.fill")
+    case "clickup":        return (Color(red: 0.91, green: 0.30, blue: 0.55), "checklist")
+    case "memory":         return (DS.Colors.overlayCursorBlue, "note.text.badge.plus")
+    case "memory-updated": return (DS.Colors.overlayCursorBlue, "pencil.and.list.clipboard")
+    case "done":           return (.green, "checkmark.circle.fill")
+    case "forget":         return (Color(white: 0.45), "trash")
+    default:               return (.green, "checkmark")
+    }
+}
+
 struct BlueCursorView: View {
     let screenFrame: CGRect
     let isFirstAppearance: Bool
@@ -707,17 +723,25 @@ struct BlueCursorView: View {
             // v16qd (2026-06-07): action-confirmation capsule AT THE
             // CURSOR. Steph misses the notch badge ("I need the visual
             // indicator to be where my mouse goes") and spoken acks are
-            // out (tone) — so memory saves / ClickUp creates flash a
-            // small green labeled capsule beside the pointer for ~2.5s.
-            // Label says WHAT happened ("✓ Saved" / "✓ ClickUp task")
-            // so the confirmation is never ambiguous. Rendered for every
-            // indicator style; rides memorySaveBadge (auto-clears).
-            Text(companionManager.memorySaveBadge ?? " ")
-                .font(.system(size: 12, weight: .semibold))
+            // out (tone) — so saves flash a labeled capsule beside the
+            // pointer for ~2.8s.
+            // v16qj (2026-06-14): now shows the ACTUAL content text as the
+            // title and is COLORED + icon'd by destination (blue=memory,
+            // orange=reminder, pink=ClickUp, green=done, gray=forgot) so
+            // Steph sees what got saved AND where, at a glance.
+            HStack(spacing: 5) {
+                Image(systemName: actionBadgeStyle(companionManager.memorySaveBadgeKind).icon)
+                    .font(.system(size: 11, weight: .bold))
+                Text(companionManager.memorySaveBadge.map {
+                    $0.count > 42 ? String($0.prefix(40)) + "…" : $0
+                } ?? " ")
+                    .font(.system(size: 12, weight: .semibold))
+                    .lineLimit(1)
+            }
                 .foregroundColor(.white)
-                .padding(.horizontal, 10)
+                .padding(.horizontal, 11)
                 .padding(.vertical, 5)
-                .background(Capsule().fill(Color.green.opacity(0.92)))
+                .background(Capsule().fill(actionBadgeStyle(companionManager.memorySaveBadgeKind).tint.opacity(0.95)))
                 .shadow(color: .black.opacity(0.25), radius: 4, y: 1)
                 .opacity(
                     companionManager.memorySaveBadge != nil && isCursorOnThisScreen
@@ -725,8 +749,8 @@ struct BlueCursorView: View {
                 )
                 .scaleEffect(companionManager.memorySaveBadge != nil ? 1.0 : 0.6)
                 .position(
-                    x: cursorPosition.x + 12,
-                    y: cursorPosition.y - 32
+                    x: cursorPosition.x + 14,
+                    y: cursorPosition.y - 34
                 )
                 .animation(.spring(response: 0.25, dampingFraction: 0.8), value: companionManager.memorySaveBadge != nil)
                 .animation(.linear(duration: 0.04), value: cursorPosition)

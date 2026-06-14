@@ -699,11 +699,22 @@ private struct NotchPillView: View {
         // and is the ONLY confirmation (silent + visual by design:
         // chime banned v15p4dk, spoken ack vetoed by Steph 2026-06-06).
         if let badge = companionManager.memorySaveBadge {
+            // v16qj (2026-06-14): color by destination, mirror of the
+            // cursor capsule (blue=memory, orange=reminder, pink=ClickUp,
+            // green=done, gray=forgot).
+            let tint: Color
+            switch companionManager.memorySaveBadgeKind {
+            case "reminder": tint = .orange
+            case "clickup": tint = Color(red: 0.91, green: 0.30, blue: 0.55)
+            case "memory", "memory-updated": tint = DS.Colors.overlayCursorBlue
+            case "forget": tint = Color(white: 0.45)
+            default: tint = .green
+            }
             return PillStateView(
                 id: "memory.saved",
-                tint: .green,
+                tint: tint,
                 kind: .live,
-                statusLabel: badge,
+                statusLabel: badge.count > 40 ? String(badge.prefix(38)) + "…" : badge,
                 transcript: nil,
                 showsWaveform: false
             )

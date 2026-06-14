@@ -413,6 +413,9 @@ final class CompanionManager: ObservableObject {
     /// audio collides with Gemini Live and hangs the notch voiceState)
     /// and Steph vetoed spoken acks 2026-06-06 (tone comes out wrong).
     @Published var memorySaveBadge: String?
+    /// v16qj (2026-06-14): which destination the badge represents, so the
+    /// notch can color it (memory / reminder / clickup / done / forget).
+    @Published var memorySaveBadgeKind: String?
     private var memorySaveBadgeClearTask: Task<Void, Never>?
     private var memorySavedObserver: NSObjectProtocol?
 
@@ -1275,16 +1278,25 @@ final class CompanionManager: ObservableObject {
             object: nil, queue: .main
         ) { [weak self] note in
             guard let self else { return }
-            // v16qd (2026-06-07): explicit label wins (e.g. "✓ ClickUp
-            // task" from the clickup create path); else Saved/Updated.
-            let updated = (note.userInfo?["updated"] as? Bool) ?? false
-            self.memorySaveBadge = (note.userInfo?["label"] as? String)
-                ?? (updated ? "✓ Updated" : "✓ Saved")
+            // v16qj (2026-06-14): badge carries the actual CONTENT text +
+            // a `kind` (memory/reminder/clickup/done/forget) the notch
+            // colors by — so Steph sees WHAT got saved and WHERE at a
+            // glance. Legacy "label"/"updated" kept as a fallback.
+            if let text = note.userInfo?["text"] as? String, !text.isEmpty {
+                self.memorySaveBadge = text
+                self.memorySaveBadgeKind = (note.userInfo?["kind"] as? String) ?? "memory"
+            } else {
+                let updated = (note.userInfo?["updated"] as? Bool) ?? false
+                self.memorySaveBadge = (note.userInfo?["label"] as? String)
+                    ?? (updated ? "✓ Updated" : "✓ Saved")
+                self.memorySaveBadgeKind = "memory"
+            }
             self.memorySaveBadgeClearTask?.cancel()
             self.memorySaveBadgeClearTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                try? await Task.sleep(nanoseconds: 2_800_000_000)
                 guard !Task.isCancelled else { return }
                 self?.memorySaveBadge = nil
+                self?.memorySaveBadgeKind = nil
             }
         }
 
