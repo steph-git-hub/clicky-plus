@@ -28,12 +28,14 @@ Usage:
     DTC:   1urJW_9FSaSZEWH6ITmsYZONY3i6aBsu8vjwpX3knDpw  "Final SKU Master List"!B3:O2061
     Amazon:1zva8IzCHQRNUasuBZcI4Cz9tQduvOtxyFSN0p-5bhvE  "MASTER"!A3:V3230
 
-Current sheet column layout (A=0 … N=13):
+Current sheet column layout (A=0 … T=19):
   A  SKU             B  ASIN               C  FBA SKU
   D  FNSKU           E  Name               F  Category
   G  Parent          H  Length             I  Shape
   J  MSRP            K  Unit Cost          L  UPC
-  M  Amazon Variation  N  Source
+  M  Amazon Variation  N  Source           O  Active (30d)
+  P  Legacy SKUs     Q  Ulta               R  Target
+  S  Sephora         T  Dillard's          U  Walmart
 """
 
 import json, re, os, sys
@@ -58,6 +60,9 @@ COL = {
     "sku": 0, "asin": 1, "amazon_sku": 2, "fnsku": 3, "name": 4,
     "category": 5, "parent": 6, "length": 7, "shape": 8,
     "msrp": 9, "unit_cost": 10, "upc": 11, "variation": 12, "source": 13,
+    "active": 14, "legacy_skus": 15,
+    "ulta_sku": 16, "target_sku": 17, "sephora_sku": 18, "dillards_sku": 19,
+    "walmart_sku": 20,
 }
 COL_ORDER = sorted(COL, key=COL.get)
 
@@ -91,8 +96,8 @@ def normalize_category(raw):
     return CATEGORY_MAP.get((raw or "").strip().lower(), (raw or "").strip())
 
 def row_to_rec(row):
-    """Pad a sheet row to 14 cols and return a dict keyed by COL field names."""
-    pad = list(row) + [""] * (14 - len(row))
+    """Pad a sheet row to 20 cols and return a dict keyed by COL field names."""
+    pad = list(row) + [""] * (21 - len(row))
     return {k: pad[v] for k, v in COL.items()}
 
 def rec_to_row(rec):
@@ -153,7 +158,7 @@ def main():
     # ── Step 1: read current curated sheet ──
     result = api.values().get(
         spreadsheetId=CURATED_ID,
-        range="'SKU Master'!A2:N",
+        range="'SKU Master'!A2:U",
     ).execute()
     sheet_rows = result.get("values", [])
 

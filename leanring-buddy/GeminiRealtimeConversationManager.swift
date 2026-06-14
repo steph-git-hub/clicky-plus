@@ -1503,9 +1503,14 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             let filterField = (args["filter_field"] as? String) ?? "collection"
             let (tsv, count, resolvedFields) = MarinResearchTools.resolveSkuRowsByFilter(
                 filterField: filterField, filterValue: filterValue, fields: fields)
+            Self.logFillAction("fill_sku_details[filter]",
+                "field='\(filterField)' value='\(filterValue)' fields=\(fields) matched=\(count)")
             if count == 0 {
+                // v16qf: name the field actually searched so a zero-match
+                // is diagnosable (e.g. 'collection' maps to the master's
+                // `parent` field, which may not hold collection names).
                 return ["status": "ok", "matched_count": 0,
-                        "note": "Nothing in the SKU master matched \(filterField)='\(filterValue)'. Tell Steph nothing was found — do NOT fill anything from memory."]
+                        "note": "Nothing in the SKU master had \(filterField) containing '\(filterValue)'. Tell Steph nothing matched that \(filterField), and that he can try a different collection/field name or list the SKUs explicitly. Do NOT fill anything from memory."]
             }
             await CompanionManager.typeTextViaClipboard(tsv)
             return ["status": "ok", "matched_count": count, "fields_filled": resolvedFields,
@@ -1520,6 +1525,8 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         }
         let (tsv, matched, notFound, resolvedFields) =
             MarinResearchTools.resolveSkuRows(items: items, fields: fields)
+        Self.logFillAction("fill_sku_details[items]",
+            "items=\(items.count) fields=\(fields) matched=\(matched.count) notFound=\(notFound.count) missing=\(notFound.prefix(8).joined(separator: ","))")
         if tsv.isEmpty {
             return ["status": "error", "reason": "Couldn't read the SKU master (no data)."]
         }
@@ -1621,6 +1628,24 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
     // /sheets info (gid→tab name) → /sheets read the SKU column →
     // resolveSkuRows looks each up → /sheets update writes the aligned block.
 
+    /// v16qf (2026-06-14): diagnostic log for the SKU/fill tools. These
+    /// paste/write tools previously logged NOTHING, so when Steph hit
+    /// "she says they're not there" there was no record to diagnose from
+    /// (only run_applescript writes marin-actions.log). One line per
+    /// fill attempt: tool, mode, resolved target, and match counts.
+    static func logFillAction(_ tool: String, _ detail: String) {
+        let dir = ("~/Library/Application Support/Clicky/action-log" as NSString).expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = (dir as NSString).appendingPathComponent("fill-actions.log")
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(stamp)] \(tool) \(detail)\n"
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+
     /// Read the URL of the frontmost browser tab (Chrome, else Safari).
     @MainActor
     private static func activeBrowserURL() -> String? {
@@ -1692,11 +1717,15 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         }
         let skus = rows.map { ($0.first.map { "\($0)" } ?? "").trimmingCharacters(in: .whitespaces) }
         if skus.allSatisfy({ $0.isEmpty }) {
-            return ["status": "error", "reason": "No SKUs found in \(skuRange)."]
+            Self.logFillAction("fill_sku_column",
+                "sheet='\(sheetName)' range='\(skuRange)' READ_EMPTY (id=\(spreadsheetId.prefix(12))…) — wrong tab/range?")
+            return ["status": "error", "reason": "No SKUs found in \(skuRange) on tab '\(sheetName.isEmpty ? "(default)" : sheetName)'. Double-check the tab and the SKU column range with Steph — the cells came back empty."]
         }
 
         // 4) Look up verified values, aligned (blank rows for misses).
         let (tsv, _, notFound, _) = MarinResearchTools.resolveSkuRows(items: skus, fields: fields)
+        Self.logFillAction("fill_sku_column",
+            "sheet='\(sheetName)' range='\(skuRange)' target='\(targetStart)' fields=\(fields) read=\(skus.filter { !$0.isEmpty }.count) notFound=\(notFound.count) first=\(skus.first ?? "") missing=\(notFound.prefix(8).joined(separator: ","))")
         let values: [[String]] = tsv.components(separatedBy: "\n").map { $0.components(separatedBy: "\t") }
 
         // 5) Write the aligned block, anchored at target_start.
