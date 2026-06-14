@@ -312,11 +312,27 @@ actor MarinMemoryStore {
             return ["status": "error", "reason": "Memory index unavailable"]
         }
         if !syncedOnce { try? await syncIndex() }
-        guard let results = try? await db.search(query: .text(q), numResults: 8, threshold: 0),
-              let target = results.first(where: { sidecar[$0.id.uuidString]?.kind == "marin" }),
-              let meta = sidecar[target.id.uuidString], let line = meta.line else {
-            return ["status": "not_found", "reason": "No stored voice memory matched. Only voice-stored memories can be forgotten — Claude Memory notes are read-only here."]
+        guard let results = try? await db.search(query: .text(q), numResults: 8, threshold: 0) else {
+            return ["status": "error", "reason": "Search failed"]
         }
+        // v16qk (2026-06-14): relevance gate — only delete a memory that
+        // actually matches. A candidate qualifies if it shares a real
+        // subject word with the query OR clears a high similarity floor.
+        // Without this, an unrelated query deleted the nearest memory
+        // (live: "forget the thing about my yacht" nuked "Ulta budget").
+        let qWords = Self.significantWords(q).subtracting(Self.genericWords)
+        var picked: (id: UUID, line: String, score: Float)?
+        for r in results {
+            guard let meta = sidecar[r.id.uuidString], meta.kind == "marin",
+                  let line = meta.line else { continue }
+            let shared = qWords.intersection(Self.significantWords(line)).count
+            guard shared >= 1 || r.score >= 0.85 else { continue }
+            if picked == nil || r.score > picked!.score { picked = (r.id, line, r.score) }
+        }
+        guard let target = picked else {
+            return ["status": "not_found", "reason": "Nothing matched '\(q)' closely enough to delete. Tell Steph you didn't find a matching memory — do NOT delete anything else. (Only voice-stored memories can be forgotten.)"]
+        }
+        let line = target.line
         do {
             try removeLineFromNote(line)
         } catch {
@@ -348,14 +364,25 @@ actor MarinMemoryStore {
             return ["status": "error", "reason": "Memory index unavailable"]
         }
         if !syncedOnce { try? await syncIndex() }
-        guard let results = try? await db.search(query: .text(q), numResults: 8, threshold: 0),
-              let target = results.first(where: {
-                  guard let m = sidecar[$0.id.uuidString] else { return false }
-                  return m.kind == "marin" && m.category == "todos"
-              }),
-              let meta = sidecar[target.id.uuidString], let line = meta.line else {
-            return ["status": "not_found", "reason": "No open to-do matched that. Use operation='list' with category 'todos' to see open items."]
+        guard let results = try? await db.search(query: .text(q), numResults: 8, threshold: 0) else {
+            return ["status": "error", "reason": "Search failed"]
         }
+        // v16qk (2026-06-14): same relevance gate as forget — only check
+        // off a to-do that actually matches the query, never the nearest
+        // by default. Restricted to category 'todos'.
+        let qWords = Self.significantWords(q).subtracting(Self.genericWords)
+        var picked: (id: UUID, line: String, score: Float)?
+        for r in results {
+            guard let meta = sidecar[r.id.uuidString], meta.kind == "marin",
+                  meta.category == "todos", let line = meta.line else { continue }
+            let shared = qWords.intersection(Self.significantWords(line)).count
+            guard shared >= 1 || r.score >= 0.85 else { continue }
+            if picked == nil || r.score > picked!.score { picked = (r.id, line, r.score) }
+        }
+        guard let target = picked else {
+            return ["status": "not_found", "reason": "No open to-do matched '\(q)' closely enough. Tell Steph you didn't find a matching to-do — do NOT check off anything else. Use operation='list' category 'todos' to see open items."]
+        }
+        let line = target.line
         do {
             try checkOffLineInNote(line)
         } catch {
@@ -627,6 +654,16 @@ actor MarinMemoryStore {
         let digest = SHA256.hash(data: Data("\(kind)\u{1F}\(text)".utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
+
+    /// v16qk (2026-06-14): generic words excluded from forget/complete
+    /// matching so a query like "the thing about my yacht" can't latch
+    /// onto a memory via filler. Without this, forget deleted the nearest
+    /// memory regardless of relevance (it nuked "Ulta budget").
+    private static let genericWords: Set<String> = [
+        "thing", "things", "stuff", "item", "items", "task", "tasks",
+        "note", "notes", "reminder", "reminders", "memory", "memories",
+        "about", "that", "this", "remember", "forget", "delete",
+    ]
 
     /// Significant words for update-detection: lowercased alphanumeric
     /// tokens ≥4 chars, excluding pure-digit tokens (years, dates) and a
