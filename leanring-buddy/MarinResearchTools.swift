@@ -692,11 +692,43 @@ enum MarinResearchTools {
             }
         }
         let fKey = keyFor(filterField.isEmpty ? "collection" : filterField)
-        let fVal = filterValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let resolvedKeys = fields.map(keyFor)
-        let matched = arr
-            .filter { !fVal.isEmpty && s($0, fKey).lowercased().contains(fVal) }
-            .sorted { s($0, "sku") < s($1, "sku") }
+
+        // v16qf (2026-06-14): robust collection matching. The old
+        // one-way `field.contains(query)` failed whenever the spoken
+        // query carried an extra word the field value didn't — most
+        // commonly "<name> collection" ("euro summer collection" is not
+        // a substring of the stored "Euro Summer"), which read back to
+        // Steph as "those SKUs aren't there." Fix in three precise-first
+        // tiers so a GOOD query is never polluted by loose fallbacks:
+        //   T1 exact field == query
+        //   T2 field contains query  (old behavior, after filler-strip)
+        //   T3 (only if T1+T2 found nothing) query contains field, i.e.
+        //      the spoken query had extra words — rescues Steph's case.
+        func norm(_ x: String) -> String {
+            x.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let fillerTrailing = [" collection", " collections", " line", " set", " skus", " sku", " group"]
+        var fVal = norm(filterValue)
+        for suffix in fillerTrailing where fVal.hasSuffix(suffix) {
+            fVal = String(fVal.dropLast(suffix.count)).trimmingCharacters(in: .whitespaces)
+        }
+        func fieldVal(_ r: [String: Any]) -> String { norm(s(r, fKey)) }
+        func sortedRows(_ rs: [[String: Any]]) -> [[String: Any]] {
+            rs.sorted { s($0, "sku") < s($1, "sku") }
+        }
+        var matched: [[String: Any]] = []
+        if !fVal.isEmpty {
+            matched = sortedRows(arr.filter { fieldVal($0) == fVal })            // T1
+            if matched.isEmpty {
+                matched = sortedRows(arr.filter { fieldVal($0).contains(fVal) }) // T2
+            }
+            if matched.isEmpty {
+                matched = sortedRows(arr.filter {                               // T3
+                    let v = fieldVal($0); return !v.isEmpty && fVal.contains(v)
+                })
+            }
+        }
         let rows = matched.map { r in resolvedKeys.map { s(r, $0) }.joined(separator: "\t") }
         return (rows.joined(separator: "\n"), matched.count, resolvedKeys)
     }
