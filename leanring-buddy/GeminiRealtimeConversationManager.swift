@@ -535,7 +535,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // ── Marin memory repository (v16qc, 2026-06-06) ────────
         [
             "name": "memory",
-            "description": "Steph's voice memory repository — one gateway tool, four operations. USE operation='remember' whenever he says 'remember this/that…', 'remember for me…', 'don't let me forget…', 'make a note that…', 'add X to my to-dos', 'put X on my to-do list', 'add that to my memory/memory file', OR reminder phrasing with no specific time — 'remind me to X', 'create/set a reminder to X', 'reminder about X' — pass his words as `content`; the app distills and files them (to-do/reminder phrasing → category='todos'). TWO HARD ROUTING RULES: (1) HIS TO-DOS LIVE HERE, NOT IN CLICKUP — never create a ClickUp task for 'to-dos'/'to-do list'/'remember to'/'remind me' phrasing; only use the clickup tool when he explicitly says 'ClickUp' or 'task'. (2) A plain 'remind me to X' / 'reminder' is a MEMORY to-do — do NOT use run_applescript or the macOS Reminders app for it. Only touch the Reminders app if he EXPLICITLY says 'Apple Reminders' or asks for a timed alert ('remind me at 3pm', 'set an alarm'). USE operation='recall' BEFORE ever saying you don't know/don't remember, whenever he asks 'what did I call X', 'where did I save Y', 'what did I say about Z', 'do you remember…' — pass the question as `content`; it searches his stored memories AND his Claude Memory notes by meaning. USE operation='complete' when he says a to-do is done — 'mark it as done', 'check that off', 'I did X', 'that's done', 'finished that' — it checks the box and KEEPS the line. USE operation='forget' ONLY when he explicitly says forget/delete/remove a memory — it deletes the line permanently; NEVER use forget for 'done' phrasing. USE operation='list' to read back stored memories (optional `category` filter: files, todos, personal, references). CONFIRMATION RULE for remember/forget/complete: a labeled indicator ('✓ Saved' / '✓ Forgot' / '✓ Done') appears at his cursor automatically — you MUST stay completely SILENT. No 'saved', no 'forgotten', no 'done', no 'got it', not one word; just wait for his next words. For recall: answer in ONE short sentence from the best match; mention the source only if he asks. If matches are weak/irrelevant, say you don't have it — never invent a memory.",
+            "description": "Steph's voice memory repository — one gateway tool, four operations. USE operation='remember' whenever he says 'remember this/that…', 'remember for me…', 'don't let me forget…', 'make a note that…', 'add X to my to-dos', 'put X on my to-do list', 'add that to my memory/memory file' — pass his words as `content`; the app distills and files them (to-do phrasing → category='todos'). TWO HARD ROUTING RULES: (1) HIS TO-DOS LIVE HERE, NOT IN CLICKUP — never create a ClickUp task for 'to-dos'/'to-do list'/'remember to' phrasing; only use the clickup tool when he explicitly says 'ClickUp' or 'task'. (2) 'Remind me to X' / 'set/create a reminder to X' is the separate `create_reminder` tool (a TIMED Apple Reminders alert that pings him) — NOT memory and NOT ClickUp. `memory` is the passive list of things to RECALL later; anything that should ALERT him at a time goes to create_reminder. USE operation='recall' BEFORE ever saying you don't know/don't remember, whenever he asks 'what did I call X', 'where did I save Y', 'what did I say about Z', 'do you remember…' — pass the question as `content`; it searches his stored memories AND his Claude Memory notes by meaning. USE operation='complete' when he says a to-do is done — 'mark it as done', 'check that off', 'I did X', 'that's done', 'finished that' — it checks the box and KEEPS the line. USE operation='forget' ONLY when he explicitly says forget/delete/remove a memory — it deletes the line permanently; NEVER use forget for 'done' phrasing. USE operation='list' to read back stored memories (optional `category` filter: files, todos, personal, references). CONFIRMATION RULE for remember/forget/complete: a labeled indicator ('✓ Saved' / '✓ Forgot' / '✓ Done') appears at his cursor automatically — you MUST stay completely SILENT. No 'saved', no 'forgotten', no 'done', no 'got it', not one word; just wait for his next words. For recall: answer in ONE short sentence from the best match; mention the source only if he asks. If matches are weak/irrelevant, say you don't have it — never invent a memory.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
@@ -553,6 +553,25 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                     ],
                 ],
                 "required": ["operation"],
+            ],
+        ],
+        // ── Timed reminders (v16qi, 2026-06-14) ────────────────
+        [
+            "name": "create_reminder",
+            "description": "Set a TIMED reminder in Steph's macOS Reminders app — it alerts at the time and syncs to his iPhone/Watch even when Clicky+ is closed. USE THIS (not run_applescript, not memory) whenever he says 'remind me to X', 'set/create a reminder to X', 'reminder to X' — especially with a time ('tomorrow at 3pm', 'in an hour', 'Friday morning'). Pass `text` = what to be reminded of, in his words, spelled correctly. Pass `due_iso` = the absolute LOCAL datetime as 'YYYY-MM-DDTHH:MM:SS' that YOU compute from his spoken time and today's date (e.g. he says 'tomorrow at 3' and today is 2026-06-14 → '2026-06-15T15:00:00'). If he gives no time at all, omit due_iso. Call this EXACTLY ONCE per request — never twice for the same reminder. Confirmation is SILENT: a '✓ Reminder' badge appears on his screen — say NOTHING ('set', 'done', etc.), just wait for his next words. NOTE: 'remember X' / 'add to my to-dos' is the separate `memory` tool (a passive list), NOT this.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "text": [
+                        "type": "STRING",
+                        "description": "What to be reminded of, in his words, correctly spelled. E.g. 'Call the vet about Bodhi'.",
+                    ],
+                    "due_iso": [
+                        "type": "STRING",
+                        "description": "Absolute local datetime 'YYYY-MM-DDTHH:MM:SS' computed from his spoken time + today's date. Omit entirely if he gave no time.",
+                    ],
+                ],
+                "required": ["text"],
             ],
         ],
         // ── SKU lookup (v16, 2026-06-04) ───────────────────────
@@ -1229,6 +1248,8 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             default:
                 return ["status": "error", "reason": "Unknown memory operation '\(op)'. Valid: remember, recall, forget, list."]
             }
+        case "create_reminder":
+            return await createReminder(args: args)
         case "lookup_sku":
             let q = (args["query"] as? String) ?? ""
             return await MainActor.run { MarinResearchTools.lookupSku(query: q) }
@@ -1644,6 +1665,101 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         } else {
             try? line.write(toFile: path, atomically: true, encoding: .utf8)
         }
+    }
+
+    // MARK: - create_reminder (v16qi, 2026-06-14)
+    //
+    // Dedicated, idempotent path to the macOS Reminders app — replaces
+    // Marin improvising raw AppleScript per request (which on 2026-06-14
+    // misspelled "Bodhi"→"Bodie", fired TWICE, and didn't set an alert
+    // time). Marin passes text + an absolute ISO datetime she computes;
+    // this builds the reminder with a real `remind me date` alert via
+    // component assignment (locale-safe, no date-string parsing) and
+    // de-dupes a double-fire within 8s.
+
+    private static let reminderLock = NSLock()
+    private static var lastReminderSig: (sig: String, at: Date)?
+
+    private func createReminder(args: [String: Any]) async -> [String: Any] {
+        let text = ((args["text"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else {
+            return ["status": "error", "reason": "Need reminder text."]
+        }
+        let dueISO = (args["due_iso"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        // De-dupe a model double-call (same text+time within 8s).
+        let sig = "\(text.lowercased())|\(dueISO)"
+        Self.reminderLock.lock()
+        if let last = Self.lastReminderSig, last.sig == sig, Date().timeIntervalSince(last.at) < 8 {
+            Self.reminderLock.unlock()
+            Self.logFillAction("create_reminder", "DEDUPE-SKIP text=\"\(text)\" due=\(dueISO)")
+            return ["status": "ok", "deduped": true,
+                    "note": "Already created moments ago — ignore, do NOT announce or create again."]
+        }
+        Self.lastReminderSig = (sig, Date())
+        Self.reminderLock.unlock()
+
+        // Parse the optional due time into calendar components.
+        var comps: DateComponents?
+        if !dueISO.isEmpty {
+            let df = DateFormatter()
+            df.locale = Locale(identifier: "en_US_POSIX")
+            df.timeZone = .current
+            for fmt in ["yyyy-MM-dd'T'HH:mm:ss", "yyyy-MM-dd'T'HH:mm",
+                        "yyyy-MM-dd HH:mm:ss", "yyyy-MM-dd HH:mm", "yyyy-MM-dd"] {
+                df.dateFormat = fmt
+                if let d = df.date(from: dueISO) {
+                    comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: d)
+                    break
+                }
+            }
+        }
+
+        // Escape for AppleScript string literal.
+        let safe = text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+
+        let script: String
+        if let c = comps, let y = c.year, let mo = c.month, let d = c.day {
+            // Set day to 1 before month to avoid month-length overflow.
+            script = """
+            set theDate to current date
+            set year of theDate to \(y)
+            set day of theDate to 1
+            set month of theDate to \(mo)
+            set day of theDate to \(d)
+            set hours of theDate to \(c.hour ?? 9)
+            set minutes of theDate to \(c.minute ?? 0)
+            set seconds of theDate to 0
+            tell application "Reminders" to make new reminder with properties {name:"\(safe)", remind me date:theDate}
+            """
+        } else {
+            script = "tell application \"Reminders\" to make new reminder with properties {name:\"\(safe)\"}"
+        }
+
+        let outcome: String = await MainActor.run {
+            var err: NSDictionary?
+            if let s = NSAppleScript(source: script) {
+                s.executeAndReturnError(&err)
+            } else {
+                return "could not compile reminder script"
+            }
+            if let err { return (err[NSAppleScript.errorMessage] as? String) ?? "\(err)" }
+            return "ok"
+        }
+        Self.logFillAction("create_reminder", "text=\"\(text)\" due=\(dueISO.isEmpty ? "none" : dueISO) result=\(outcome)")
+        if outcome != "ok" {
+            return ["status": "error", "reason": "Couldn't create the reminder: \(outcome)"]
+        }
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: MarinMemoryStore.memorySavedNotification, object: nil,
+                userInfo: ["label": "✓ Reminder"]
+            )
+        }
+        return ["status": "ok",
+                "note": "Reminder created in Apple Reminders\(dueISO.isEmpty ? "" : " for \(dueISO)"). Stay SILENT — the ✓ badge confirms it. Do not announce or repeat."]
     }
 
     /// Read the URL of the frontmost browser tab (Chrome, else Safari).
