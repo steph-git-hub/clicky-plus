@@ -222,10 +222,20 @@ actor MarinMemoryStore {
             return ["status": "error", "reason": "Could not write Marin Memory note: \(error.localizedDescription)"]
         }
 
-        // 4. Update the index incrementally. Best effort — the launch
-        // hash-sync self-heals any miss here.
-        await applyWriteToIndex(newLine: newLine, category: category, removedLine: replacedLine)
+        // 4. Update the index — OFF the critical path (v16qg, 2026-06-14).
+        // The note is the source of truth and is already written; the
+        // vector index is derived and the launch hash-sync self-heals any
+        // miss. Awaiting it here meant the tool didn't return until the
+        // on-device embedder finished — and on the FIRST save after a
+        // relaunch (embedder still cold) that hung Marin's turn: spinner
+        // stuck, and a quick follow-up save got dropped (Steph's missing
+        // "vet" to-do, 2026-06-14). Detach it so the tool returns the
+        // instant the note is written.
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.applyWriteToIndex(newLine: newLine, category: category, removedLine: replacedLine)
+        }
 
+        Self.logMemoryAction("remember", "category=\(category) engine=\(engine) action=\(replacedLine != nil ? "updated" : "added") line=\"\(memoryLine)\"")
         NotificationCenter.default.post(
             name: Self.memorySavedNotification, object: nil,
             userInfo: ["updated": replacedLine != nil]
@@ -239,8 +249,27 @@ actor MarinMemoryStore {
         ]
     }
 
+    /// v16qg (2026-06-14): action log for the memory tool. Like the fill
+    /// tools, `memory` wrote nothing — so when Marin claimed she saved a
+    /// to-do that never landed, there was no way to tell whether the tool
+    /// errored or Marin never called it. One line per op. If an op Marin
+    /// SAID she did has no line here, she hallucinated the tool call.
+    nonisolated static func logMemoryAction(_ op: String, _ detail: String) {
+        let dir = ("~/Library/Application Support/Clicky/action-log" as NSString).expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = (dir as NSString).appendingPathComponent("memory-actions.log")
+        let stamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(stamp)] \(op) \(detail)\n"
+        if let h = FileHandle(forWritingAtPath: path) {
+            h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+
     func recall(query: String) async -> [String: Any] {
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        Self.logMemoryAction("recall", "query=\"\(q)\"")
         guard !q.isEmpty else {
             return ["status": "error", "reason": "Empty query"]
         }
@@ -284,6 +313,7 @@ actor MarinMemoryStore {
         try? await db.deleteDocuments(ids: [target.id])
         sidecar.removeValue(forKey: target.id.uuidString)
         saveSidecar()
+        Self.logMemoryAction("forget", "removed=\"\(line)\"")
         NotificationCenter.default.post(
             name: Self.memorySavedNotification, object: nil,
             userInfo: ["label": "✓ Forgot"]
@@ -322,6 +352,7 @@ actor MarinMemoryStore {
         try? await db.deleteDocuments(ids: [target.id])
         sidecar.removeValue(forKey: target.id.uuidString)
         saveSidecar()
+        Self.logMemoryAction("complete", "checked=\"\(line)\"")
         NotificationCenter.default.post(
             name: Self.memorySavedNotification, object: nil,
             userInfo: ["label": "✓ Done"]
