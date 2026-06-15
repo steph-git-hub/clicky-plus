@@ -5686,12 +5686,38 @@ final class CompanionManager: ObservableObject {
     /// If AX says the field ends in whitespace, we trust it and
     /// skip — even if memory says we just pasted. This handles
     /// manual edits between pastes correctly.
+    /// v16qm (2026-06-14): strip hallucinated affirmative backchannels
+    /// ("mm-hmm", "mhm", "uh-huh") that STT engines — Scribe especially —
+    /// insert on breaths/background noise. Steph never dictates these
+    /// intentionally, so ANY occurrence is an artifact. Removes them as
+    /// standalone tokens and cleans up the comma/space they leave behind.
+    /// Conservative on purpose: only the AFFIRMATIVE backchannels — never
+    /// "uh-uh"/"mm-mm", which mean "no" and carry meaning.
+    static func stripBackchannelFillers(from text: String) -> String {
+        var out = text
+        // Remove the token plus any trailing comma/whitespace it arrives wrapped in.
+        out = out.replacingOccurrences(
+            of: "(?i)\\b(mm[-\\s]?hmm|mhm+|mmhmm|uh[-\\s]?huh)\\b[\\s,]*",
+            with: "", options: .regularExpression)
+        // Tidy the wreckage: leading commas/space, doubled spaces,
+        // space-before-punctuation, and doubled punctuation.
+        out = out.replacingOccurrences(of: "(?i)^[\\s,]+", with: "", options: .regularExpression)
+        out = out.replacingOccurrences(of: "\\s{2,}", with: " ", options: .regularExpression)
+        out = out.replacingOccurrences(of: "\\s+([,.!?])", with: "$1", options: .regularExpression)
+        out = out.replacingOccurrences(of: "([,.!?])\\1+", with: "$1", options: .regularExpression)
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private func pasteVoiceToTextTranscript(
         _ transcript: String,
         polishAfterRepunctuate: Bool = false,
         contextScreenshot: CompanionScreenCapture? = nil
     ) {
-        let trimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawTrimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        // v16qm: drop hallucinated "mm-hmm"/"mhm"/"uh-huh" before any
+        // downstream processing (hold, toggle, repunctuate all see the
+        // cleaned text). Runs on every VTT provider, not just Scribe.
+        let trimmed = Self.stripBackchannelFillers(from: rawTrimmed)
         guard !trimmed.isEmpty else {
             voiceState = .idle
             scheduleTransientHideIfNeeded()
