@@ -7830,17 +7830,27 @@ final class CompanionManager: ObservableObject {
                     labeledImages.append((data: frame.imageData, label: label))
                 }
 
-                // v16qs (2026-06-17): send ONLY the active screen (the one the
-                // cursor is on), like Marin. Base PTT used to map ALL screenCaptures
-                // into the baseline, so Claude narrated every monitor. Fall back to
-                // all screens only if the cursor screen can't be identified, so we
-                // never send zero baseline frames.
-                let cursorScreenCaptures = screenCaptures.filter { $0.isCursorScreen }
-                let baselineSource = cursorScreenCaptures.isEmpty ? screenCaptures : cursorScreenCaptures
-                let baselineImages = baselineSource.map { capture -> (data: Data, label: String) in
-                    let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
+                // v16qt (2026-06-17): mirror Marin exactly — capture only the ACTIVE
+                // WINDOW (the focused window under the cursor), not the whole screen.
+                // captureActiveScreenAsJPEG hit-tests the cursor against the window
+                // z-order and crops to that window (falling back to the active display
+                // if no window is found), so a split-screen no longer sends both halves.
+                // If the active-window grab fails, fall back to the cursor-screen capture
+                // so we never send zero baseline frames.
+                let activeWindowCapture = try? await CompanionScreenCaptureUtility.captureActiveScreenAsJPEG()
+                let baselineImages: [(data: Data, label: String)]
+                if let active = activeWindowCapture {
+                    let dimensionInfo = " (image dimensions: \(active.screenshotWidthInPixels)x\(active.screenshotHeightInPixels) pixels)"
                     let prefix = dedupedClickFrames.isEmpty ? "" : "final baseline — "
-                    return (data: capture.imageData, label: prefix + capture.label + dimensionInfo)
+                    baselineImages = [(data: active.imageData, label: prefix + active.label + dimensionInfo)]
+                } else {
+                    let cursorScreenCaptures = screenCaptures.filter { $0.isCursorScreen }
+                    let baselineSource = cursorScreenCaptures.isEmpty ? screenCaptures : cursorScreenCaptures
+                    baselineImages = baselineSource.map { capture -> (data: Data, label: String) in
+                        let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
+                        let prefix = dedupedClickFrames.isEmpty ? "" : "final baseline — "
+                        return (data: capture.imageData, label: prefix + capture.label + dimensionInfo)
+                    }
                 }
                 labeledImages.append(contentsOf: baselineImages)
 
@@ -7850,11 +7860,11 @@ final class CompanionManager: ObservableObject {
                 // sent the full (downscaled) all-screens view, so Claude
                 // couldn't read fine detail like Marin can. Mirrors Marin's
                 // sendVisionContent fovea pipeline.
-                if let cursorCapture = screenCaptures.first(where: { $0.isCursorScreen }),
-                   let cg = cursorCapture.cgImage,
+                if let foveaSource = activeWindowCapture ?? screenCaptures.first(where: { $0.isCursorScreen }),
+                   let cg = foveaSource.cgImage,
                    let crop = CursorFoveaCropper.cropAroundCursor(
                        sourceImage: cg,
-                       cursorInImagePixels: cursorCapture.cursorPositionInImagePixels) {
+                       cursorInImagePixels: foveaSource.cursorPositionInImagePixels) {
                     let cx = Int(crop.cursorInCropPixels.x.rounded())
                     let cy = Int(crop.cursorInCropPixels.y.rounded())
                     labeledImages.append((
