@@ -7789,18 +7789,6 @@ final class CompanionManager: ObservableObject {
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
-            // v16qp: safety net — if the pipeline blocks (Claude hang, TTS
-            // never plays), force the spinner off after 25s so it can't
-            // stick forever, and log that it fired.
-            let spinnerWatchdog = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 25_000_000_000)
-                guard let self, !Task.isCancelled else { return }
-                if self.voiceState == .processing {
-                    Self.logBasePTT("WATCHDOG fired — still .processing after 25s; forcing idle")
-                    self.voiceState = .idle
-                }
-            }
-            defer { spinnerWatchdog.cancel() }
 
             // v12r: snapshot the click-capture buffer at the START of
             // the send so any late-arriving post-frames after this point
@@ -7848,6 +7836,25 @@ final class CompanionManager: ObservableObject {
                     return (data: capture.imageData, label: prefix + capture.label + dimensionInfo)
                 }
                 labeledImages.append(contentsOf: baselineImages)
+
+                // v16qp (2026-06-17): Marin-grade vision. Add a high-detail
+                // FOVEA CROP around the cursor — the sharp tile of the screen
+                // Steph is actually working on. Without this, base PTT only
+                // sent the full (downscaled) all-screens view, so Claude
+                // couldn't read fine detail like Marin can. Mirrors Marin's
+                // sendVisionContent fovea pipeline.
+                if let cursorCapture = screenCaptures.first(where: { $0.isCursorScreen }),
+                   let cg = cursorCapture.cgImage,
+                   let crop = CursorFoveaCropper.cropAroundCursor(
+                       sourceImage: cg,
+                       cursorInImagePixels: cursorCapture.cursorPositionInImagePixels) {
+                    let cx = Int(crop.cursorInCropPixels.x.rounded())
+                    let cy = Int(crop.cursorInCropPixels.y.rounded())
+                    labeledImages.append((
+                        data: crop.jpegData,
+                        label: "high-detail crop around the cursor (\(crop.widthInPixels)x\(crop.heightInPixels) pixels) — trust this as the sharp source for fine detail near the cursor; cursor is at pixel (\(cx),\(cy)) within this crop"
+                    ))
+                }
 
                 if !dedupedClickFrames.isEmpty {
                     print("📸 Voice mode → Claude: \(dedupedClickFrames.count) click frame(s) + \(baselineImages.count) baseline screen(s)")

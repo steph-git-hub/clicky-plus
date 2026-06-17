@@ -287,7 +287,12 @@ struct BlueCursorView: View {
             return .listening
         case .processing:
             return .processing
-        case .idle, .responding:
+        case .responding:
+            // v16qp (2026-06-17): show the halo (listening-style pulse)
+            // while Clicky is SPEAKING, so Steph can see she's talking even
+            // with the volume down. Was a bare dot (.idle), no halo.
+            return .listening
+        case .idle:
             return .idle
         }
     }
