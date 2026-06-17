@@ -837,7 +837,8 @@ struct BlueCursorView: View {
             BlueCursorWaveformView(
                 audioPowerLevel: indicatorAudioPowerLevel,
                 tint: currentCursorTint,
-                captureTrigger: companionManager.lastScreenshotCaptureAt
+                captureTrigger: companionManager.lastScreenshotCaptureAt,
+                isActive: buddyIsVisibleOnThisScreen && isListeningForIndicator && !selfContainedStyleActive
             )
                 // v15g: hide waveform when any self-contained indicator
                 // style is selected (cursorDot, bottomEdgeLine, sideStrip).
@@ -862,7 +863,8 @@ struct BlueCursorView: View {
             // Spinner — shown while the AI is processing (transcription + Claude + waiting for TTS).
             // Same mode-aware tint as the waveform above.
             BlueCursorSpinnerView(
-                tint: currentCursorTint
+                tint: currentCursorTint,
+                isActive: buddyIsVisibleOnThisScreen && isProcessingForIndicator && !selfContainedStyleActive
             )
                 // v15g: hide spinner when any self-contained indicator
                 // style is selected. Each handles its own processing visual.
@@ -1443,12 +1445,21 @@ private struct CursorPresenceDot: View {
                     .rotationEffect(.degrees(processingSpin))
             )
             .allowsHitTesting(false)
-        .onAppear {
-            // v15h: idle is now SOLID (no pulse). Spin animation only used
-            // when in .processing state but kept always-on so transitioning
-            // into processing has the ring already moving smoothly.
-            withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
-                processingSpin = 360
+        .onChange(of: mode) { _, newMode in
+            // v16qr (2026-06-17): only SPIN while processing. Previously the
+            // repeatForever ran in .onAppear and was "kept always-on" — but the
+            // ring is invisible at idle (opacity 0), so the perpetually-mutating
+            // rotationEffect just forced the always-mounted cursor view to
+            // recomposite 60fps forever (a top driver of the idle CPU/WindowServer
+            // pin that froze the machine). Start the spin on entering processing,
+            // freeze it otherwise. Visually identical (ring hidden when not spinning).
+            if newMode == .processing {
+                processingSpin = 0
+                withAnimation(.linear(duration: 1.2).repeatForever(autoreverses: false)) {
+                    processingSpin = 360
+                }
+            } else {
+                withAnimation(.linear(duration: 0.01)) { processingSpin = 0 }
             }
         }
         .animation(.spring(response: 0.18, dampingFraction: 0.65), value: dotDiameter)
@@ -1554,7 +1565,14 @@ private struct CursorDotWithSonarRing: View {
         // per-frame clock; we derive the spin angle from that clock so the
         // ring rotates smoothly. The single-draw concentricity from v15p4cq is
         // preserved — all shapes still draw from one shared center point.
-        TimelineView(.animation) { timeline in
+        // v16qr (2026-06-17): PAUSE the per-frame clock unless the spinning
+        // processing ring is actually drawing. The dot & sonar are input-driven
+        // (.animation(value:) modifiers re-run the Canvas on change), so the only
+        // thing needing a 60fps clock is mode == .processing. Without this gate
+        // the always-on cursor dot repainted a STATIC dot 60x/sec forever —
+        // ~33% CPU + 80% WindowServer at idle, which stacked into full-system
+        // freezes. paused:true at idle/listening drops the dot's redraws to zero.
+        TimelineView(.animation(paused: mode != .processing)) { timeline in
             Canvas { context, size in
                 let center = CGPoint(x: size.width / 2, y: size.height / 2)
 
@@ -1742,13 +1760,21 @@ private struct EdgeLineIndicator: View {
         .allowsHitTesting(false)
         .animation(.easeInOut(duration: 0.18), value: mode)
         .animation(.spring(response: 0.18, dampingFraction: 0.7), value: audioPowerLevel)
-        .onAppear {
-            // v15h: idle is solid — only kick off the processing-state
-            // animation. (Idle no longer pulses per Steph's call.)
-            withAnimation(
-                .easeInOut(duration: processingPulseDuration).repeatForever(autoreverses: true)
-            ) {
-                processingPulse = true
+        .onChange(of: mode) { _, newMode in
+            // v16qr (2026-06-17): only pulse while processing. Both edge-line
+            // indicators (bottom + side) stay mounted at idle (opacity-cross-faded),
+            // so a repeatForever started in .onAppear animated processingPulse
+            // 60fps FOREVER even when invisible — a top idle-redraw source behind
+            // the system freeze. Start on entering processing, freeze otherwise.
+            if newMode == .processing {
+                processingPulse = false
+                withAnimation(
+                    .easeInOut(duration: processingPulseDuration).repeatForever(autoreverses: true)
+                ) {
+                    processingPulse = true
+                }
+            } else {
+                withAnimation(.linear(duration: 0.01)) { processingPulse = false }
             }
         }
     }
@@ -1890,6 +1916,10 @@ private struct BlueCursorWaveformView: View {
     /// rings that read as "ping" rather than "flash" — better for rapid
     /// click-to-capture cadences where the previous flash was too noisy.
     var captureTrigger: Date? = nil
+    /// v16qr (2026-06-17): when false (idle / invisible / a self-contained style
+    /// is active) the per-frame TimelineView clock is paused so this always-mounted
+    /// (opacity-cross-faded) waveform stops repainting 60fps at idle.
+    var isActive: Bool = false
 
     @State private var sonarRings: [SonarRingState] = []
 
@@ -1906,7 +1936,7 @@ private struct BlueCursorWaveformView: View {
     private let ringLineWidth: CGFloat = 1.5
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timelineContext in
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: !isActive)) { timelineContext in
             ZStack {
                 // Sonar rings — drawn behind the audio bars so they never
                 // wash out the waveform. .allowsHitTesting(false) on each
@@ -2048,6 +2078,10 @@ private struct IdeaCapturedToast: View {
 private struct BlueCursorSpinnerView: View {
     @State private var isSpinning = false
     var tint: Color = DS.Colors.overlayCursorBlue
+    /// v16qr (2026-06-17): only spin while actually processing. The spinner stays
+    /// mounted at idle (opacity-cross-faded), so the old .onAppear repeatForever
+    /// spun the (invisible) ring forever — an idle-redraw source behind the freeze.
+    var isActive: Bool = false
 
     var body: some View {
         Circle()
@@ -2065,9 +2099,14 @@ private struct BlueCursorSpinnerView: View {
             .frame(width: 14, height: 14)
             .rotationEffect(.degrees(isSpinning ? 360 : 0))
             .shadow(color: tint.opacity(0.6), radius: 6, x: 0, y: 0)
-            .onAppear {
-                withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) {
-                    isSpinning = true
+            .onChange(of: isActive) { _, nowActive in
+                if nowActive {
+                    isSpinning = false
+                    withAnimation(.linear(duration: 0.8).repeatForever(autoreverses: false)) {
+                        isSpinning = true
+                    }
+                } else {
+                    withAnimation(.linear(duration: 0.01)) { isSpinning = false }
                 }
             }
     }
