@@ -1758,11 +1758,15 @@ final class CompanionManager: ObservableObject {
         // repurpose below). The publisher name (shortcutTransition…)
         // is historical; it still fires on Fn+Opt — only the handler
         // changes.
+        // v16qo (2026-06-14): Steph's hotkey remap. The Fn+Opt chord
+        // (shortcutTransitionPublisher) now drives TYPING mode (moved off
+        // Cmd+Fn). Watch moves to Fn+Shift+Opt (burst chord) below; Base
+        // PTT takes the freed Cmd+Fn chord (typing publisher) below.
         shortcutTransitionCancellable = globalPushToTalkShortcutMonitor
             .shortcutTransitionPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] transition in
-                self?.handleVideoWatchTransition(transition)
+                self?.handleTypingTransition(transition)
             }
 
         // v15p3hx (2026-05-19): Fn+Shift+Opt (burst chord) RETIRED.
@@ -1770,15 +1774,25 @@ final class CompanionManager: ObservableObject {
         // alongside Deepgram and Parakeet — Fn+Ctrl is the single VTT
         // hotkey, the active provider follows the picker. The chord
         // itself is freed up for a future repurpose.
-        // burstTransitionCancellable left unbound — handleBurstTransition
-        // is gated on isBurstModeEnabled = false so it's a no-op even
-        // if some future code path resubscribes accidentally.
+        // v16qo (2026-06-14): Fn+Shift+Opt (burst chord) now drives
+        // WATCH mode (moved off Fn+Opt). The burst chord was retired/no-op
+        // before this.
+        burstTransitionCancellable = globalPushToTalkShortcutMonitor
+            .burstTransitionPublisher
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] transition in
+                self?.handleVideoWatchTransition(transition)
+            }
 
+        // v16qo (2026-06-14): Cmd+Fn (typing chord) now drives BASE PTT —
+        // the Claude voice/vision conversation (handleShortcutTransition,
+        // which is where Claude Vision Phase 1 lives). Typing moved to
+        // Fn+Opt above. This is what finally binds Base PTT to a hotkey.
         typingTransitionCancellable = globalPushToTalkShortcutMonitor
             .typingTransitionPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] transition in
-                self?.handleTypingTransition(transition)
+                self?.handleShortcutTransition(transition)
             }
 
         // v15p3bw (2026-05-13): voiceToTextTransitionPublisher (Fn+Ctrl)
@@ -1835,12 +1849,14 @@ final class CompanionManager: ObservableObject {
             .sink { [weak self] in
                 self?.handleVoiceToTextDoubleTapEngage()
             }
+        // v16qo (2026-06-14): double-tap Cmd no longer engages the typing
+        // toggle (typing moved off Cmd to Fn+Opt; Steph doesn't want a
+        // typing toggle). Left as a no-op for now — it becomes the Base
+        // PTT hands-free toggle when Phase 2 (continuous Claude convo) ships.
         commandDoubleTapCancellable = globalPushToTalkShortcutMonitor
             .commandDoubleTapPublisher
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] in
-                self?.handleTypingDoubleTapEngage()
-            }
+            .sink { _ in }
         // v15p2 (2026-05-02): hotkey swap — Option double-tap now
         // engages Realtime hands-free instead of Base voice-mode.
         // Base voice-mode moved to Fn+Shift+Opt (handled below).
@@ -1863,12 +1879,12 @@ final class CompanionManager: ObservableObject {
             .sink { [weak self] in
                 self?.handleVoiceToTextSingleTapDisengage()
             }
+        // v16qo: typing single-tap disengage removed from Cmd (typing moved
+        // off Cmd; no typing toggle). No-op for now.
         commandSingleTapCancellable = globalPushToTalkShortcutMonitor
             .commandSingleTapPublisher
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] in
-                self?.handleTypingSingleTapDisengage()
-            }
+            .sink { _ in }
         // v15p2 (2026-05-02): single-tap Option mirrors the swap —
         // disengages Realtime hands-free instead of Base voice-mode.
         optionSingleTapCancellable = globalPushToTalkShortcutMonitor
