@@ -471,10 +471,10 @@ struct BlueCursorView: View {
         // The active-mode flag is still isVoiceToTextDeepgramModeActive
         // because the hotkey wiring hasn't been renamed.
         if companionManager.isVoiceToTextDeepgramModeActive {
-            switch companionManager.selectedVTTProvider {
-            case "scribe": return DS.Colors.overlayCursorOrange
-            default: return DS.Colors.overlayCursorCyan
-            }
+            // v16qp (2026-06-17): Scribe won the bake-off — drop the orange
+            // differentiator and use the same teal/cyan as the live-preview
+            // text box for all VTT providers.
+            return DS.Colors.overlayCursorCyan
         }
         if companionManager.isBurstModeActive || companionManager.isBurstResponseCycleInFlight {
             // v15p3fq (2026-05-17): burst mode is functionally retired

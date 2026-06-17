@@ -7769,13 +7769,38 @@ final class CompanionManager: ObservableObject {
     /// the spinner/processing state until TTS audio begins playing.
     /// Claude's response may include a [POINT:x,y:label] tag which triggers
     /// the buddy to fly to that element on screen.
+    /// v16qp (2026-06-17): base-PTT diagnostic log. Writes pipeline
+    /// milestones to action-log/base-ptt.log so a stuck-spinner hang is
+    /// diagnosable without a terminal launch (which breaks TCC perms).
+    nonisolated static func logBasePTT(_ msg: String) {
+        let dir = ("~/Library/Application Support/Clicky/action-log" as NSString).expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = (dir as NSString).appendingPathComponent("base-ptt.log")
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(msg)\n"
+        if let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
+        else { try? line.write(toFile: path, atomically: true, encoding: .utf8) }
+    }
+
     private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
         ttsClient.stopPlayback()
 
+        Self.logBasePTT("START transcript=\"\(transcript.prefix(60))\"")
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
             voiceState = .processing
+            // v16qp: safety net — if the pipeline blocks (Claude hang, TTS
+            // never plays), force the spinner off after 25s so it can't
+            // stick forever, and log that it fired.
+            let spinnerWatchdog = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 25_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                if self.voiceState == .processing {
+                    Self.logBasePTT("WATCHDOG fired — still .processing after 25s; forcing idle")
+                    self.voiceState = .idle
+                }
+            }
+            defer { spinnerWatchdog.cancel() }
 
             // v12r: snapshot the click-capture buffer at the START of
             // the send so any late-arriving post-frames after this point
@@ -7956,9 +7981,11 @@ final class CompanionManager: ObservableObject {
 
                 guard !Task.isCancelled else { return }
 
+                Self.logBasePTT("CLAUDE_RETURNED len=\(fullResponseText.count)")
                 // Parse the [POINT:...] tag from Claude's response
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
+                Self.logBasePTT("SPOKEN len=\(spokenText.count) preview=\"\(spokenText.prefix(40))\"")
 
                 // Handle element pointing if Claude returned coordinates.
                 // Switch to idle BEFORE setting the location so the triangle
@@ -8078,6 +8105,7 @@ final class CompanionManager: ObservableObject {
                 //     synthesizeAudio/playAudio split.
                 if !spokenText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     do {
+                        Self.logBasePTT("TTS_PATH voicebox=\(voiceboxClient != nil) cont=\(streamingState.taskContinuation != nil) loop=\(streamingState.playerLoopTask != nil)")
                         if let voiceboxClient,
                            let taskContinuation = streamingState.taskContinuation,
                            let playerLoopTask = streamingState.playerLoopTask {
@@ -8127,6 +8155,7 @@ final class CompanionManager: ObservableObject {
                             // Interrupted by another interaction — stay silent
                             return
                         }
+                        Self.logBasePTT("ERROR(tts): \((error as NSError).localizedDescription)")
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
                         print("⚠️ TTS error (streaming): \(error)")
                         speakCreditsErrorFallback(error: error)
@@ -8139,11 +8168,13 @@ final class CompanionManager: ObservableObject {
                     // Interrupted by another interaction — stay silent
                     return
                 }
+                Self.logBasePTT("ERROR(response): \((error as NSError).localizedDescription)")
                 ClickyAnalytics.trackResponseError(error: error.localizedDescription)
                 print("⚠️ Companion response error: \(error)")
                 speakCreditsErrorFallback(error: error)
             }
 
+            Self.logBasePTT("REACHED_END cancelled=\(Task.isCancelled)")
             if !Task.isCancelled {
                 voiceState = .idle
                 scheduleTransientHideIfNeeded()
