@@ -7830,7 +7830,14 @@ final class CompanionManager: ObservableObject {
                     labeledImages.append((data: frame.imageData, label: label))
                 }
 
-                let baselineImages = screenCaptures.map { capture -> (data: Data, label: String) in
+                // v16qs (2026-06-17): send ONLY the active screen (the one the
+                // cursor is on), like Marin. Base PTT used to map ALL screenCaptures
+                // into the baseline, so Claude narrated every monitor. Fall back to
+                // all screens only if the cursor screen can't be identified, so we
+                // never send zero baseline frames.
+                let cursorScreenCaptures = screenCaptures.filter { $0.isCursorScreen }
+                let baselineSource = cursorScreenCaptures.isEmpty ? screenCaptures : cursorScreenCaptures
+                let baselineImages = baselineSource.map { capture -> (data: Data, label: String) in
                     let dimensionInfo = " (image dimensions: \(capture.screenshotWidthInPixels)x\(capture.screenshotHeightInPixels) pixels)"
                     let prefix = dedupedClickFrames.isEmpty ? "" : "final baseline — "
                     return (data: capture.imageData, label: prefix + capture.label + dimensionInfo)
