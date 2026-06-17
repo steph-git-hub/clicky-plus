@@ -28,7 +28,18 @@ enum CompanionVoiceState {
 struct ConversationEntry: Codable {
     let userTranscript: String
     let assistantResponse: String
+    /// v16qn (2026-06-14): screenshot(s) Claude saw on this turn, kept in
+    /// memory so Claude can SEE recent screens (Claude Vision Phase 1),
+    /// not just read a text placeholder. EXCLUDED from Codable on purpose
+    /// — disk history stays small and visual memory is a within-session
+    /// thing (resets on app restart, which is fine for a conversation).
+    var screenshots: [Data] = []
+    enum CodingKeys: String, CodingKey { case userTranscript, assistantResponse }
 }
+
+/// v16qn: how many of the most-recent turns carry their screenshots into
+/// Claude's context. Bounds tokens/cost; older turns stay text-only.
+private let claudeVisualMemoryTurns = 3
 
 // MARK: - Clicky Transcript Log (v11y, 2026-04-27)
 //
@@ -2368,11 +2379,20 @@ final class CompanionManager: ObservableObject {
                 let historyForAPI = conversationHistory.map { entry in
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
+                // v16qn: carry the last few turns' screenshots into context
+                // so Claude SEES recent screens (Claude Vision Phase 1).
+                let historyImages: [[Data]] = {
+                    let n = conversationHistory.count
+                    return conversationHistory.enumerated().map { idx, entry in
+                        idx >= n - claudeVisualMemoryTurns ? entry.screenshots : []
+                    }
+                }()
 
                 let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
                     images: labeledImages,
                     systemPrompt: Self.burstModeSystemPrompt,
                     conversationHistory: historyForAPI,
+                    historyImages: historyImages,
                     userPrompt: transcript,
                     personalFacts: Self.loadCurrentObsidianMemoryContents(),
                     onTextChunk: { _ in }
@@ -2383,9 +2403,13 @@ final class CompanionManager: ObservableObject {
                 let parseResult = Self.parsePointingCoordinates(from: fullResponseText)
                 let spokenText = parseResult.spokenText
 
+                // v16qn: keep the most recent burst frame so Claude can
+                // recall this view on later turns (Claude Vision Phase 1).
+                let burstMemoryShot = frames.last?.imageData
                 conversationHistory.append(ConversationEntry(
                     userTranscript: transcript,
-                    assistantResponse: spokenText
+                    assistantResponse: spokenText,
+                    screenshots: burstMemoryShot.map { [$0] } ?? []
                 ))
                 if conversationHistory.count > 30 {
                     conversationHistory.removeFirst(conversationHistory.count - 30)
@@ -7792,6 +7816,14 @@ final class CompanionManager: ObservableObject {
                 let historyForAPI = conversationHistory.map { entry in
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
+                // v16qn: attach the last few turns' screenshots so Claude
+                // SEES recent screens, not just text (Claude Vision Phase 1).
+                let historyImages: [[Data]] = {
+                    let n = conversationHistory.count
+                    return conversationHistory.enumerated().map { idx, entry in
+                        idx >= n - claudeVisualMemoryTurns ? entry.screenshots : []
+                    }
+                }()
 
 
                 // Streaming TTS (v11j): per-sentence chunking with a
@@ -7866,6 +7898,7 @@ final class CompanionManager: ObservableObject {
                     images: labeledImages,
                     systemPrompt: Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
+                    historyImages: historyImages,
                     userPrompt: transcript,
                     personalFacts: Self.loadCurrentObsidianMemoryContents(),
                     onTextChunk: { [weak voiceboxClient] chunk in
@@ -7968,9 +8001,14 @@ final class CompanionManager: ObservableObject {
 
                 // Save this exchange to conversation history (with the point tag
                 // stripped so it doesn't confuse future context)
+                // v16qn: store the cursor screen so Claude can recall this
+                // view on later turns (Claude Vision Phase 1).
+                let memoryShot = (screenCaptures.first(where: { $0.isCursorScreen })
+                    ?? screenCaptures.first)?.imageData
                 conversationHistory.append(ConversationEntry(
                     userTranscript: transcript,
-                    assistantResponse: spokenText
+                    assistantResponse: spokenText,
+                    screenshots: memoryShot.map { [$0] } ?? []
                 ))
 
                 // Keep only the last 30 exchanges to avoid unbounded context growth

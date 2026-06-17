@@ -109,6 +109,7 @@ class ClaudeAPI {
         images: [(data: Data, label: String)],
         systemPrompt: String,
         conversationHistory: [(userPlaceholder: String, assistantResponse: String)] = [],
+        historyImages: [[Data]] = [],
         userPrompt: String,
         personalFacts: String? = nil,
         onTextChunk: @MainActor @Sendable (String) -> Void
@@ -120,9 +121,31 @@ class ClaudeAPI {
         // Build messages array
         var messages: [[String: Any]] = []
 
-        for (userPlaceholder, assistantResponse) in conversationHistory {
-            messages.append(["role": "user", "content": userPlaceholder])
-            messages.append(["role": "assistant", "content": assistantResponse])
+        // v16qn (2026-06-14): Claude Vision Phase 1 — past user turns can
+        // now carry their screenshots, not just text. `historyImages[i]`
+        // (when non-empty) are the screens for conversationHistory[i]'s
+        // user turn, so Claude SEES recent screens instead of only reading
+        // a text placeholder. Empty → text-only (prior behavior). The
+        // caller only populates the last few turns to bound tokens.
+        for (idx, pair) in conversationHistory.enumerated() {
+            let turnImages = idx < historyImages.count ? historyImages[idx] : []
+            if turnImages.isEmpty {
+                messages.append(["role": "user", "content": pair.userPlaceholder])
+            } else {
+                var blocks: [[String: Any]] = turnImages.map { data in
+                    [
+                        "type": "image",
+                        "source": [
+                            "type": "base64",
+                            "media_type": detectImageMediaType(for: data),
+                            "data": data.base64EncodedString()
+                        ]
+                    ]
+                }
+                blocks.append(["type": "text", "text": pair.userPlaceholder])
+                messages.append(["role": "user", "content": blocks])
+            }
+            messages.append(["role": "assistant", "content": pair.assistantResponse])
         }
 
         // Build current message with all labeled images + prompt
