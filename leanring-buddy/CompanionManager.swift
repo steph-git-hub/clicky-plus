@@ -894,6 +894,10 @@ final class CompanionManager: ObservableObject {
     /// Mutually exclusive — only one can be true at a time.
     private var isVoiceToTextToggleLocked: Bool = false
     private var isTypingToggleLocked: Bool = false
+    /// v16qw: set when the user double-taps Ctrl WHILE the VTT lock is active —
+    /// disengage and run the heavier FULL polish (Sonnet) instead of the lighter
+    /// toggle polish (Haiku rewrite). Read + reset in the VTT submit closure.
+    private var requestFullPolishOnDisengage: Bool = false
     /// v12s: hands-free base voice mode engaged via double-tap Option.
     /// While true, click-to-capture is armed and the user can click freely
     /// (no modifiers held → clicks work normally). Single-tap Opt or Esc
@@ -3042,10 +3046,14 @@ final class CompanionManager: ObservableObject {
                         let toggleScreenshot = self.vttToggleEngagementScreenshot
                         self.vttToggleEngagementScreenshot = nil
                         let gesturePolish = self.globalPushToTalkShortcutMonitor.vttReleaseToPolishLatched
+                        // v16qw: double-tap-Ctrl disengage requests the heavier full polish.
+                        let fullPolish = self.requestFullPolishOnDisengage
+                        self.requestFullPolishOnDisengage = false
                         self.pasteVoiceToTextTranscript(
                             finalTranscript,
-                            polishAfterRepunctuate: isToggleSession || gesturePolish,
-                            contextScreenshot: toggleScreenshot
+                            polishAfterRepunctuate: isToggleSession || gesturePolish || fullPolish,
+                            contextScreenshot: toggleScreenshot,
+                            fullPolish: fullPolish
                         )
                     }
                 )
@@ -3165,10 +3173,14 @@ final class CompanionManager: ObservableObject {
                         // fired during this hold (one key released + kept
                         // talking), polish even though it's a hold session.
                         let gesturePolish = self.globalPushToTalkShortcutMonitor.vttReleaseToPolishLatched
+                        // v16qw: double-tap-Ctrl disengage requests the heavier full polish.
+                        let fullPolish = self.requestFullPolishOnDisengage
+                        self.requestFullPolishOnDisengage = false
                         self.pasteVoiceToTextTranscript(
                             finalTranscript,
-                            polishAfterRepunctuate: isToggleSession || gesturePolish,
-                            contextScreenshot: toggleScreenshot
+                            polishAfterRepunctuate: isToggleSession || gesturePolish || fullPolish,
+                            contextScreenshot: toggleScreenshot,
+                            fullPolish: fullPolish
                         )
                     },
                     overrideTranscriptionProvider: self.activeVTTProvider
@@ -3490,7 +3502,15 @@ final class CompanionManager: ObservableObject {
     /// Double-tap Ctrl alone → engage VTT lock. If already locked, no-op
     /// (single-tap is the disengage path now). If typing is locked, swap.
     private func handleVoiceToTextDoubleTapEngage() {
-        guard !isVoiceToTextToggleLocked else { return }
+        guard !isVoiceToTextToggleLocked else {
+            // v16qw: double-tap Ctrl WHILE locked → disengage with FULL polish
+            // (single-tap disengages with the lighter toggle polish).
+            print("🔒 VTT toggle: disengaging (double-tap Ctrl) — FULL polish")
+            requestFullPolishOnDisengage = true
+            disengageVoiceToTextToggle()
+            return
+        }
+        requestFullPolishOnDisengage = false  // fresh session — clear any stale flag
         print("🔒 VTT toggle: engaging (double-tap Ctrl) — provider=Deepgram")
         if isTypingToggleLocked {
             disengageTypingToggle()
@@ -5751,7 +5771,8 @@ final class CompanionManager: ObservableObject {
     private func pasteVoiceToTextTranscript(
         _ transcript: String,
         polishAfterRepunctuate: Bool = false,
-        contextScreenshot: CompanionScreenCapture? = nil
+        contextScreenshot: CompanionScreenCapture? = nil,
+        fullPolish: Bool = false
     ) {
         let rawTrimmed = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         // v16qm: drop hallucinated "mm-hmm"/"mhm"/"uh-huh" before any
@@ -5883,6 +5904,8 @@ final class CompanionManager: ObservableObject {
                     // is tone-matching > strict list-formatting fidelity.
                     // Polish prompt simplified to be less aggressive, so the
                     // image's tone-bias should now help (not hurt).
+                    // v16qw: double-tap-Ctrl disengage → FULL polish (Sonnet default,
+                    // no "rewrite" cap). Single-tap stays light (Haiku rewrite).
                     let polished = try await Self.sendPolishCommandToWorker(
                         workerBaseURL: workerBaseURL,
                         fieldText: punctuatedText,
@@ -5891,11 +5914,11 @@ final class CompanionManager: ObservableObject {
                         role: focusedContext?.role,
                         windowTitle: focusedContext?.windowTitle,
                         personalFacts: Self.loadCurrentObsidianMemoryContents(),
-                        modelOverride: "claude-haiku-4-5-20251001",
-                        polishStyle: "rewrite",
+                        modelOverride: fullPolish ? nil : "claude-haiku-4-5-20251001",
+                        polishStyle: fullPolish ? nil : "rewrite",
                         contextImageJPEG: contextScreenshot?.imageData
                     )
-                    print("✨ VTT polish (Haiku, smart, vision=\(contextScreenshot != nil)): \(punctuatedText.count) → \(polished.count) chars")
+                    print("✨ VTT polish (\(fullPolish ? "FULL/Sonnet" : "Haiku rewrite"), vision=\(contextScreenshot != nil)): \(punctuatedText.count) → \(polished.count) chars")
                     textToFormat = polished
                     pipelineStatus = "ok"
                 } catch {
