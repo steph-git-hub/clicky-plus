@@ -6740,7 +6740,11 @@ final class CompanionManager: ObservableObject {
             ("semicolon", ";"),
             ("colon", ":"),
             ("comma", ","),
-            ("period", "."),
+            // ("period", ".") removed v16qy (2026-06-18) — Steph never dictates
+            // "period" as punctuation but talks about time "periods" constantly
+            // (forecasting), so the literal word must survive. Sentence-ending
+            // periods still come from the grammar-based repunctuate pass, so no
+            // real punctuation is lost.
         ]
 
         var workingTranscript = transcript
