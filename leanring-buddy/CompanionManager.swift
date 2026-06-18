@@ -5904,12 +5904,16 @@ final class CompanionManager: ObservableObject {
                     // is tone-matching > strict list-formatting fidelity.
                     // Polish prompt simplified to be less aggressive, so the
                     // image's tone-bias should now help (not hurt).
-                    // v16qw: double-tap-Ctrl disengage → FULL polish (Sonnet default,
-                    // no "rewrite" cap). Single-tap stays light (Haiku rewrite).
+                    // v16qx: double-tap-Ctrl disengage → the worker's dedicated FULL
+                    // POLISH mode (substantive editor pass: reorders, consolidates,
+                    // sharpens). Triggered by the "full polish" modifier phrase — the
+                    // SAME mode as the spoken "full polish" modifier on the polish hotkey,
+                    // and heavier than both the hotkey tap ("preserve") and the single-tap
+                    // toggle polish ("rewrite"/Haiku). Single-tap keeps the light toggle polish.
                     let polished = try await Self.sendPolishCommandToWorker(
                         workerBaseURL: workerBaseURL,
                         fieldText: punctuatedText,
-                        modifier: nil,
+                        modifier: fullPolish ? "full polish" : nil,
                         appName: focusedContext?.appName,
                         role: focusedContext?.role,
                         windowTitle: focusedContext?.windowTitle,
@@ -5918,7 +5922,7 @@ final class CompanionManager: ObservableObject {
                         polishStyle: fullPolish ? nil : "rewrite",
                         contextImageJPEG: contextScreenshot?.imageData
                     )
-                    print("✨ VTT polish (\(fullPolish ? "FULL/Sonnet" : "Haiku rewrite"), vision=\(contextScreenshot != nil)): \(punctuatedText.count) → \(polished.count) chars")
+                    print("✨ VTT polish (\(fullPolish ? "FULL POLISH/Sonnet substantive" : "Haiku rewrite"), vision=\(contextScreenshot != nil)): \(punctuatedText.count) → \(polished.count) chars")
                     textToFormat = polished
                     pipelineStatus = "ok"
                 } catch {
