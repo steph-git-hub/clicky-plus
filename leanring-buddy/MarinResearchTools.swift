@@ -31,11 +31,11 @@ enum MarinResearchTools {
         NSString("~/Documents/Claude/Scheduled").expandingTildeInPath
     }
 
-    private static var obsidianVaultDir: String {
+    nonisolated private static var obsidianVaultDir: String {
         NSString("~/Desktop/Claude Cowork/Obsidian/Steph Vault").expandingTildeInPath
     }
 
-    private static var clickyRepoDir: String {
+    nonisolated private static var clickyRepoDir: String {
         NSString("~/clicky-plus").expandingTildeInPath
     }
 
@@ -321,7 +321,7 @@ enum MarinResearchTools {
 
     // MARK: - 4. search_obsidian
 
-    static func searchObsidian(query: String) -> [String: Any] {
+    nonisolated static func searchObsidian(query: String) -> [String: Any] {
         guard !query.isEmpty else {
             return ["status": "error", "reason": "Empty search query"]
         }
@@ -339,6 +339,12 @@ enum MarinResearchTools {
         while let relPath = enumerator.nextObject() as? String {
             guard relPath.hasSuffix(".md") else { continue }
             let fullPath = (obsidianVaultDir as NSString).appendingPathComponent(relPath)
+            // v16qv: skip very large files. A normal note is tiny; a multi-hundred-KB
+            // markdown file is a transcript/data dump whose full read + lowercase would
+            // dominate the scan (this synchronous read is what froze the main thread).
+            // Bounding per-file cost keeps the whole search fast.
+            if let attrs = try? fm.attributesOfItem(atPath: fullPath),
+               let size = (attrs[.size] as? NSNumber)?.intValue, size > 512_000 { continue }
             guard let content = try? String(contentsOfFile: fullPath, encoding: .utf8) else { continue }
             let lower = content.lowercased()
             guard let range = lower.range(of: queryLower) else { continue }
@@ -370,7 +376,7 @@ enum MarinResearchTools {
 
     // MARK: - 5. read_obsidian_note
 
-    static func readObsidianNote(path: String) -> [String: Any] {
+    nonisolated static func readObsidianNote(path: String) -> [String: Any] {
         guard !path.isEmpty else {
             return ["status": "error", "reason": "Empty path"]
         }
@@ -408,7 +414,7 @@ enum MarinResearchTools {
 
     // MARK: - 6. search_clicky_codebase
 
-    static func searchClickyCodebase(query: String) -> [String: Any] {
+    nonisolated static func searchClickyCodebase(query: String) -> [String: Any] {
         guard !query.isEmpty else {
             return ["status": "error", "reason": "Empty search query"]
         }

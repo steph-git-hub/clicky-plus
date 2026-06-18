@@ -1208,13 +1208,17 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             return await MainActor.run { MarinResearchTools.listPlugins() }
         case "search_obsidian":
             let query = (args["query"] as? String) ?? ""
-            return await MainActor.run { MarinResearchTools.searchObsidian(query: query) }
+            // v16qv: run off the main thread — this scans/reads the whole Obsidian
+            // vault and was hanging the UI (main-thread deadlock) on @MainActor.
+            return await Task.detached(priority: .userInitiated) { MarinResearchTools.searchObsidian(query: query) }.value
         case "read_obsidian_note":
             let path = (args["path"] as? String) ?? ""
-            return await MainActor.run { MarinResearchTools.readObsidianNote(path: path) }
+            // v16qv: off the main thread — reads a note file synchronously.
+            return await Task.detached(priority: .userInitiated) { MarinResearchTools.readObsidianNote(path: path) }.value
         case "search_clicky_codebase":
             let query = (args["query"] as? String) ?? ""
-            return await MainActor.run { MarinResearchTools.searchClickyCodebase(query: query) }
+            // v16qv: off the main thread — walks/reads the whole clicky-plus repo.
+            return await Task.detached(priority: .userInitiated) { MarinResearchTools.searchClickyCodebase(query: query) }.value
         case "read_clicky_roadmap":
             return await MainActor.run { MarinResearchTools.readClickyRoadmap() }
         case "pin_playbook":
