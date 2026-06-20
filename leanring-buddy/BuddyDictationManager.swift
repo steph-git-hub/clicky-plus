@@ -177,28 +177,17 @@ enum BuddyPushToTalkShortcut {
         modifierFlags: NSEvent.ModifierFlags,
         wasShortcutPreviouslyPressed: Bool
     ) -> ShortcutTransition {
-        if let modifierOnlyFlags = currentShortcutOption.modifierOnlyFlags {
+        if currentShortcutOption.modifierOnlyFlags != nil {
             guard shortcutEventType == .flagsChanged else { return .none }
 
-            // v15p2 (2026-05-02): mutual-exclusivity logic depends on
-            // which option we're using. Old behavior: forbid .function
-            // (so we don't double-fire with burst). New for .optionFunction:
-            // we REQUIRE .function, so the forbidden flags shift to
-            // shift/command/control to keep us mutually exclusive with
-            // VTT (fn+ctrl), capture (fn+shift), typing (cmd+fn), and
-            // the new Realtime PTT (ctrl+opt).
-            let hasRequired = modifierFlags.isSuperset(of: modifierOnlyFlags)
-            let hasForbidden: Bool
-            switch currentShortcutOption {
-            case .optionFunction:
-                hasForbidden = modifierFlags.contains(.shift)
-                    || modifierFlags.contains(.control)
-                    || modifierFlags.contains(.command)
-            default:
-                // Original behavior for legacy chords: Fn is forbidden.
-                hasForbidden = modifierFlags.contains(.function)
-            }
-            let isShortcutCurrentlyPressed = hasRequired && !hasForbidden
+            // v16qz: exact-match from the user-rebindable HotkeyBindingStore.
+            // NOTE the name is historical — this base "shortcut" detector DRIVES
+            // TYPING MODE since the v16qo subscription remap
+            // (shortcutTransitionPublisher → handleTypingTransition). Reading the
+            // store makes Typing rebindable from the menu; exact-match is naturally
+            // mutually-exclusive so the old forbidden-flag lists are no longer needed.
+            let isShortcutCurrentlyPressed =
+                modifierFlags.intersection(HotkeyBindingStore.relevantMask) == HotkeyBindingStore.flags(for: .typing)
 
             if isShortcutCurrentlyPressed && !wasShortcutPreviouslyPressed {
                 return .pressed
@@ -283,7 +272,10 @@ enum BuddyPushToTalkShortcut {
         modifierFlags: NSEvent.ModifierFlags,
         wasBurstPreviouslyPressed: Bool
     ) -> ShortcutTransition {
-        let isBurstCurrentlyPressed = modifierFlags.isSuperset(of: burstModifierFlags)
+        // v16qz: exact-match from the store. NOTE the name is historical — this
+        // "burst" detector DRIVES WATCH MODE (v16qo re-pointed the subscription).
+        let isBurstCurrentlyPressed =
+            modifierFlags.intersection(HotkeyBindingStore.relevantMask) == HotkeyBindingStore.flags(for: .watch)
 
         if isBurstCurrentlyPressed && !wasBurstPreviouslyPressed {
             return .pressed
@@ -326,14 +318,11 @@ enum BuddyPushToTalkShortcut {
         modifierFlags: NSEvent.ModifierFlags,
         wasTypingPreviouslyPressed: Bool
     ) -> ShortcutTransition {
-        // Must have Cmd + Fn, and must NOT include shift, option, or
-        // control — otherwise it's ambiguous with burst (shift+opt+fn)
-        // or a future combo and we'd fire two modes at once.
-        let hasRequired = modifierFlags.isSuperset(of: typingModifierFlags)
-        let hasForbidden = modifierFlags.contains(.shift)
-            || modifierFlags.contains(.option)
-            || modifierFlags.contains(.control)
-        let isTypingCurrentlyPressed = hasRequired && !hasForbidden
+        // v16qz: exact-match from the store. NOTE the name is historical — this
+        // "typing" detector DRIVES BASE PTT (Claude voice+vision) since the v16qo
+        // subscription remap (typingTransitionPublisher → handleShortcutTransition).
+        let isTypingCurrentlyPressed =
+            modifierFlags.intersection(HotkeyBindingStore.relevantMask) == HotkeyBindingStore.flags(for: .basePTT)
 
         if isTypingCurrentlyPressed && !wasTypingPreviouslyPressed {
             return .pressed
@@ -383,14 +372,9 @@ enum BuddyPushToTalkShortcut {
         modifierFlags: NSEvent.ModifierFlags,
         wasVoiceToTextPreviouslyPressed: Bool
     ) -> ShortcutTransition {
-        let hasRequired = modifierFlags.isSuperset(of: voiceToTextModifierFlags)
-        // Forbidden flags must NOT include .control (it's required now).
-        // Shift, option, command stay forbidden so this combo doesn't
-        // overlap with polish (shift+fn), burst (shift+option+fn), or typing (cmd+fn).
-        let hasForbidden = modifierFlags.contains(.shift)
-            || modifierFlags.contains(.option)
-            || modifierFlags.contains(.command)
-        let isVoiceToTextCurrentlyPressed = hasRequired && !hasForbidden
+        // v16qz: exact-match from the user-rebindable store (this detector drives VTT).
+        let isVoiceToTextCurrentlyPressed =
+            modifierFlags.intersection(HotkeyBindingStore.relevantMask) == HotkeyBindingStore.flags(for: .vtt)
 
         if isVoiceToTextCurrentlyPressed && !wasVoiceToTextPreviouslyPressed {
             return .pressed
@@ -434,14 +418,9 @@ enum BuddyPushToTalkShortcut {
         modifierFlags: NSEvent.ModifierFlags,
         wasCaptureToInboxPreviouslyPressed: Bool
     ) -> ShortcutTransition {
-        let hasRequired = modifierFlags.isSuperset(of: captureToInboxModifierFlags)
-        // v15p2: Fn+Shift is required; .option/.command/.control are
-        // forbidden so we don't double-fire with Realtime (fn+opt),
-        // burst (fn+shift+opt), typing (cmd+fn), or VTT (fn+ctrl).
-        let hasForbidden = modifierFlags.contains(.option)
-            || modifierFlags.contains(.command)
-            || modifierFlags.contains(.control)
-        let isCaptureToInboxCurrentlyPressed = hasRequired && !hasForbidden
+        // v16qz: exact-match from the user-rebindable store (this detector drives Capture-to-inbox).
+        let isCaptureToInboxCurrentlyPressed =
+            modifierFlags.intersection(HotkeyBindingStore.relevantMask) == HotkeyBindingStore.flags(for: .captureToInbox)
 
         if isCaptureToInboxCurrentlyPressed && !wasCaptureToInboxPreviouslyPressed {
             return .pressed
@@ -489,14 +468,9 @@ enum BuddyPushToTalkShortcut {
         modifierFlags: NSEvent.ModifierFlags,
         wasRealtimePreviouslyPressed: Bool
     ) -> ShortcutTransition {
-        let hasRequired = modifierFlags.isSuperset(of: realtimeModifierFlags)
-        // Ctrl+Opt is the chord. Forbidden: shift/command/function so
-        // we don't double-fire with VTT (fn+ctrl), capture-to-inbox
-        // (fn+shift), typing (cmd+fn), or Base PTT (fn+opt).
-        let hasForbidden = modifierFlags.contains(.shift)
-            || modifierFlags.contains(.command)
-            || modifierFlags.contains(.function)
-        let isRealtimeCurrentlyPressed = hasRequired && !hasForbidden
+        // v16qz: exact-match from the user-rebindable store (this detector drives Marin realtime).
+        let isRealtimeCurrentlyPressed =
+            modifierFlags.intersection(HotkeyBindingStore.relevantMask) == HotkeyBindingStore.flags(for: .realtime)
 
         if isRealtimeCurrentlyPressed && !wasRealtimePreviouslyPressed {
             return .pressed
@@ -567,16 +541,9 @@ enum BuddyPushToTalkShortcut {
         modifierFlags: NSEvent.ModifierFlags,
         wasPolishHotkeyPreviouslyPressed: Bool
     ) -> ShortcutTransition {
-        let hasRequired = modifierFlags.isSuperset(of: polishHotkeyModifierFlags)
-        // Forbid the modifiers used by other modes so polish doesn't double-fire:
-        //   - .option excludes base PTT (⌃⌥) and burst (⇧⌥Fn) and capture-to-inbox (⌥Fn)
-        //   - .command excludes typing (⌘Fn)
-        //   - .function excludes VTT (⌃Fn) and the four Fn-modes above
-        // After v11d, .control + .shift are both REQUIRED.
-        let hasForbidden = modifierFlags.contains(.option)
-            || modifierFlags.contains(.command)
-            || modifierFlags.contains(.function)
-        let isPolishHotkeyCurrentlyPressed = hasRequired && !hasForbidden
+        // v16qz: exact-match from the user-rebindable store (this detector drives Polish).
+        let isPolishHotkeyCurrentlyPressed =
+            modifierFlags.intersection(HotkeyBindingStore.relevantMask) == HotkeyBindingStore.flags(for: .polish)
 
         if isPolishHotkeyCurrentlyPressed && !wasPolishHotkeyPreviouslyPressed {
             return .pressed

@@ -55,8 +55,8 @@ enum ClickyHotkeyMode: String, CaseIterable {
         case .typing:         return [.option, .function]             // Fn+Opt  (was Cmd+Fn)
         case .watch:          return [.shift, .option, .function]     // Fn+Shift+Opt (was Fn+Opt)
         case .vtt:            return [.control, .function]            // Ctrl+Fn (unchanged)
-        case .polish:         return [.shift, .function]              // Shift+Fn (unchanged)
-        case .captureToInbox: return [.option, .shift, .function]    // verify at wire-time
+        case .polish:         return [.shift, .control]               // Shift+Ctrl (matches live BuddyDictationManager)
+        case .captureToInbox: return [.shift, .function]              // Fn+Shift (matches live BuddyDictationManager)
         case .realtime:       return [.control, .option]             // Ctrl+Opt (unchanged)
         }
     }
