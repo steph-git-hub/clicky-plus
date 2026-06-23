@@ -865,6 +865,105 @@ enum MarinResearchTools {
         ]
     }
 
+    // MARK: - open_file (v16r0, 2026-06-23)
+    //
+    // Resolve a FILENAME (which Steph knows) to a full path (which he doesn't)
+    // by searching his common folders, then open it with its default app via
+    // NSWorkspace. Fixes "Marin can never find the right path" — she only needs
+    // the filename. No shell needed (`open`/`do shell script` are deny-listed in
+    // run_applescript); NSWorkspace is the safe doorway. The folder walk runs OFF
+    // the main thread (Task.detached) so it can't freeze the UI — see
+    // feedback_marin_tools_off_main_thread (the searchObsidian main-thread hang).
+
+    /// Roots searched for a file, in priority order. Cowork first (where Steph's
+    /// HTML dashboards + project files live), then the usual personal folders.
+    nonisolated private static var openFileSearchRoots: [String] {
+        let home = NSHomeDirectory()
+        return [
+            "\(home)/Desktop/Claude Cowork",
+            "\(home)/Desktop",
+            "\(home)/Downloads",
+            "\(home)/Documents",
+        ]
+    }
+
+    /// Directory names never worth walking (huge / irrelevant).
+    nonisolated private static let openFileBlockedDirs: Set<String> = [
+        ".git", "node_modules", "DerivedData", ".Trash", "Library",
+        ".wrangler", "Pods", ".next", "build", ".venv", "venv", ".cache",
+    ]
+
+    /// Voice entry point: find a file by name and open it. Returns status
+    /// ok / not_found / multiple / error so Marin can respond appropriately.
+    nonisolated static func openFile(query rawQuery: String) async -> [String: Any] {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !query.isEmpty else { return ["status": "error", "reason": "No filename given."] }
+        // Steph knows the filename — match on the last path component.
+        let needle = ((query as NSString).lastPathComponent).lowercased()
+
+        // Search OFF the main thread — a big folder walk must never block the UI.
+        let matches = await Task.detached(priority: .userInitiated) {
+            Self.findFileMatches(needle: needle)
+        }.value
+
+        switch matches.count {
+        case 0:
+            return ["status": "not_found",
+                    "reason": "Couldn't find \"\(query)\" in Cowork, Desktop, Downloads, or Documents."]
+        case 1:
+            let path = matches[0]
+            let opened = await MainActor.run { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
+            return opened
+                ? ["status": "ok", "path": path]
+                : ["status": "error", "reason": "Found it but macOS wouldn't open \((path as NSString).lastPathComponent)."]
+        default:
+            let names = matches.prefix(6).map { p -> String in
+                let ns = p as NSString
+                let parent = (ns.deletingLastPathComponent as NSString).lastPathComponent
+                return "\(ns.lastPathComponent) (in \(parent))"
+            }
+            return ["status": "multiple",
+                    "matches": Array(matches.prefix(6)),
+                    "note": "Multiple matches — ask Steph which one: \(names.joined(separator: ", "))"]
+        }
+    }
+
+    /// Synchronous file walk over the search roots. Exact filename match wins;
+    /// falls back to a case-insensitive contains (needle >= 5 chars). Ranked by
+    /// root priority then path depth (shallower first). Bounded scan.
+    nonisolated private static func findFileMatches(needle: String) -> [String] {
+        let fm = FileManager.default
+        var exact: [(path: String, rank: Int)] = []
+        var partial: [(path: String, rank: Int)] = []
+        var scanned = 0
+        for (rootIdx, root) in Self.openFileSearchRoots.enumerated() {
+            guard fm.fileExists(atPath: root), let en = fm.enumerator(atPath: root) else { continue }
+            while let rel = en.nextObject() as? String {
+                if scanned > 60_000 { break }
+                let comps = rel.split(separator: "/")
+                let lastComp = String(comps.last ?? "")
+                if Self.openFileBlockedDirs.contains(lastComp) { en.skipDescendants(); continue }
+                if lastComp.hasPrefix(".") { continue }
+                scanned += 1
+                let lname = lastComp.lowercased()
+                let rank = rootIdx * 100 + comps.count
+                let full = (root as NSString).appendingPathComponent(rel)
+                if lname == needle {
+                    exact.append((full, rank))
+                } else if needle.count >= 5 && lname.contains(needle) {
+                    partial.append((full, rank))
+                }
+            }
+        }
+        let chosen = exact.isEmpty ? partial : exact
+        var seen = Set<String>(); var out: [String] = []
+        for m in chosen.sorted(by: { $0.rank < $1.rank }) where !seen.contains(m.path) {
+            seen.insert(m.path); out.append(m.path)
+            if out.count >= 8 { break }
+        }
+        return out
+    }
+
     // MARK: - run_applescript (v15p4cw, 2026-06-01)
     //
     // Catch-all local OS-control tool. Lets Marin drive any scriptable Mac

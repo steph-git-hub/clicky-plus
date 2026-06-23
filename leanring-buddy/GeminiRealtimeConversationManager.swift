@@ -727,6 +727,18 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "required": ["script"],
             ],
         ],
+        // ── open_file: resolve a filename → path and open it (v16r0) ──
+        [
+            "name": "open_file",
+            "description": "Open a LOCAL FILE on Steph's Mac when he points you at it by NAME — e.g. 'open kombo-amazon-dashboard.html', 'pull up euro-summer.html', 'open the Q1 report'. You do NOT need the folder path and must NOT guess one: pass just the filename he said (or its distinctive part) as `filename`, and this tool searches his Cowork, Desktop, Downloads, and Documents folders, finds the file, and opens it in its default app (HTML → browser, etc.). Use THIS for local files instead of run_applescript (run_applescript is for URLs, his dashboards/sheets, and app control — local files were where it kept guessing the wrong path). Benign + reversible, so say NOTHING before: call the tool, then a one-word past-tense confirm after ('Opened.'). Handle the result by `status`: 'ok' → say 'Opened.'; 'not_found' → tell him you couldn't find that filename; 'multiple' → read him the short list from `note` and ask which one he means, then call again with the fuller name. For his named destinations (Marin Nav dashboards/sheets/URLs) keep using run_applescript; for an actual file on disk, use this.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "filename": ["type": "STRING", "description": "The file name Steph said (e.g. 'kombo-amazon-dashboard.html'), or its distinctive part. Just the name — no folder path needed or wanted."],
+                ],
+                "required": ["filename"],
+            ],
+        ],
         // ── Slack (worker-backed) ──────────────────────────────
         [
             "name": "search_slack",
@@ -1314,6 +1326,12 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             return await MainActor.run {
                 MarinResearchTools.runAppleScript(source: source, confirmed: confirmed)
             }
+        case "open_file":
+            // v16r0 (2026-06-23): resolve a filename → path (searching Steph's
+            // folders off-main) and open it. openFile self-manages off-main search
+            // + main-thread NSWorkspace open.
+            let filename = (args["filename"] as? String) ?? ""
+            return await MarinResearchTools.openFile(query: filename)
         case "web_fetch":
             let url = (args["url"] as? String) ?? ""
             return await MarinResearchTools.webFetch(url: url)
