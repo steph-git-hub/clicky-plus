@@ -574,7 +574,13 @@ enum MarinResearchTools {
             let name = s(r, "name").lowercased()
             let desc = s(r, "description").lowercased()
             let parent = s(r, "parent").lowercased()
-            if sku == q || asku == q || asin == q {
+            // v16r1: match legacy + retailer SKUs too (not just sku/amazon/asin).
+            let legacyHit = s(r, "legacy_skus").lowercased()
+                .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.contains(q)
+            let retailerHit = [s(r, "ulta_sku"), s(r, "target_sku"), s(r, "sephora_sku"),
+                               s(r, "dillards_sku"), s(r, "walmart_sku"), s(r, "fnsku"),
+                               s(r, "upc")].map { $0.lowercased() }.contains(q)
+            if sku == q || asku == q || asin == q || legacyHit || retailerHit {
                 exact.append(r)
             } else if sku.contains(q) || asku.contains(q) || asin.contains(q)
                         || name.contains(q) || desc.contains(q) || parent.contains(q) {
@@ -587,8 +593,10 @@ enum MarinResearchTools {
             return ["status": "ok", "match_count": 0, "results": [],
                     "note": "No SKU matched '\(query)'. Try a SKU code, ASIN, or product name."]
         }
-        let keys = ["sku", "amazon_sku", "asin", "name", "description", "category",
-                    "parent", "length", "shape", "msrp", "unit_cost", "upc", "variation", "source"]
+        let keys = ["sku", "amazon_sku", "asin", "fnsku", "name", "category",
+                    "parent", "length", "shape", "msrp", "unit_cost", "upc", "variation",
+                    "ulta_sku", "target_sku", "sephora_sku", "dillards_sku", "walmart_sku",
+                    "legacy_skus", "active", "source"]
         let results: [[String: Any]] = hits.map { r in
             var out: [String: Any] = [:]
             for k in keys where !s(r, k).isEmpty { out[k] = s(r, k) }
@@ -627,6 +635,14 @@ enum MarinResearchTools {
             case "msrp", "price", "retail": return "msrp"
             case "cost", "unit cost", "unit_cost": return "unit_cost"
             case "category": return "category"
+            // v16r1: retailer-specific SKUs were missing — "ulta" mapped to a
+            // nonexistent "ulta" key and returned blank. Map each spoken retailer
+            // name to its <retailer>_sku column.
+            case "ulta", "ulta sku", "ulta_sku": return "ulta_sku"
+            case "target", "target sku", "target_sku": return "target_sku"
+            case "sephora", "sephora sku", "sephora_sku": return "sephora_sku"
+            case "dillards", "dillard's", "dillards sku", "dillards_sku": return "dillards_sku"
+            case "walmart", "walmart sku", "walmart_sku": return "walmart_sku"
             default: return field.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             }
         }
@@ -635,11 +651,21 @@ enum MarinResearchTools {
         func findRow(_ item: String) -> [String: Any]? {
             let q = item.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             if q.isEmpty { return nil }
-            // Exact match on identifier-ish fields first.
+            // Exact match on identifier-ish fields first. v16r1: also match
+            // legacy SKU codes (comma-separated in legacy_skus — e.g. old
+            // "NAILS1042" now lives under sku "NAILS1187") and retailer SKUs,
+            // so Steph can look up by any code he still references.
             for r in arr {
+                let legacyHit = s(r, "legacy_skus").lowercased()
+                    .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                    .contains(q)
                 if s(r, "sku").lowercased() == q || s(r, "amazon_sku").lowercased() == q
                     || s(r, "asin").lowercased() == q || s(r, "upc").lowercased() == q
-                    || s(r, "fnsku").lowercased() == q || s(r, "name").lowercased() == q {
+                    || s(r, "fnsku").lowercased() == q || s(r, "name").lowercased() == q
+                    || s(r, "ulta_sku").lowercased() == q || s(r, "target_sku").lowercased() == q
+                    || s(r, "sephora_sku").lowercased() == q || s(r, "dillards_sku").lowercased() == q
+                    || s(r, "walmart_sku").lowercased() == q
+                    || legacyHit {
                     return r
                 }
             }
@@ -694,6 +720,14 @@ enum MarinResearchTools {
             case "msrp", "price", "retail": return "msrp"
             case "cost", "unit cost", "unit_cost": return "unit_cost"
             case "category": return "category"
+            // v16r1: retailer-specific SKUs were missing — "ulta" mapped to a
+            // nonexistent "ulta" key and returned blank. Map each spoken retailer
+            // name to its <retailer>_sku column.
+            case "ulta", "ulta sku", "ulta_sku": return "ulta_sku"
+            case "target", "target sku", "target_sku": return "target_sku"
+            case "sephora", "sephora sku", "sephora_sku": return "sephora_sku"
+            case "dillards", "dillard's", "dillards sku", "dillards_sku": return "dillards_sku"
+            case "walmart", "walmart sku", "walmart_sku": return "walmart_sku"
             default: return field.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             }
         }
