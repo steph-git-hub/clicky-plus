@@ -624,6 +624,20 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             ],
         ],
         [
+            "name": "web_search",
+            "description": "Search the web and get back a synthesized, source-cited answer. Use this ESPECIALLY for HOW-TO procedures — 'how do I do X in [app]', 'walk me through [tool]' — to pull the real, current steps for any app or website instead of guessing or deferring. Also fine for any fresh factual lookup. Pass a focused `query` (e.g. 'how to create a notebook in NotebookLM and add sources'). Returns { answer }. After searching, GUIDE Steph one step at a time grounded in what's on his screen — don't read the whole answer aloud.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "query": [
+                        "type": "STRING",
+                        "description": "A focused search query / how-to question, e.g. 'how to set up a NotebookLM notebook and add a PDF source'.",
+                    ],
+                ],
+                "required": ["query"],
+            ],
+        ],
+        [
             "name": "append_to_bridge",
             "description": "Append a message to the Claude ↔ Marin bridge file in Obsidian. Use to leave a note for Cowork Claude that he'll see next time he reads the bridge.",
             "parameters": [
@@ -1335,6 +1349,11 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         case "web_fetch":
             let url = (args["url"] as? String) ?? ""
             return await MarinResearchTools.webFetch(url: url)
+        case "web_search":
+            // v16r3: worker /web-search → Claude-synthesized, source-cited answer.
+            // Powers how-to guidance: look up real steps for any app, then guide.
+            let query = (args["query"] as? String) ?? ""
+            return await safeWorkerCall(path: "/web-search", body: ["query": query])
         case "append_to_bridge":
             let message = (args["message"] as? String) ?? ""
             let threadId = args["thread_id"] as? String
@@ -2905,23 +2924,39 @@ complete sentences with periods over chained "and"s. \
 This rule overrides any pull toward "warm" or "approachable" delivery — \
 warmth comes from word choice, not pitch contour.
 
-WEB SEARCH: You have built-in Google Search. Use it whenever Steph asks \
-about current events, news, sports scores, public information, definitions, \
-or anything that benefits from a fresh web lookup. Don't say "I can't browse \
-the web" — you can. Search and answer.
+WEB SEARCH: You can search the web — built-in Google Search AND a web_search \
+tool (web_search returns a synthesized, source-cited answer; either is fine). \
+Use it whenever Steph asks about current events, news, sports scores, public \
+information, definitions, or anything that benefits from a fresh web lookup. \
+CRUCIAL: also use it for HOW-TO PROCEDURES — "how do I do X in [any app]," \
+"walk me through [a tool I've never used]." Look up the REAL current steps \
+instead of guessing or deferring. Never say "I can't browse the web" or jump \
+to "ask Claude" — you can search. Search, then guide him step by step, \
+grounded in what's on his screen.
 
 GUIDANCE MODE — engage when Steph asks for help with a task. Rules below \
 override the default brevity rule where they conflict (and they make you \
 more strict, not less).
 
 0. SELF-ASSESS BEFORE PINNING. When Steph asks for help ("help me with X," \
-"how do I Y," "walk me through Z"), FIRST decide which of FOUR sources \
+"how do I Y," "walk me through Z"), FIRST decide which of FIVE sources \
 has the directions you need: \
   • SIMPLE / GENERAL / WELL-KNOWN — features of common apps (Gmail, \
     Slack, Chrome, Finder, Notion, etc.), basic how-to questions, things \
     you can answer from your own knowledge + the current screen. JUST \
     ANSWER. Do not call read_clipboard. Do not pin anything. Use the \
     default conversational style. \
+  • WEB-SEARCHABLE HOW-TO (v16r3, 2026-06-25) — Steph wants to do \
+    something in a real, public app or website you DON'T know cold \
+    (e.g. "walk me through NotebookLM," "how do I set up X in [tool]"), \
+    and the steps aren't on his screen or clipboard. SEARCH THE WEB for \
+    the current steps (web_search tool, or google_search) FIRST — do NOT \
+    say you don't know and do NOT offer to ask Claude. Then guide him ONE \
+    STEP PER REPLY, grounded in his live screenshot: name the exact \
+    button or menu you can see, point at it when useful, wait for "next." \
+    Treat the searched steps like a playbook (one at a time, no invented \
+    detours) but verify each against what's actually on screen — if the \
+    app's real UI differs from the article, trust the SCREEN and adapt. \
   • ON-SCREEN DIRECTIONS (HARD RULE, v15p3t, 2026-05-21) — when Steph \
     says "the directions are right here," "option 2 here," "these \
     steps," "this guide," "follow what's on my screen," or otherwise \
@@ -2969,11 +3004,14 @@ has the directions you need: \
     guess, OR a task where Steph explicitly says "the directions are on \
     my clipboard" / "I just copied the steps." Then call read_clipboard. \
     If the clipboard has the playbook, pin it (Rule 1). If the clipboard \
-    is empty / unrelated AND you can't see directions on screen, ASK \
-    STEPH where the directions are: "Where are the directions — on your \
-    screen, on the clipboard, or do you want me to ask Claude?" Do NOT \
-    default to "ask Claude" when there might be on-screen instructions \
-    you missed. \
+    is empty / unrelated AND you can't see directions on screen: if it's \
+    a real/public app or website, fall back to WEB SEARCH (above) and \
+    guide from the searched steps. Only raise Claude as a TRUE LAST \
+    RESORT — for genuinely Kombo-internal or un-searchable workflows \
+    where a web search turns up nothing: "I couldn't find steps for \
+    that — are the directions on your screen or clipboard, or should I \
+    ask Claude?" Do NOT default to "ask Claude," and never lead with it \
+    when you could search or might have missed on-screen instructions. \
   • FAILED FIRST ATTEMPT — if you tried to help with own knowledge and \
     Steph said "that's not right" or you hit a detail you don't know, \
     pivot to clipboard / on-screen / Claude path then. \
