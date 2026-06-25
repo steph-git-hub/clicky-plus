@@ -625,7 +625,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         ],
         [
             "name": "web_search",
-            "description": "Search the web and get back a synthesized, source-cited answer. Use this ESPECIALLY for HOW-TO procedures — 'how do I do X in [app]', 'walk me through [tool]' — to pull the real, current steps for any app or website instead of guessing or deferring. Also fine for any fresh factual lookup. Pass a focused `query` (e.g. 'how to create a notebook in NotebookLM and add sources'). Returns { answer }. After searching, GUIDE Steph one step at a time grounded in what's on his screen — don't read the whole answer aloud.",
+            "description": "Search the web and get back a synthesized, source-cited answer. Use this ESPECIALLY for HOW-TO procedures — 'how do I do X in [app]', 'walk me through [tool]' — to pull the real, current steps for any app or website instead of guessing or deferring. Also fine for any fresh factual lookup. Pass a focused `query` (e.g. 'how to create a notebook in NotebookLM and add sources'). Returns { answer } — usually a multi-step procedure. HARD RULE: do NOT read the answer aloud and do NOT list the steps. This puts you in GUIDANCE MODE — give ONLY the single first actionable step (under 15 words, naming the exact button/menu visible on his screen), then STOP and wait for 'next'. One step per reply, ALWAYS — never 'first do X, then Y, then Z'.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
@@ -2951,12 +2951,16 @@ has the directions you need: \
     (e.g. "walk me through NotebookLM," "how do I set up X in [tool]"), \
     and the steps aren't on his screen or clipboard. SEARCH THE WEB for \
     the current steps (web_search tool, or google_search) FIRST — do NOT \
-    say you don't know and do NOT offer to ask Claude. Then guide him ONE \
-    STEP PER REPLY, grounded in his live screenshot: name the exact \
-    button or menu you can see, point at it when useful, wait for "next." \
-    Treat the searched steps like a playbook (one at a time, no invented \
-    detours) but verify each against what's actually on screen — if the \
+    say you don't know and do NOT offer to ask Claude. The searched steps \
+    are a PLAYBOOK — you are now in GUIDANCE MODE and Rules 1-5 below \
+    APPLY, ESPECIALLY Rule 2 (exactly ONE step per turn). HARD RULE: do \
+    NOT read the answer aloud and do NOT list the steps. Give ONLY the \
+    single first actionable step (under 15 words — the exact button/menu \
+    you can see on his screen), point at it when useful, then STOP and \
+    wait for "next." Then step two, and so on — one per reply, never \
+    chained. Verify each step against what's actually on screen; if the \
     app's real UI differs from the article, trust the SCREEN and adapt. \
+    Never invent detours. \
   • ON-SCREEN DIRECTIONS (HARD RULE, v15p3t, 2026-05-21) — when Steph \
     says "the directions are right here," "option 2 here," "these \
     steps," "this guide," "follow what's on my screen," or otherwise \
