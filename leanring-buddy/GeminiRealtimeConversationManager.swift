@@ -1279,6 +1279,25 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         }
     }
 
+    /// v16r7: advance the active walkthrough by one and return a cue telling Marin
+    /// EXACTLY what to say next. Returns nil when no walkthrough is active (the
+    /// caller then uses the generic cue for the legacy on-screen-playbook flow).
+    /// This makes the Command-advance deterministic — it no longer depends on Marin
+    /// choosing to call next_step off a vague "what's next?".
+    private func advanceWalkthroughCueText() -> String? {
+        guard !walkthroughSteps.isEmpty else { return nil }
+        walkthroughIndex += 1
+        if walkthroughIndex < walkthroughSteps.count {
+            let step = walkthroughSteps[walkthroughIndex]
+            return "Walkthrough advance. Tell Steph ONLY this next step, briefly and grounded in the screenshot — add nothing else, do NOT repeat earlier steps, do NOT list anything: \(step)"
+        } else {
+            let total = walkthroughSteps.count
+            walkthroughSteps = []
+            walkthroughIndex = 0
+            return "Walkthrough complete. Tell Steph he's done — that was the last step (\(total) total). Say nothing else."
+        }
+    }
+
     /// Heuristic: does this query want a multi-step PROCEDURE (→ pace it) vs a one-off fact?
     nonisolated private static func looksLikeHowTo(_ query: String) -> Bool {
         let q = query.lowercased()
@@ -3710,6 +3729,11 @@ unless he asks for them).
             )
             return
         }
+        // v16r7: if a structured walkthrough is active, advance it HERE and feed
+        // Marin the exact next step to voice — don't rely on a vague "what's next?"
+        // cue (which let her improvise, re-search, or leak her voice/uptalk prompt).
+        // No active walkthrough → keep the original cue (legacy on-screen-playbook flow).
+        let effectiveCue = advanceWalkthroughCueText() ?? cueText
         Task { @MainActor in
             // Capture a fresh screenshot of the active screen so Marin
             // can see what the user just finished doing. Falls back to
@@ -3731,7 +3755,7 @@ unless he asks for them).
                     "[gemini] silent advance: screenshot capture failed (\(error.localizedDescription)) — sending text-only"
                 )
             }
-            parts.append(["text": cueText])
+            parts.append(["text": effectiveCue])
 
             let payload: [String: Any] = [
                 "client_content": [
