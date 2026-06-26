@@ -1254,6 +1254,38 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         return steps
     }
 
+    /// Search the real steps, parse them, store the list, and return ONLY step 1.
+    /// Shared by start_walkthrough AND any how-to that arrives via web_search, so
+    /// pacing is structural — it doesn't depend on which tool Marin picked.
+    private func beginWalkthrough(task: String) async -> [String: Any] {
+        let res = await safeWorkerCall(path: "/web-search", body: ["query": task, "mode": "steps"])
+        let answer = (res["answer"] as? String) ?? ""
+        let steps = Self.parseWalkthroughSteps(from: answer)
+        Self.logToolCall("walkthrough.result", ["parsed_steps": steps.count, "answer_chars": answer.count])
+        if steps.count >= 2 {
+            walkthroughSteps = steps
+            walkthroughIndex = 0
+            return ["status": "ok", "step_number": 1, "total_steps": steps.count,
+                    "step": steps[0],
+                    "instruction": "Give Steph ONLY this one step (under 15 words, grounded in what's on his screen). Do NOT reveal later steps. When he says next/done, call next_step."]
+        } else {
+            walkthroughSteps = []
+            walkthroughIndex = 0
+            return ["status": "ok",
+                    "answer": answer.isEmpty ? "No steps found — tell Steph you couldn't find a guide." : answer,
+                    "instruction": "Guide ONE step at a time; never read the whole answer aloud."]
+        }
+    }
+
+    /// Heuristic: does this query want a multi-step PROCEDURE (→ pace it) vs a one-off fact?
+    nonisolated private static func looksLikeHowTo(_ query: String) -> Bool {
+        let q = query.lowercased()
+        let triggers = ["how to ", "how do i", "how can i", "how would i", "walk me through",
+                        "walk through", "steps to", "step by step", "step-by-step", "guide me",
+                        "set up ", "set-up", "configure ", "create a ", "enable "]
+        return triggers.contains { q.contains($0) }
+    }
+
     /// v16r5-diag: log every tool dispatch so we can see exactly what Marin calls
     /// (vs. native google_search grounding, which bypasses this and won't appear).
     nonisolated private static func logToolCall(_ name: String, _ args: [String: Any]) {
@@ -1404,32 +1436,16 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             let url = (args["url"] as? String) ?? ""
             return await MarinResearchTools.webFetch(url: url)
         case "web_search":
-            // v16r3: worker /web-search → Claude-synthesized, source-cited answer.
-            // Powers how-to guidance: look up real steps for any app, then guide.
+            // v16r6: a how-to query is STRUCTURALLY paced (one step at a time) no
+            // matter which search tool she reaches for; plain facts get a normal answer.
             let query = (args["query"] as? String) ?? ""
+            if Self.looksLikeHowTo(query) {
+                return await beginWalkthrough(task: query)
+            }
             return await safeWorkerCall(path: "/web-search", body: ["query": query])
         case "start_walkthrough":
-            // v16r5: search the real steps, parse them, return ONLY step 1, stash
-            // the rest. The model can't dump because it only receives one step.
             let task = (args["task"] as? String) ?? ""
-            let res = await safeWorkerCall(path: "/web-search", body: ["query": task, "mode": "steps"])
-            let answer = (res["answer"] as? String) ?? ""
-            let steps = Self.parseWalkthroughSteps(from: answer)
-            Self.logToolCall("start_walkthrough.result", ["parsed_steps": steps.count, "answer_chars": answer.count])
-            if steps.count >= 2 {
-                walkthroughSteps = steps
-                walkthroughIndex = 0
-                return ["status": "ok", "step_number": 1, "total_steps": steps.count,
-                        "step": steps[0],
-                        "instruction": "Give Steph ONLY this one step (under 15 words, grounded in what's on his screen). Do NOT reveal later steps. When he says next/done, call next_step."]
-            } else {
-                // Couldn't parse a multi-step list — hand back the answer; still guide one beat at a time.
-                walkthroughSteps = []
-                walkthroughIndex = 0
-                return ["status": "ok",
-                        "answer": answer.isEmpty ? "No steps found — tell Steph you couldn't find a guide." : answer,
-                        "instruction": "Guide ONE step at a time; never read the whole answer aloud."]
-            }
+            return await beginWalkthrough(task: task)
         case "next_step":
             // v16r5: advance the in-progress walkthrough by one step.
             guard !walkthroughSteps.isEmpty else {
@@ -3017,8 +3033,8 @@ complete sentences with periods over chained "and"s. \
 This rule overrides any pull toward "warm" or "approachable" delivery — \
 warmth comes from word choice, not pitch contour.
 
-WEB SEARCH: You can search the web — built-in Google Search AND a web_search \
-tool (web_search returns a synthesized, source-cited answer; either is fine). \
+WEB SEARCH: You can search the web with the web_search tool (it returns a \
+synthesized, source-cited answer). \
 Use it whenever Steph asks about current events, news, sports scores, public \
 information, definitions, or anything that benefits from a fresh web lookup. \
 CRUCIAL: also use it for HOW-TO PROCEDURES — "how do I do X in [any app]," \
@@ -4205,9 +4221,10 @@ unless he asks for them).
                             return true
                         },
                     ],
-                    [
-                        "google_search": [String: Any](),
-                    ],
+                    // v16r6: google_search grounding REMOVED — it returned full
+                    // answers Marin would dump for how-tos, bypassing the paced
+                    // walkthrough. All web access now goes through web_search /
+                    // start_walkthrough, which pace multi-step procedures.
                 ],
             ]
         }
