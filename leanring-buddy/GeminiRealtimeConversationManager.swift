@@ -1268,6 +1268,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         if steps.count >= 2 {
             walkthroughSteps = steps
             walkthroughIndex = 0
+            drawHighlightForCurrentStep()
             return ["status": "ok", "step_number": 1, "total_steps": steps.count,
                     "step": steps[0],
                     "instruction": "Give Steph ONLY this one step (under 15 words, grounded in what's on his screen). Do NOT reveal later steps. When he says next/done, call next_step."]
@@ -1290,11 +1291,13 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         walkthroughIndex += 1
         if walkthroughIndex < walkthroughSteps.count {
             let step = walkthroughSteps[walkthroughIndex]
+            drawHighlightForCurrentStep()
             return "Walkthrough advance. Tell Steph ONLY this next step, briefly and grounded in the screenshot — add nothing else, do NOT repeat earlier steps, do NOT list anything: \(step)"
         } else {
             let total = walkthroughSteps.count
             walkthroughSteps = []
             walkthroughIndex = 0
+            walkthroughHighlightOverlay.hide()
             return "Walkthrough complete. Tell Steph he's done — that was the last step (\(total) total). Say nothing else."
         }
     }
@@ -1306,6 +1309,73 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                         "walk through", "steps to", "step by step", "step-by-step", "guide me",
                         "set up ", "set-up", "configure ", "create a ", "enable "]
         return triggers.contains { q.contains($0) }
+    }
+
+    // MARK: - v16r9: Phase 1 screen drawing (highlight box on the current step)
+
+    /// Reuses the proven AppKit highlight window (pulsing box + label) from the
+    /// OpenAI manager. Drawn for the current walkthrough step's target element.
+    private lazy var walkthroughHighlightOverlay = RealtimeHighlightOverlayManager()
+
+    /// Best-effort: ground the current step's target UI element on screen and
+    /// draw a highlight box over it. Silently no-ops if grounding finds nothing
+    /// (e.g. a "wait for it to load" step) or the lookup fails — never disrupts
+    /// the spoken walkthrough.
+    private func drawHighlightForCurrentStep() {
+        guard walkthroughIndex < walkthroughSteps.count else { return }
+        let stepText = walkthroughSteps[walkthroughIndex]
+        Task { @MainActor in
+            do {
+                if let rect = try await findWalkthroughElementViaVision(description: stepText) {
+                    walkthroughHighlightOverlay.show(screenRect: rect, label: stepText, dwellSeconds: 60)
+                } else {
+                    walkthroughHighlightOverlay.hide()   // no target this step → clear stale box
+                }
+            } catch {
+                RealtimeConversationManager.appendDiag("[walkthrough-draw] grounding failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Ported from RealtimeConversationManager.findElementViaVision: screenshot →
+    /// /find-ui-element (Sonnet) → global AppKit screen-coord CGRect (or nil).
+    private func findWalkthroughElementViaVision(description: String) async throws -> CGRect? {
+        let screen = try await CompanionScreenCaptureUtility.captureActiveScreenAsJPEG()
+        guard let url = URL(string: "https://clicky-proxy.sapierso.workers.dev/find-ui-element") else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+        request.timeoutInterval = 15
+        request.httpBody = try JSONSerialization.data(withJSONObject: [
+            "description": description,
+            "imageBase64": screen.imageData.base64EncodedString(),
+            "imageWidth": screen.screenshotWidthInPixels,
+            "imageHeight": screen.screenshotHeightInPixels,
+        ])
+        let (data, response) = try await URLSession.shared.data(for: request)
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { return nil }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let found = json["found"] as? Bool, found,
+              let bbox = json["bbox_pixels"] as? [String: Any],
+              let bx = (bbox["x"] as? NSNumber)?.doubleValue,
+              let by = (bbox["y"] as? NSNumber)?.doubleValue,
+              let bw = (bbox["w"] as? NSNumber)?.doubleValue,
+              let bh = (bbox["h"] as? NSNumber)?.doubleValue,
+              bw > 0, bh > 0 else { return nil }
+        // Screenshot pixels (top-left origin) → screen points → global AppKit (bottom-left).
+        let scaleX = Double(screen.displayWidthInPoints) / Double(screen.screenshotWidthInPixels)
+        let scaleY = Double(screen.displayHeightInPoints) / Double(screen.screenshotHeightInPixels)
+        let pointWidth = bw * scaleX
+        let pointHeight = bh * scaleY
+        let pointX_local = bx * scaleX
+        let pointTop_localFromTop = by * scaleY
+        let pointY_localFromBottom = Double(screen.displayHeightInPoints) - pointTop_localFromTop - pointHeight
+        return CGRect(
+            x: screen.displayFrame.origin.x + CGFloat(pointX_local),
+            y: screen.displayFrame.origin.y + CGFloat(pointY_localFromBottom),
+            width: CGFloat(pointWidth),
+            height: CGFloat(pointHeight)
+        )
     }
 
     /// v16r5-diag: log every tool dispatch so we can see exactly what Marin calls
@@ -1487,6 +1557,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             }
             walkthroughIndex += 1
             if walkthroughIndex < walkthroughSteps.count {
+                drawHighlightForCurrentStep()
                 return ["status": "ok", "step_number": walkthroughIndex + 1, "total_steps": walkthroughSteps.count,
                         "step": walkthroughSteps[walkthroughIndex],
                         "instruction": "Give Steph ONLY this step, grounded in his screen. When he says next, call next_step again."]
@@ -1494,6 +1565,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 let total = walkthroughSteps.count
                 walkthroughSteps = []
                 walkthroughIndex = 0
+                walkthroughHighlightOverlay.hide()
                 return ["status": "done", "note": "That was the last step (\(total) total). Tell Steph he's all done."]
             }
         case "append_to_bridge":
