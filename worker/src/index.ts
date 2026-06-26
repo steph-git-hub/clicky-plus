@@ -526,7 +526,7 @@ async function handleWebSearch(request: Request, env: Env): Promise<Response> {
   // (Marin serves them one at a time); default returns a tight 2-4 sentence answer.
   const stepsMode = (payload.mode ?? "").trim() === "steps";
   const systemPrompt = stepsMode
-    ? "You are a how-to assistant. Use web_search to find the CURRENT official way to do what the user asks. Return ONLY a numbered list of concise, imperative steps — one concrete action per step, e.g. '1. Open notebooklm.google.com and sign in.' '2. Click \"New notebook\".' Keep each step to one short sentence (the single action). No intro, no summary, no commentary. After the last step, on its own line write 'Sources:' then the source URLs."
+    ? "You are a how-to assistant. Use web_search to find the CURRENT official way to do what the user asks. Then respond with ONLY a JSON object of the form {\"steps\":[\"first action\",\"second action\"]} — each string is ONE concise imperative step (the single concrete action, e.g. 'Open notebooklm.google.com and sign in.', 'Click the New notebook button.'). Aim for 3 to 12 steps. Output ONLY the raw JSON object — no markdown, no code fences, no prose before or after."
     : "You are a search assistant. The user will give you a query. Use web_search to find current information, then return a tight 2-4 sentence answer with the key facts. Cite sources inline as [1], [2], etc., then list the source URLs at the end as a flat list. No preamble, no commentary on the search process — just the answer + sources.";
 
   const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
@@ -568,10 +568,28 @@ async function handleWebSearch(request: Request, env: Env): Promise<Response> {
     .join("\n")
     .trim();
 
+  // v16r6: in steps mode the model returns a JSON {steps:[...]} object. Parse it
+  // out (tolerating stray prose / code fences) so the client gets a clean array.
+  let steps: string[] = [];
+  if (stepsMode) {
+    const match = answer.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        const parsed = JSON.parse(match[0]) as { steps?: unknown };
+        if (Array.isArray(parsed.steps)) {
+          steps = parsed.steps.filter(
+            (s: unknown): s is string => typeof s === "string" && s.trim().length > 0
+          );
+        }
+      } catch { /* leave steps empty — client falls back to text parse */ }
+    }
+  }
+
   return new Response(
     JSON.stringify({
       query,
       answer: answer.length > 0 ? answer : "No answer returned.",
+      steps,
     }),
     { status: 200, headers: { "content-type": "application/json" } }
   );

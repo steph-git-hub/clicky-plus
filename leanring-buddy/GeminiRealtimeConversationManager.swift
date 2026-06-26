@@ -1260,8 +1260,10 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
     private func beginWalkthrough(task: String) async -> [String: Any] {
         let res = await safeWorkerCall(path: "/web-search", body: ["query": task, "mode": "steps"])
         let answer = (res["answer"] as? String) ?? ""
-        let steps = Self.parseWalkthroughSteps(from: answer)
-        Self.logToolCall("walkthrough.result", ["parsed_steps": steps.count, "answer_chars": answer.count])
+        // v16r6: prefer the worker's structured steps array; fall back to text parse.
+        let workerSteps = (res["steps"] as? [Any])?.compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } ?? []
+        let steps = workerSteps.count >= 2 ? workerSteps : Self.parseWalkthroughSteps(from: answer)
+        Self.logToolCall("walkthrough.result", ["parsed_steps": steps.count, "answer_chars": answer.count, "worker_steps": workerSteps.count])
         if steps.count >= 2 {
             walkthroughSteps = steps
             walkthroughIndex = 0
