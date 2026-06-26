@@ -1264,6 +1264,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         let workerSteps = (res["steps"] as? [Any])?.compactMap { ($0 as? String)?.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty } ?? []
         let steps = workerSteps.count >= 2 ? workerSteps : Self.parseWalkthroughSteps(from: answer)
         Self.logToolCall("walkthrough.result", ["parsed_steps": steps.count, "answer_chars": answer.count, "worker_steps": workerSteps.count])
+        Self.logWalkthroughSteps(task: task, steps: steps)
         if steps.count >= 2 {
             walkthroughSteps = steps
             walkthroughIndex = 0
@@ -1315,6 +1316,17 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         let path = (dir as NSString).appendingPathComponent("marin-tools.log")
         let preview = args.map { "\($0.key)=\(String(describing: $0.value).prefix(50))" }.joined(separator: " ")
         let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(name) \(preview)\n"
+        if let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
+        else { try? line.write(toFile: path, atomically: true, encoding: .utf8) }
+    }
+
+    /// v16r8-diag: dump the full generated walkthrough steps so we can audit their
+    /// CONTENT quality (parsing is fine now; accuracy of the steps is the open issue).
+    nonisolated private static func logWalkthroughSteps(task: String, steps: [String]) {
+        let dir = ("~/Library/Application Support/Clicky/action-log" as NSString).expandingTildeInPath
+        let path = (dir as NSString).appendingPathComponent("marin-tools.log")
+        let body = steps.enumerated().map { "   \($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] STEPS \"\(task)\":\n\(body)\n"
         if let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
         else { try? line.write(toFile: path, atomically: true, encoding: .utf8) }
     }

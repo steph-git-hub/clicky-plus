@@ -537,7 +537,7 @@ async function handleWebSearch(request: Request, env: Env): Promise<Response> {
       "content-type": "application/json",
     },
     body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
+      model: stepsMode ? "claude-sonnet-4-5" : "claude-haiku-4-5-20251001",
       max_tokens: stepsMode ? 1200 : 800,
       tools: [
         {
