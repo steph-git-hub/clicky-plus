@@ -512,9 +512,9 @@ async function handleSheets(request: Request, env: Env): Promise<Response> {
 /// vs raw search snippets), worse latency (~3-8s instead of ~500ms). For
 /// Marin's low-volume use case the trade-off is right.
 async function handleWebSearch(request: Request, env: Env): Promise<Response> {
-  let payload: { query?: string };
+  let payload: { query?: string; mode?: string };
   try {
-    payload = (await request.json()) as { query?: string };
+    payload = (await request.json()) as { query?: string; mode?: string };
   } catch {
     return jsonError("Invalid JSON body", 400);
   }
@@ -522,6 +522,12 @@ async function handleWebSearch(request: Request, env: Env): Promise<Response> {
   if (query.length === 0) {
     return jsonError("Missing 'query' parameter", 400);
   }
+  // v16r5: "steps" mode returns a NUMBERED step list for how-to walkthroughs
+  // (Marin serves them one at a time); default returns a tight 2-4 sentence answer.
+  const stepsMode = (payload.mode ?? "").trim() === "steps";
+  const systemPrompt = stepsMode
+    ? "You are a how-to assistant. Use web_search to find the CURRENT official way to do what the user asks. Return ONLY a numbered list of concise, imperative steps — one concrete action per step, e.g. '1. Open notebooklm.google.com and sign in.' '2. Click \"New notebook\".' Keep each step to one short sentence (the single action). No intro, no summary, no commentary. After the last step, on its own line write 'Sources:' then the source URLs."
+    : "You are a search assistant. The user will give you a query. Use web_search to find current information, then return a tight 2-4 sentence answer with the key facts. Cite sources inline as [1], [2], etc., then list the source URLs at the end as a flat list. No preamble, no commentary on the search process — just the answer + sources.";
 
   const anthropicResponse = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
@@ -532,7 +538,7 @@ async function handleWebSearch(request: Request, env: Env): Promise<Response> {
     },
     body: JSON.stringify({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 800,
+      max_tokens: stepsMode ? 1200 : 800,
       tools: [
         {
           type: "web_search_20250305",
@@ -540,7 +546,7 @@ async function handleWebSearch(request: Request, env: Env): Promise<Response> {
           max_uses: 3,
         },
       ],
-      system: "You are a search assistant. The user will give you a query. Use web_search to find current information, then return a tight 2-4 sentence answer with the key facts. Cite sources inline as [1], [2], etc., then list the source URLs at the end as a flat list. No preamble, no commentary on the search process — just the answer + sources.",
+      system: systemPrompt,
       messages: [
         { role: "user", content: query },
       ],

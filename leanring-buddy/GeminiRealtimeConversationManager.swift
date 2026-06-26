@@ -638,6 +638,26 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             ],
         ],
         [
+            "name": "start_walkthrough",
+            "description": "Begin a step-by-step walkthrough of how to do something in any app or website — 'walk me through NotebookLM', 'how do I set up X in [tool]'. USE THIS (not web_search) for any how-to Steph wants guided. It searches the current real steps and returns ONLY the FIRST step; the rest are stored. After it returns, give Steph ONLY that one step, grounded in what's on his screen, then wait. When he says 'next' / 'done' / 'okay', call next_step for the following step. You literally only receive one step at a time — never try to list them all.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "task": ["type": "STRING", "description": "What he wants to do, e.g. 'create a NotebookLM notebook and add a PDF source'."],
+                ],
+                "required": ["task"],
+            ],
+        ],
+        [
+            "name": "next_step",
+            "description": "Advance to the NEXT step of the in-progress walkthrough (started with start_walkthrough). Call this each time Steph says 'next', 'done', 'okay', or has clearly finished the current step. Returns the next single step, or status 'done' when the walkthrough is complete. Give Steph only the one step it returns.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [String: Any](),
+                "required": [String](),
+            ],
+        ],
+        [
             "name": "append_to_bridge",
             "description": "Append a message to the Claude ↔ Marin bridge file in Obsidian. Use to leave a note for Cowork Claude that he'll see next time he reads the bridge.",
             "parameters": [
@@ -1213,6 +1233,27 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
     /// Single dispatcher table covering every tool. Local tools run
     /// inline; worker tools call callWorkerJSON. Mirrors the OpenAI
     /// dispatcher's surface so Sulafat has the same capabilities.
+    // v16r5: stateful how-to walkthrough. Steps are served ONE AT A TIME so the
+    // realtime model physically can't dump them all (prompt-only one-step rules
+    // didn't hold). Set by start_walkthrough, advanced by next_step.
+    private var walkthroughSteps: [String] = []
+    private var walkthroughIndex: Int = 0
+
+    /// Parse a worker "steps" answer (numbered list) into discrete steps,
+    /// dropping the trailing "Sources:" block and any URL lines.
+    nonisolated private static func parseWalkthroughSteps(from text: String) -> [String] {
+        var steps: [String] = []
+        for raw in text.split(separator: "\n", omittingEmptySubsequences: true) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.lowercased().hasPrefix("sources") { break }   // stop at citations
+            if let r = line.range(of: #"^\d+[.)]\s+"#, options: .regularExpression) {
+                let step = String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+                if !step.isEmpty { steps.append(step) }
+            }
+        }
+        return steps
+    }
+
     private func dispatchTool(name: String, args: [String: Any]) async -> [String: Any] {
         switch name {
         case "get_current_screenshot":
@@ -1354,6 +1395,44 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             // Powers how-to guidance: look up real steps for any app, then guide.
             let query = (args["query"] as? String) ?? ""
             return await safeWorkerCall(path: "/web-search", body: ["query": query])
+        case "start_walkthrough":
+            // v16r5: search the real steps, parse them, return ONLY step 1, stash
+            // the rest. The model can't dump because it only receives one step.
+            let task = (args["task"] as? String) ?? ""
+            let res = await safeWorkerCall(path: "/web-search", body: ["query": task, "mode": "steps"])
+            let answer = (res["answer"] as? String) ?? ""
+            let steps = Self.parseWalkthroughSteps(from: answer)
+            if steps.count >= 2 {
+                walkthroughSteps = steps
+                walkthroughIndex = 0
+                return ["status": "ok", "step_number": 1, "total_steps": steps.count,
+                        "step": steps[0],
+                        "instruction": "Give Steph ONLY this one step (under 15 words, grounded in what's on his screen). Do NOT reveal later steps. When he says next/done, call next_step."]
+            } else {
+                // Couldn't parse a multi-step list — hand back the answer; still guide one beat at a time.
+                walkthroughSteps = []
+                walkthroughIndex = 0
+                return ["status": "ok",
+                        "answer": answer.isEmpty ? "No steps found — tell Steph you couldn't find a guide." : answer,
+                        "instruction": "Guide ONE step at a time; never read the whole answer aloud."]
+            }
+        case "next_step":
+            // v16r5: advance the in-progress walkthrough by one step.
+            guard !walkthroughSteps.isEmpty else {
+                return ["status": "no_active_walkthrough",
+                        "note": "No walkthrough in progress. If Steph wants how-to help, call start_walkthrough."]
+            }
+            walkthroughIndex += 1
+            if walkthroughIndex < walkthroughSteps.count {
+                return ["status": "ok", "step_number": walkthroughIndex + 1, "total_steps": walkthroughSteps.count,
+                        "step": walkthroughSteps[walkthroughIndex],
+                        "instruction": "Give Steph ONLY this step, grounded in his screen. When he says next, call next_step again."]
+            } else {
+                let total = walkthroughSteps.count
+                walkthroughSteps = []
+                walkthroughIndex = 0
+                return ["status": "done", "note": "That was the last step (\(total) total). Tell Steph he's all done."]
+            }
         case "append_to_bridge":
             let message = (args["message"] as? String) ?? ""
             let threadId = args["thread_id"] as? String
@@ -2949,18 +3028,18 @@ has the directions you need: \
   • WEB-SEARCHABLE HOW-TO (v16r3, 2026-06-25) — Steph wants to do \
     something in a real, public app or website you DON'T know cold \
     (e.g. "walk me through NotebookLM," "how do I set up X in [tool]"), \
-    and the steps aren't on his screen or clipboard. SEARCH THE WEB for \
-    the current steps (web_search tool, or google_search) FIRST — do NOT \
-    say you don't know and do NOT offer to ask Claude. The searched steps \
-    are a PLAYBOOK — you are now in GUIDANCE MODE and Rules 1-5 below \
-    APPLY, ESPECIALLY Rule 2 (exactly ONE step per turn). HARD RULE: do \
-    NOT read the answer aloud and do NOT list the steps. Give ONLY the \
-    single first actionable step (under 15 words — the exact button/menu \
-    you can see on his screen), point at it when useful, then STOP and \
-    wait for "next." Then step two, and so on — one per reply, never \
-    chained. Verify each step against what's actually on screen; if the \
-    app's real UI differs from the article, trust the SCREEN and adapt. \
-    Never invent detours. \
+    and the steps aren't on his screen or clipboard. Call start_walkthrough \
+    with the task — do NOT say you don't know and do NOT offer to ask \
+    Claude. It searches the real current steps and hands you back ONLY the \
+    FIRST one; the rest are stored. Deliver that single step (under 15 \
+    words, naming the exact button/menu you can see on his screen), point \
+    at it when useful, then STOP and wait. When he says "next" / "done", \
+    call next_step for the following step. You only ever RECEIVE one step \
+    at a time — there is no list to read, so you physically cannot dump \
+    them; just relay each step as it comes. Verify each against what's \
+    actually on screen; if the app's real UI differs, trust the SCREEN \
+    and adapt. (Use web_search, not start_walkthrough, only for one-off \
+    facts — never for a guided procedure.) \
   • ON-SCREEN DIRECTIONS (HARD RULE, v15p3t, 2026-05-21) — when Steph \
     says "the directions are right here," "option 2 here," "these \
     steps," "this guide," "follow what's on my screen," or otherwise \
