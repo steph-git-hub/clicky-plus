@@ -1254,7 +1254,20 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         return steps
     }
 
+    /// v16r5-diag: log every tool dispatch so we can see exactly what Marin calls
+    /// (vs. native google_search grounding, which bypasses this and won't appear).
+    nonisolated private static func logToolCall(_ name: String, _ args: [String: Any]) {
+        let dir = ("~/Library/Application Support/Clicky/action-log" as NSString).expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = (dir as NSString).appendingPathComponent("marin-tools.log")
+        let preview = args.map { "\($0.key)=\(String(describing: $0.value).prefix(50))" }.joined(separator: " ")
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(name) \(preview)\n"
+        if let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
+        else { try? line.write(toFile: path, atomically: true, encoding: .utf8) }
+    }
+
     private func dispatchTool(name: String, args: [String: Any]) async -> [String: Any] {
+        Self.logToolCall(name, args)
         switch name {
         case "get_current_screenshot":
             // v15p3ew (2026-05-17): restored. captureAndSendActiveScreenshotForGemini
@@ -1402,6 +1415,7 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             let res = await safeWorkerCall(path: "/web-search", body: ["query": task, "mode": "steps"])
             let answer = (res["answer"] as? String) ?? ""
             let steps = Self.parseWalkthroughSteps(from: answer)
+            Self.logToolCall("start_walkthrough.result", ["parsed_steps": steps.count, "answer_chars": answer.count])
             if steps.count >= 2 {
                 walkthroughSteps = steps
                 walkthroughIndex = 0
