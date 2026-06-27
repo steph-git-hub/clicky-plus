@@ -658,6 +658,17 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             ],
         ],
         [
+            "name": "highlight_element",
+            "description": "Draw a HIGHLIGHT BOX directly on Steph's screen around a UI element, to point him at it visually. Use whenever he says 'highlight X', 'show me where Y is', 'point at / circle Z', or when a visual pointer would help. Pass `description` = the element (e.g. 'the New notebook button', 'the Export dropdown'). It grounds the element from a fresh screenshot and draws a box that auto-clears after a few seconds. You CAN do this — NEVER say you can't highlight or draw on screen. Returns ok / not_found (if not_found, tell Steph you don't see it on the current screen).",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "description": ["type": "STRING", "description": "The on-screen element to highlight, e.g. 'the blue Save button in the top right'."],
+                ],
+                "required": ["description"],
+            ],
+        ],
+        [
             "name": "append_to_bridge",
             "description": "Append a message to the Claude ↔ Marin bridge file in Obsidian. Use to leave a note for Cowork Claude that he'll see next time he reads the bridge.",
             "parameters": [
@@ -1328,10 +1339,13 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             do {
                 if let rect = try await findWalkthroughElementViaVision(description: stepText) {
                     walkthroughHighlightOverlay.show(screenRect: rect, label: stepText, dwellSeconds: 60)
+                    Self.logToolCall("walkthrough.draw", ["found": "yes"])
                 } else {
                     walkthroughHighlightOverlay.hide()   // no target this step → clear stale box
+                    Self.logToolCall("walkthrough.draw", ["found": "no"])
                 }
             } catch {
+                Self.logToolCall("walkthrough.draw", ["error": error.localizedDescription])
                 RealtimeConversationManager.appendDiag("[walkthrough-draw] grounding failed: \(error.localizedDescription)")
             }
         }
@@ -1376,6 +1390,23 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             width: CGFloat(pointWidth),
             height: CGFloat(pointHeight)
         )
+    }
+
+    /// On-command highlight (the highlight_element tool). Same grounding + overlay
+    /// as the walkthrough auto-highlight, but Marin-invoked.
+    private func highlightElementOnScreen(description: String) async -> [String: Any] {
+        do {
+            if let rect = try await findWalkthroughElementViaVision(description: description) {
+                walkthroughHighlightOverlay.show(screenRect: rect, label: description, dwellSeconds: 6)
+                Self.logToolCall("highlight_element.result", ["found": "yes"])
+                return ["status": "ok", "note": "Drew a highlight box on screen. Tell Steph briefly (e.g. 'highlighted')."]
+            }
+            Self.logToolCall("highlight_element.result", ["found": "no"])
+            return ["status": "not_found", "note": "Couldn't locate that on the current screen — tell Steph you don't see it there."]
+        } catch {
+            Self.logToolCall("highlight_element.result", ["error": error.localizedDescription])
+            return ["status": "error", "reason": error.localizedDescription]
+        }
     }
 
     /// v16r5-diag: log every tool dispatch so we can see exactly what Marin calls
@@ -1568,6 +1599,11 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 walkthroughHighlightOverlay.hide()
                 return ["status": "done", "note": "That was the last step (\(total) total). Tell Steph he's all done."]
             }
+        case "highlight_element":
+            // v16r10: draw a highlight box around an element ON COMMAND (not just
+            // during walkthroughs). Same Sonnet grounding + overlay.
+            let desc = (args["description"] as? String) ?? ""
+            return await highlightElementOnScreen(description: desc)
         case "append_to_bridge":
             let message = (args["message"] as? String) ?? ""
             let threadId = args["thread_id"] as? String
@@ -3147,6 +3183,13 @@ CRUCIAL: also use it for HOW-TO PROCEDURES — "how do I do X in [any app]," \
 instead of guessing or deferring. Never say "I can't browse the web" or jump \
 to "ask Claude" — you can search. Search, then guide him step by step, \
 grounded in what's on his screen.
+
+SCREEN DRAWING: You CAN draw directly on Steph's screen — a highlight box that \
+points at a UI element. During a walkthrough this happens automatically for each \
+step. Any other time, call highlight_element with a short description ("the Save \
+button") whenever he says highlight / show me / point at / circle something, or \
+when a visual pointer would help. NEVER say you can't highlight or draw on screen \
+— you can. \
 
 GUIDANCE MODE — engage when Steph asks for help with a task. Rules below \
 override the default brevity rule where they conflict (and they make you \
