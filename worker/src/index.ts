@@ -1470,10 +1470,22 @@ async function handleFindUIElement(request: Request, env: Env): Promise<Response
   // Validate the JSON — if Sonnet returned something we can't parse,
   // surface that as found=false so the Mac client can fall back
   // gracefully instead of crashing.
+  //
+  // v16r12 (2026-07-17): THE highlight bug. The fence-strip above only fires when
+  // the reply STARTS with ```. Sonnet routinely prefaces or wraps the object with
+  // prose, so JSON.parse threw and EVERY lookup silently degraded to found:false —
+  // meaning a highlight box literally never drew. Fall back to extracting the first
+  // {...} block, which tolerates fences/prose anywhere around it.
   let parsed: any;
   try {
     parsed = JSON.parse(cleaned);
   } catch {
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (match) {
+      try { parsed = JSON.parse(match[0]); } catch { /* fall through to found:false */ }
+    }
+  }
+  if (!parsed) {
     return new Response(JSON.stringify({
       found: false,
       bbox_pixels: { x: 0, y: 0, w: 0, h: 0 },
