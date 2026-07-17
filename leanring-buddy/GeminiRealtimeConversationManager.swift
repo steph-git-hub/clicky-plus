@@ -1367,9 +1367,20 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             "imageHeight": screen.screenshotHeightInPixels,
         ])
         let (data, response) = try await URLSession.shared.data(for: request)
-        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) { return nil }
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let found = json["found"] as? Bool, found,
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            // v16r11-diag: an HTTP/worker error previously looked identical to
+            // "Sonnet didn't find it" — both returned nil. Log them apart.
+            let body = String(data: data, encoding: .utf8) ?? "<binary>"
+            Self.logFindUI("HTTP_ERROR status=\(http.statusCode) body=\(body.prefix(200))")
+            return nil
+        }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            Self.logFindUI("PARSE_FAIL body=\((String(data: data, encoding: .utf8) ?? "").prefix(200))")
+            return nil
+        }
+        // Log what Sonnet actually said — found flag, confidence, and its reasoning.
+        Self.logFindUI("resp found=\(json["found"] as? Bool ?? false) conf=\(json["confidence"] as? NSNumber ?? 0) img=\(screen.screenshotWidthInPixels)x\(screen.screenshotHeightInPixels) desc=\"\(description.prefix(60))\" reasoning=\((json["reasoning"] as? String ?? "").prefix(160))")
+        guard let found = json["found"] as? Bool, found,
               let bbox = json["bbox_pixels"] as? [String: Any],
               let bx = (bbox["x"] as? NSNumber)?.doubleValue,
               let by = (bbox["y"] as? NSNumber)?.doubleValue,
@@ -1402,7 +1413,11 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 return ["status": "ok", "note": "Drew a highlight box on screen. Tell Steph briefly (e.g. 'highlighted')."]
             }
             Self.logToolCall("highlight_element.result", ["found": "no"])
-            return ["status": "not_found", "note": "Couldn't locate that on the current screen — tell Steph you don't see it there."]
+            // v16r11: do NOT let her retry-storm. Each attempt costs a screenshot +
+            // a Sonnet call (3-12s) and stalls the conversation — Steph saw her go
+            // unresponsive after 4 rapid retries. One mention, then move on.
+            return ["status": "not_found",
+                    "note": "Couldn't place a box on it. Say ONE short thing like 'I can see it but can't box it' and CONTINUE the conversation normally. Do NOT call highlight_element again for this — retrying stalls you and never works twice."]
         } catch {
             Self.logToolCall("highlight_element.result", ["error": error.localizedDescription])
             return ["status": "error", "reason": error.localizedDescription]
@@ -1419,6 +1434,17 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(name) \(preview)\n"
         if let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
         else { try? line.write(toFile: path, atomically: true, encoding: .utf8) }
+    }
+
+    /// v16r11-diag: raw find-ui-element logging (full reasoning, untruncated) so we
+    /// can tell a worker/API error apart from Sonnet genuinely not locating the element.
+    nonisolated private static func logFindUI(_ line: String) {
+        let dir = ("~/Library/Application Support/Clicky/action-log" as NSString).expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = (dir as NSString).appendingPathComponent("marin-tools.log")
+        let out = "[\(ISO8601DateFormatter().string(from: Date()))] FIND-UI \(line)\n"
+        if let h = FileHandle(forWritingAtPath: path) { h.seekToEndOfFile(); h.write(Data(out.utf8)); try? h.close() }
+        else { try? out.write(toFile: path, atomically: true, encoding: .utf8) }
     }
 
     /// v16r8-diag: dump the full generated walkthrough steps so we can audit their
