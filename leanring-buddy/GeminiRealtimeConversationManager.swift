@@ -1354,7 +1354,11 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
     /// Ported from RealtimeConversationManager.findElementViaVision: screenshot →
     /// /find-ui-element (Sonnet) → global AppKit screen-coord CGRect (or nil).
     private func findWalkthroughElementViaVision(description: String) async throws -> CGRect? {
-        let screen = try await CompanionScreenCaptureUtility.captureActiveScreenAsJPEG()
+        // v16r13: FULL-SCREEN capture (windowCrop:false) so displayFrame is the
+        // NSScreen frame (AppKit) and the bbox→screen coordinate map is correct.
+        // A window crop returns a CG-coords window frame that mismapped the box
+        // off-screen on secondary monitors.
+        let screen = try await CompanionScreenCaptureUtility.captureActiveScreenAsJPEG(windowCrop: false)
         guard let url = URL(string: "https://clicky-proxy.sapierso.workers.dev/find-ui-element") else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"

@@ -199,7 +199,7 @@ enum CompanionScreenCaptureUtility {
     /// Watch Mode passes 1280 to cut JPEG payload ~6× and per-frame
     /// token cost ~4×, which is the main lever for higher effective
     /// FPS in the streaming-frame pipeline.
-    static func captureActiveScreenAsJPEG(maxDimension: Int = 1920) async throws -> CompanionScreenCapture {
+    static func captureActiveScreenAsJPEG(maxDimension: Int = 1920, windowCrop: Bool = true) async throws -> CompanionScreenCapture {
         let content = try await SCShareableContent.excludingDesktopWindows(
             false, onScreenWindowsOnly: true
         )
@@ -269,6 +269,12 @@ enum CompanionScreenCaptureUtility {
         // hit-test and then match the resulting CGWindowID back to an
         // SCWindow (since SCContentFilter requires SCWindow, not raw CG id).
         let focusedWindow: SCWindow? = {
+            // v16r13: skip window-crop when the caller wants a FULL-SCREEN capture.
+            // The highlight grounding needs the display frame (NSScreen, AppKit
+            // bottom-left) for a correct coordinate map; a window crop returns the
+            // window frame in CG top-left coords, which mismapped the box off-screen
+            // on secondary monitors.
+            guard windowCrop else { return nil }
             guard let primaryScreen = NSScreen.screens.first else { return nil }
             let cgMouse = CGPoint(
                 x: mouseLocation.x,
