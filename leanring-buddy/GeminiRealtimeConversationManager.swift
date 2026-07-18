@@ -1395,12 +1395,19 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         let pointX_local = bx * scaleX
         let pointTop_localFromTop = by * scaleY
         let pointY_localFromBottom = Double(screen.displayHeightInPoints) - pointTop_localFromTop - pointHeight
-        return CGRect(
+        let rect = CGRect(
             x: screen.displayFrame.origin.x + CGFloat(pointX_local),
             y: screen.displayFrame.origin.y + CGFloat(pointY_localFromBottom),
             width: CGFloat(pointWidth),
             height: CGFloat(pointHeight)
         )
+        // v16r13-diag: log the full coordinate map + screen layout so we can see
+        // whether the computed rect actually falls on a visible screen.
+        let screensDesc = NSScreen.screens.map {
+            "(\(Int($0.frame.origin.x)),\(Int($0.frame.origin.y)) \(Int($0.frame.width))x\(Int($0.frame.height)))"
+        }.joined(separator: " ")
+        Self.logFindUI("MAP bbox=(\(Int(bx)),\(Int(by)),\(Int(bw))x\(Int(bh))) img=\(screen.screenshotWidthInPixels)x\(screen.screenshotHeightInPixels) dispPts=\(screen.displayWidthInPoints)x\(screen.displayHeightInPoints) dispOrigin=(\(Int(screen.displayFrame.origin.x)),\(Int(screen.displayFrame.origin.y))) rect=(\(Int(rect.origin.x)),\(Int(rect.origin.y)),\(Int(rect.width))x\(Int(rect.height))) screens=[\(screensDesc)]")
+        return rect
     }
 
     /// On-command highlight (the highlight_element tool). Same grounding + overlay
