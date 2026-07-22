@@ -396,6 +396,17 @@ final class ParakeetStreamingTranscriptionSession: BuddyStreamingTranscriptionSe
             ("Bodie", "Bodhi"),
             ("Caitlyn", "Caitlin"),
             ("Cider", "Sider"),
+            // Grok (xAI) — daily tool since 2026-07-20. Keyterm biases the
+            // STT but "Grok" is a homophone of several real words, so it
+            // keeps landing as Groq/Grock/Grawk. Hard-map ONLY the non-word
+            // mishears; NEVER remap "rock"/"crock" (real words Steph uses).
+            // Case-sensitive, so cover the observed forms. Added 2026-07-22.
+            ("Groq", "Grok"),
+            ("groq", "Grok"),
+            ("Grock", "Grok"),
+            ("grock", "Grok"),
+            ("Grawk", "Grok"),
+            ("grawk", "Grok"),
             // v15p4dz (2026-06-03): Steph says "D to C" / "D two C"
             // (direct-to-consumer) and wants it written DTC, not "D to C"
             // or "D2C". Cover the connector + capitalization variants the
