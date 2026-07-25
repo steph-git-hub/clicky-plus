@@ -6696,12 +6696,12 @@ final class CompanionManager: ObservableObject {
 
     // v16r15: fix domain proper-noun mishears Scribe makes consistently.
     // Deterministic (word-bounded) so it never times out and can't be
-    // "un-fixed" by an inconsistent LLM polish pass. NOTE: Groq→Grok and
-    // Peter→Petar carry a small homograph risk (Groq is a real company;
-    // Peter a common name) — flagged for Steph. Lucas→Lukas / Maren→Marin
-    // are unambiguous in his vocabulary.
+    // "un-fixed" by an inconsistent LLM polish pass. Peter→Petar was
+    // considered but DROPPED (2026-07-25) — "Peter" is far too common a
+    // name to blanket-correct. Groq→Grok kept: Steph only ever means
+    // xAI's Grok. Lucas→Lukas / Maren→Marin are unambiguous in his vocab.
     private static let properNounSubstitutions: [(String, String)] = [
-        ("Lucas", "Lukas"), ("Maren", "Marin"), ("Groq", "Grok"), ("Peter", "Petar"),
+        ("Lucas", "Lukas"), ("Maren", "Marin"), ("Groq", "Grok"),
     ]
     static func applyProperNounSubstitutions(_ text: String) -> String {
         var s = text
