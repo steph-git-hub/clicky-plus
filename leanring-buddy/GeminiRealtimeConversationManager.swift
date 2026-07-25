@@ -468,13 +468,13 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         ],
         [
             "name": "search_obsidian",
-            "description": "Full-text search across Steph's Obsidian vault. Use when he asks if he wrote anything about X, where his notes on Y are, what he captured about Z.",
+            "description": "Ranked keyword search across Steph's Obsidian vault — matches individual terms (not just exact phrases) and ranks title hits highest. Use when he asks if he wrote anything about X, where his notes on Y are, OR which past Cowork session he worked on something in. Past Cowork sessions are archived under 'Chat Summaries/' as 'YYYY-MM-DD - Cowork - <topic>', so a topic search finds the session — read back the note title + date as the session name. NEVER use search_meetings to find a Cowork session; that tool is Fireflies MEETINGS, not Cowork work sessions.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
                     "query": [
                         "type": "STRING",
-                        "description": "Search term. Plain text — no regex, no boolean operators. Case-insensitive.",
+                        "description": "Distinctive keywords — prefer specific nouns (product/tool/feature names) over generic phrases. Terms are matched individually and ranked, so 'vyra video editor' finds a note titled only 'Vyra'. If the first search misses, retry with simpler or different keywords before giving up.",
                     ],
                 ],
                 "required": ["query"],

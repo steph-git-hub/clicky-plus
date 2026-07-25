@@ -329,9 +329,23 @@ enum MarinResearchTools {
         guard fm.fileExists(atPath: obsidianVaultDir) else {
             return ["status": "error", "reason": "Obsidian vault not found at \(obsidianVaultDir)"]
         }
+        // v16r15: tokenized + ranked matching. The old engine did a single literal
+        // substring match (lower.range(of: queryLower)), so a paraphrased query like
+        // "AI video editing" missed notes titled "Vyra..." / "Video Reframe...". Now we
+        // split the query into terms and SCORE every note: exact-phrase hit is strong,
+        // a title hit is strongest (session lookups are title-driven), and each body/
+        // title term adds weight. Results are sorted by score, so the right note surfaces
+        // even when no single contiguous phrase matches.
         let queryLower = query.lowercased()
-        var matches: [[String: Any]] = []
+        let terms = Set(
+            queryLower
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { $0.count >= 2 }
+        )
         let maxResults = 15
+
+        struct Scored { var title: String; var path: String; var snippet: String; var score: Int }
+        var scored: [Scored] = []
 
         guard let enumerator = fm.enumerator(atPath: obsidianVaultDir) else {
             return ["status": "error", "reason": "Could not enumerate vault"]
@@ -347,30 +361,47 @@ enum MarinResearchTools {
                let size = (attrs[.size] as? NSNumber)?.intValue, size > 512_000 { continue }
             guard let content = try? String(contentsOfFile: fullPath, encoding: .utf8) else { continue }
             let lower = content.lowercased()
-            guard let range = lower.range(of: queryLower) else { continue }
+            let titleRaw = ((relPath as NSString).lastPathComponent as NSString).deletingPathExtension
+            let titleLower = titleRaw.lowercased()
 
-            // Build a snippet around the first match.
-            let lowerStart = lower.distance(from: lower.startIndex, to: range.lowerBound)
-            let snippetStart = max(0, lowerStart - 60)
-            let snippetEnd = min(content.count, lowerStart + queryLower.count + 100)
+            // Score this note. Anchor the snippet on the best hit we find.
+            var score = 0
+            var anchorRange: Range<String.Index>? = lower.range(of: queryLower)
+            if anchorRange != nil { score += 100 }            // exact phrase in body
+            if titleLower.contains(queryLower) { score += 200 } // exact phrase in title
+            for term in terms {
+                if titleLower.contains(term) { score += 25 }   // title term — strong signal
+                if let r = lower.range(of: term) {              // body term
+                    score += 3
+                    if anchorRange == nil { anchorRange = r }
+                }
+            }
+            guard score > 0 else { continue }
+
+            // Build a snippet around the best available anchor (phrase, else first term,
+            // else note start for title-only matches).
+            let anchor = anchorRange ?? (lower.startIndex..<lower.startIndex)
+            let anchorStart = lower.distance(from: lower.startIndex, to: anchor.lowerBound)
+            let snippetStart = max(0, anchorStart - 60)
+            let snippetEnd = min(content.count, anchorStart + 160)
             let startIdx = content.index(content.startIndex, offsetBy: snippetStart)
             let endIdx = content.index(content.startIndex, offsetBy: snippetEnd)
             let snippet = String(content[startIdx..<endIdx])
                 .replacingOccurrences(of: "\n", with: " ")
                 .trimmingCharacters(in: .whitespaces)
 
-            let title = ((relPath as NSString).lastPathComponent as NSString).deletingPathExtension
-            matches.append([
-                "title": title,
-                "path": relPath,
-                "snippet": snippet,
-            ])
-            if matches.count >= maxResults { break }
+            scored.append(Scored(title: titleRaw, path: relPath, snippet: snippet, score: score))
+        }
+
+        // Rank by score (desc) so the best matches come first, then take the top N.
+        scored.sort { $0.score > $1.score }
+        let matches: [[String: Any]] = scored.prefix(maxResults).map {
+            ["title": $0.title, "path": $0.path, "snippet": $0.snippet, "score": $0.score]
         }
         return [
             "matches": matches,
             "count": matches.count,
-            "truncated": matches.count >= maxResults,
+            "truncated": scored.count > maxResults,
         ]
     }
 
