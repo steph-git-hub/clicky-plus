@@ -802,7 +802,19 @@ final class CompanionManager: ObservableObject {
     /// Persisted picker value. "openai" or "gemini". Defaults to OpenAI
     /// so existing users see no behavior change on upgrade.
     @AppStorage("marin.provider") private(set) var marinProvider: String = "openai"
-    var marinUsingGemini: Bool { marinProvider == "gemini" }
+    // ⛔️ OpenAI Realtime DISABLED 2026-07-23 (Steph). Forces Marin to
+    // ALWAYS use Gemini Live regardless of the persisted picker value, so
+    // no OpenAI Realtime WebSocket (wss://api.openai.com/v1/realtime) can
+    // open. Nothing is removed — RealtimeConversationManager and the
+    // "OpenAI" picker button stay intact, just never reached. Why: OpenAI
+    // Realtime is unused (Marin runs on Gemini Live) and its metered
+    // billing hits the work OpenAI account (a 7/19/26 test cost ~$0.14).
+    // TO RE-ENABLE: restore the original one-liner shown below AND
+    // re-enable the OpenAI button in CompanionPanelView.swift (search
+    // "OpenAI Realtime DISABLED 2026-07-23"). If re-wiring for real use,
+    // point it at a PERSONAL OpenAI key, not the work account.
+    //   var marinUsingGemini: Bool { marinProvider == "gemini" }
+    var marinUsingGemini: Bool { true }
 
     /// v15p2 (2026-05-03): Marin's input audio level mirrored into
     /// CompanionManager so indicators can be voice-reactive while
@@ -6633,6 +6645,73 @@ final class CompanionManager: ObservableObject {
         return output
     }
 
+    // v16r15 (2026-07-25): deterministic stutter / false-start collapse.
+    // The repunctuate + polish prompts preserve stutters verbatim by
+    // design (anti-truncation hard rules), so "I-I-I'm", "th-the", "we--",
+    // "S-" survive on the hold path and on any polish-timeout fallback.
+    // We strip them here — the single final cleaner every path funnels
+    // through before paste. The prefix check protects real compounds
+    // ("month-end", "self-serve", "cross-channel"). Verified against a
+    // stutter + compound test matrix before shipping.
+    private static let stutterHyphenRegex = try? NSRegularExpression(
+        pattern: "\\b([A-Za-z]+)-+[ \\t]?([A-Za-z]+)", options: [])
+    private static let danglingFragmentRegex = try? NSRegularExpression(
+        pattern: "\\b[A-Za-z]{1,7}-+(?=[ \\t])", options: [])
+    static func collapseStutterArtifacts(_ text: String) -> String {
+        guard let r1 = stutterHyphenRegex else { return text }
+        var s = text
+        // R1: fragment-hyphen-word where one side is a prefix of the other
+        // → keep the full word. Loop to a fixpoint ("I-I-I'm" needs 2 passes).
+        for _ in 0..<4 {
+            let ns = s as NSString
+            let matches = r1.matches(in: s, options: [], range: NSRange(location: 0, length: ns.length))
+            if matches.isEmpty { break }
+            var result = ""
+            var last = 0
+            for m in matches {
+                let whole = ns.substring(with: m.range)
+                let a = ns.substring(with: m.range(at: 1)).lowercased()
+                let aFull = ns.substring(with: m.range(at: 1))
+                let b = ns.substring(with: m.range(at: 2))
+                let bl = b.lowercased()
+                result += ns.substring(with: NSRange(location: last, length: m.range.location - last))
+                if bl.hasPrefix(a) { result += b }
+                else if a.hasPrefix(bl) { result += aFull }
+                else { result += whole }
+                last = m.range.location + m.range.length
+            }
+            result += ns.substring(from: last)
+            if result == s { break }
+            s = result
+        }
+        // R2: abandoned false-start fragment before whitespace → drop it.
+        if let r2 = danglingFragmentRegex {
+            let ns = s as NSString
+            s = r2.stringByReplacingMatches(
+                in: s, options: [], range: NSRange(location: 0, length: ns.length), withTemplate: "")
+        }
+        s = s.replacingOccurrences(of: "[ \\t]{2,}", with: " ", options: .regularExpression)
+        return s
+    }
+
+    // v16r15: fix domain proper-noun mishears Scribe makes consistently.
+    // Deterministic (word-bounded) so it never times out and can't be
+    // "un-fixed" by an inconsistent LLM polish pass. NOTE: Groq→Grok and
+    // Peter→Petar carry a small homograph risk (Groq is a real company;
+    // Peter a common name) — flagged for Steph. Lucas→Lukas / Maren→Marin
+    // are unambiguous in his vocabulary.
+    private static let properNounSubstitutions: [(String, String)] = [
+        ("Lucas", "Lukas"), ("Maren", "Marin"), ("Groq", "Grok"), ("Peter", "Petar"),
+    ]
+    static func applyProperNounSubstitutions(_ text: String) -> String {
+        var s = text
+        for (wrong, right) in properNounSubstitutions {
+            s = s.replacingOccurrences(
+                of: "\\b\(wrong)\\b", with: right, options: .regularExpression)
+        }
+        return s
+    }
+
     static func stripVoiceToTextArtifacts(_ transcript: String) -> String {
         var cleaned = transcript
 
@@ -6668,6 +6747,12 @@ final class CompanionManager: ObservableObject {
         // the rare false positive — these words almost never appear in
         // natural dictation.
         cleaned = substituteSpokenPunctuation(in: cleaned)
+
+        // v16r15: strip hyphenated stutters / false starts, then fix domain
+        // proper-noun mishears — both deterministic and LLM-independent, so
+        // they also clean the polish-timeout fallback that pastes raw text.
+        cleaned = collapseStutterArtifacts(cleaned)
+        cleaned = applyProperNounSubstitutions(cleaned)
 
         while cleaned.contains("  ") {
             cleaned = cleaned.replacingOccurrences(of: "  ", with: " ")
