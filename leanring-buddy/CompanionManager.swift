@@ -4089,12 +4089,16 @@ final class CompanionManager: ObservableObject {
     /// Schedule the 10s force-clear timer. Called by the $voiceState sink
     /// every time voiceState enters .processing. If it doesn't change to
     /// a non-processing state in 10s, force-clear everything.
-    private func scheduleVoiceStateWatchdog() {
+    /// v16r16 (2026-07-27): the budget is now a parameter. It was a hard
+    /// 10s, which capped the polish timeout at 9.5s and made long-dictation
+    /// polish impossible (see polishTimeoutSeconds). The VTT polish path
+    /// re-arms this with a longer budget once it knows the transcript length.
+    private func scheduleVoiceStateWatchdog(seconds: TimeInterval = 10) {
         voiceStateWatchdogTask?.cancel()
         let scheduledAt = Date()
-        print("🛡️ Watchdog armed at \(dateFormatterDebug.string(from: scheduledAt)) (10s)")
+        print("🛡️ Watchdog armed at \(dateFormatterDebug.string(from: scheduledAt)) (\(String(format: "%.1f", seconds))s)")
         voiceStateWatchdogTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
             guard let self else { return }
             guard !Task.isCancelled else {
                 print("🛡️ Watchdog cancelled before fire")
@@ -4106,7 +4110,7 @@ final class CompanionManager: ObservableObject {
                 print("🛡️ Watchdog passed (state=\(self.voiceState))")
                 return
             }
-            print("⚠️ VoiceState watchdog: stuck on .processing >10s (isPreparing=\(self.buddyDictationManager.isPreparingToRecord) isFinalizing=\(self.buddyDictationManager.isFinalizingTranscript) isRecording=\(self.buddyDictationManager.isRecordingFromKeyboardShortcut)). Force-clearing.")
+            print("⚠️ VoiceState watchdog: stuck on .processing >\(String(format: "%.1f", seconds))s (isPreparing=\(self.buddyDictationManager.isPreparingToRecord) isFinalizing=\(self.buddyDictationManager.isFinalizingTranscript) isRecording=\(self.buddyDictationManager.isRecordingFromKeyboardShortcut)). Force-clearing.")
             self.currentResponseTask?.cancel()
             self.currentResponseTask = nil
             self.pendingVoiceToTextShortcutStartTask?.cancel()
@@ -5258,6 +5262,25 @@ final class CompanionManager: ObservableObject {
         return detailed.output
     }
 
+    /// v16r16: polish latency scales roughly linearly with input+output
+    /// length, so a flat request budget silently caps how much you can
+    /// dictate. 9.5s stays the floor (covers short/medium at the previous
+    /// behavior), then ~1s per 250 chars past 600, hard-capped at 30s so a
+    /// wedged call can't hang the overlay indefinitely.
+    ///   600 ch → 9.5s | 1533 ch → ~13.2s | 2698 ch → ~17.9s | 8000+ → 30s
+    static func polishTimeoutSeconds(forTextLength length: Int) -> TimeInterval {
+        let base: TimeInterval = 9.5
+        guard length > 600 else { return base }
+        return min(30.0, base + Double(length - 600) / 250.0)
+    }
+
+    /// Screenshots are attached to toggle polish for tone-matching, but the
+    /// JPEG payload adds seconds of upload+vision latency — which is what
+    /// pushed long dictations over the old 9.5s cap while the identical
+    /// text succeeded image-free. Past this length the tone signal isn't
+    /// worth the timeout risk: the transcript itself carries plenty of tone.
+    static let polishScreenshotMaxTextLength = 1200
+
     private static func sendPolishCommandToWorkerDetailed(
         workerBaseURL: String,
         fieldText: String,
@@ -5283,12 +5306,19 @@ final class CompanionManager: ObservableObject {
         request.setValue("application/json", forHTTPHeaderField: "content-type")
         // v15p4cp (2026-06-01): 9.5s timeout — polish uses Sonnet 4.6 (~1.5-3s
         // typical). Bumped from 8s after a 583-char/107-word toggle polish hit
-        // 8009ms and timed out by 9ms. MUST stay below the VTT watchdog's 10s
+        // 8009ms and timed out by 9ms. MUST stay below the VTT watchdog's
         // force-clear (scheduleVoiceStateWatchdog) so a slow polish fails
         // gracefully (falls back to the unpolished punctuated text) before the
         // watchdog force-cancels mid-call and loses the transcript entirely.
-        // 9.5s is the safe ceiling under that 10s cap.
-        request.timeoutInterval = 9.5
+        //
+        // v16r16 (2026-07-27): the flat 9.5s was a HARD CEILING on dictation
+        // length — polish latency scales with input+output tokens, so anything
+        // past ~1200 chars timed out every time and pasted raw. Observed
+        // 2026-07-27: 2698-char and 1533-char toggle polishes both timed out,
+        // while the same text succeeded via the (image-free) standalone polish.
+        // Budget now scales with length; the VTT path re-arms the watchdog
+        // above this value so the ordering guarantee above still holds.
+        request.timeoutInterval = Self.polishTimeoutSeconds(forTextLength: fieldText.count)
 
         var requestBody: [String: Any] = [
             "command": "polish",
@@ -5922,6 +5952,19 @@ final class CompanionManager: ObservableObject {
                     // SAME mode as the spoken "full polish" modifier on the polish hotkey,
                     // and heavier than both the hotkey tap ("preserve") and the single-tap
                     // toggle polish ("rewrite"/Haiku). Single-tap keeps the light toggle polish.
+                    // v16r16: long dictations previously ALWAYS timed out —
+                    // the attached screenshot's upload+vision cost blew the
+                    // budget, and the budget itself was a flat 9.5s. Drop the
+                    // image past the length threshold and re-arm the watchdog
+                    // above the (now length-scaled) request timeout so a slow
+                    // polish still fails gracefully to punctuated text rather
+                    // than being force-cancelled mid-call.
+                    let polishBudget = Self.polishTimeoutSeconds(forTextLength: punctuatedText.count)
+                    let sendScreenshot = punctuatedText.count <= Self.polishScreenshotMaxTextLength
+                    if polishBudget > 9.5 || !sendScreenshot {
+                        print("✨ VTT polish: \(punctuatedText.count) chars → budget \(String(format: "%.1f", polishBudget))s, screenshot=\(sendScreenshot)")
+                    }
+                    self?.scheduleVoiceStateWatchdog(seconds: polishBudget + 2.5)
                     let polished = try await Self.sendPolishCommandToWorker(
                         workerBaseURL: workerBaseURL,
                         fieldText: punctuatedText,
@@ -5932,9 +5975,9 @@ final class CompanionManager: ObservableObject {
                         personalFacts: Self.loadCurrentObsidianMemoryContents(),
                         modelOverride: fullPolish ? nil : "claude-haiku-4-5-20251001",
                         polishStyle: fullPolish ? nil : "rewrite",
-                        contextImageJPEG: contextScreenshot?.imageData
+                        contextImageJPEG: sendScreenshot ? contextScreenshot?.imageData : nil
                     )
-                    print("✨ VTT polish (\(fullPolish ? "FULL POLISH/Sonnet substantive" : "Haiku rewrite"), vision=\(contextScreenshot != nil)): \(punctuatedText.count) → \(polished.count) chars")
+                    print("✨ VTT polish (\(fullPolish ? "FULL POLISH/Sonnet substantive" : "Haiku rewrite"), vision=\(sendScreenshot && contextScreenshot != nil)): \(punctuatedText.count) → \(polished.count) chars")
                     textToFormat = polished
                     pipelineStatus = "ok"
                 } catch {
