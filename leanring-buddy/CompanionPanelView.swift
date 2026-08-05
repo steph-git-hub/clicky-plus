@@ -894,6 +894,13 @@ struct CompanionPanelView: View {
         }
         .buttonStyle(.plain)
         .pointerCursor()
+        // ⛔️ OpenAI Realtime DISABLED 2026-07-23 (Steph): OpenAI provider
+        // is off (see marinUsingGemini in CompanionManager.swift). Disable
+        // + dim the OpenAI button so it can't re-select the unused,
+        // work-billed OpenAI path. Gemini button is unaffected.
+        // TO RE-ENABLE: remove these two modifiers.
+        .disabled(providerID == "openai")
+        .opacity(providerID == "openai" ? 0.35 : 1)
     }
 
     // MARK: - Model Picker
