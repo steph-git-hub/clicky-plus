@@ -38,6 +38,10 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
     private var sparkleUpdaterController: SPUStandardUpdaterController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // v16r17 (2026-08-05): single-instance guard. MUST run before
+        // anything else starts — see the comment on the method.
+        terminateOtherInstances()
+
         print("🎯 Clicky: Starting...")
         print("🎯 Clicky: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
 
@@ -88,6 +92,55 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         companionManager.stop()
         // v16pv (2026-06-06): kill the on-device LLM server we spawned.
         LocalLLMManager.shared.stop()
+    }
+
+    /// v16r17 (2026-08-05): terminate any OTHER running Clicky instance
+    /// so the newest launch always wins.
+    ///
+    /// WHY. Clicky registers itself as a login item, so an instance is
+    /// almost always already running. Hitting Run in Xcode only kills the
+    /// instance Xcode itself launched — a login-item copy survives, and
+    /// macOS keeps its already-mapped binary image even after the build
+    /// replaces the file on disk. Result: two Clickys, one silently
+    /// serving PRE-BUILD code, and whichever owns the realtime session
+    /// answers Marin's tool calls.
+    ///
+    /// Live cost 2026-08-05: a stale instance served `memory` calls after
+    /// a fresh build. `forget` worked (old code had it) but `undo_last`
+    /// hit the old `default:` branch, so a correct new feature looked
+    /// broken — "she undid it, but said she couldn't find anything to
+    /// undo" — and the capture journal never got written. Cost a full
+    /// debugging cycle chasing a bug that did not exist.
+    ///
+    /// Newest-wins is the right rule: the instance that just launched is
+    /// the one the user (or Xcode) deliberately started. Runs FIRST in
+    /// applicationDidFinishLaunching so the old process finishes its
+    /// cleanup — `companionManager.stop()`, `LocalLLMManager.stop()` —
+    /// before this one claims the hotkey tap and spawns its LLM server.
+    private func terminateOtherInstances() {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return }
+        let myPID = ProcessInfo.processInfo.processIdentifier
+        let others = NSRunningApplication
+            .runningApplications(withBundleIdentifier: bundleID)
+            .filter { $0.processIdentifier != myPID }
+        guard !others.isEmpty else { return }
+
+        for app in others {
+            print("🎯 Clicky: terminating stale instance (pid \(app.processIdentifier))")
+            app.terminate()
+        }
+
+        // Bounded wait so the old instance releases the CGEvent tap and
+        // its LLM server port before we start ours. Escalate to a force
+        // kill rather than hang the launch on a wedged process.
+        let deadline = Date().addingTimeInterval(2.0)
+        while Date() < deadline, others.contains(where: { !$0.isTerminated }) {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        for app in others where !app.isTerminated {
+            print("⚠️ Clicky: stale instance (pid \(app.processIdentifier)) ignored quit — forcing")
+            app.forceTerminate()
+        }
     }
 
     /// Registers the app as a login item so it launches automatically on
