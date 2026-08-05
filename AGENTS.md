@@ -88,7 +88,20 @@ open leanring-buddy.xcodeproj
 # deprecated onChange warning in OverlayWindow.swift. Do NOT attempt to fix these.
 ```
 
-**Do NOT run `xcodebuild` from the terminal** — it invalidates TCC (Transparency, Consent, and Control) permissions and the app will need to re-request screen recording, accessibility, etc.
+**Building from the terminal is fine** — agents can and should just run:
+
+```bash
+cd ~/clicky-plus && xcodebuild -project leanring-buddy.xcodeproj \
+  -scheme leanring-buddy -configuration Debug build
+```
+
+This file previously said "Do NOT run `xcodebuild` from the terminal — it invalidates TCC permissions." **That is wrong and has been removed.** Measured 2026-08-05: TCC grants for `com.stephenpierson.clickyplus` were byte-identical before and after a terminal build (15 rows unchanged), and the designated requirement was unchanged. Nothing was re-prompted.
+
+The mechanism: TCC matches on **bundle ID + designated requirement** (the signing certificate), not on the binary hash. Rebuilding with the same toolchain and signing identity cannot disturb it.
+
+**The one thing that DOES break TCC** — and is the likely origin of the old rule — is building with a *different* Xcode, e.g.
+`DEVELOPER_DIR=~/Downloads/Xcode.app/Contents/Developer xcodebuild …`
+(found once in shell history). A different toolchain can change the signature, which changes the designated requirement, which invalidates every grant. Use the default toolchain (`xcode-select -p` → `/Applications/Xcode.app`) and never override `DEVELOPER_DIR`.
 
 ## Cloudflare Worker
 
@@ -143,7 +156,7 @@ IMPORTANT: Follow these naming rules strictly. Clarity is the top priority.
 - Do not add docstrings, comments, or type annotations to code you did not change
 - Do not try to fix the known non-blocking warnings (Swift 6 concurrency, deprecated onChange)
 - Do not rename the project directory or scheme (the "leanring" typo is intentional/legacy)
-- Do not run `xcodebuild` from the terminal — it invalidates TCC permissions
+- Do not override `DEVELOPER_DIR` when building — a non-default Xcode changes the code signature and DOES invalidate TCC grants. Plain `xcodebuild` with the default toolchain is safe (verified 2026-08-05); see Build & Run.
 
 ## Coding Behavior (Karpathy principles)
 
