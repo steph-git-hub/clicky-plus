@@ -247,6 +247,10 @@ actor MarinMemoryStore {
             await self?.applyWriteToIndex(newLine: newLine, category: category, removedLine: replacedLine)
         }
 
+        // v16r17 (2026-08-04): journal the capture so "undo that last
+        // thing" can find it by recency instead of by semantic search.
+        MarinCaptureJournal.record(kind: .memory, line: newLine, path: notePath, category: category, replaced: replacedLine)
+
         Self.logMemoryAction("remember", "category=\(category) engine=\(engine) action=\(replacedLine != nil ? "updated" : "added") line=\"\(memoryLine)\"")
         NotificationCenter.default.post(
             name: Self.memorySavedNotification, object: nil,
@@ -347,6 +351,96 @@ actor MarinMemoryStore {
             userInfo: ["kind": "forget", "text": line]
         )
         return ["status": "ok", "forgot": line]
+    }
+
+    // MARK: - Last capture / undo (v16r17, 2026-08-04)
+
+    /// Read-only: what did Marin just capture, and WHERE. Exists because
+    /// she confidently answered "I didn't capture anything" 30 seconds
+    /// after writing to the Idea Inbox — she had no way to look at her
+    /// own recent writes, only to semantic-search one of the two stores.
+    func lastCapture() -> [String: Any] {
+        guard let e = MarinCaptureJournal.last() else {
+            return ["status": "none", "reason": "No capture on record. Tell Steph you have nothing captured recently — do NOT guess."]
+        }
+        return [
+            "status": "ok",
+            "captured": e.line,
+            "destination": e.kind == .memory ? "Marin Memory note" : "Obsidian Idea Inbox",
+            "category": e.category ?? "",
+            "at": ISO8601DateFormatter().string(from: e.at),
+        ]
+    }
+
+    /// Delete the most recent capture, whichever store it landed in.
+    /// Recency-based on purpose: "undo that" arrives when Steph does NOT
+    /// want to re-describe what he just said, which is exactly the input
+    /// semantic search needs. No query, no relevance gate, no ambiguity.
+    func undoLastCapture() async -> [String: Any] {
+        guard let e = MarinCaptureJournal.last() else {
+            return ["status": "none", "reason": "Nothing to undo — no capture on record. Tell Steph that plainly; do NOT delete anything else."]
+        }
+        switch e.kind {
+        case .memory:
+            do {
+                try removeLineFromNote(e.line)
+            } catch {
+                return ["status": "error", "reason": "Could not edit Marin Memory note: \(error.localizedDescription)"]
+            }
+            // If this capture overwrote a real memory (dedupe/update
+            // path), put that one back — undoing an accidental capture
+            // must not take a genuine memory down with it.
+            if let restored = e.replaced {
+                try? appendLineToNote(restored, categoryKey: e.category ?? "references")
+            }
+            // Drop it from the vector index too, else recall keeps
+            // surfacing a line that no longer exists in the note.
+            if let db = try? await database() {
+                let staleIDs = sidecar.filter { $0.value.kind == "marin" && $0.value.line == e.line }
+                    .compactMap { UUID(uuidString: $0.key) }
+                if !staleIDs.isEmpty {
+                    try? await db.deleteDocuments(ids: staleIDs)
+                    for id in staleIDs { sidecar.removeValue(forKey: id.uuidString) }
+                    saveSidecar()
+                }
+            }
+        case .inbox:
+            do {
+                try Self.removeLineFromInbox(e.line, path: e.path)
+            } catch {
+                return ["status": "error", "reason": "Could not edit Idea Inbox: \(error.localizedDescription)"]
+            }
+        }
+        MarinCaptureJournal.drop(id: e.id)
+        let destination = e.kind == .memory ? "Marin Memory note" : "Idea Inbox"
+        Self.logMemoryAction("undo_last", "kind=\(e.kind.rawValue) removed=\"\(e.line)\"")
+        NotificationCenter.default.post(
+            name: Self.memorySavedNotification, object: nil,
+            userInfo: ["kind": "forget", "text": e.line]
+        )
+        return [
+            "status": "ok",
+            "removed": e.line,
+            "destination": destination,
+            "say": "Confirm in ONE short sentence naming what you removed and from where, so Steph can tell you undid the right thing. E.g. \"Removed that meet-time bug note from your Idea Inbox.\"",
+        ]
+    }
+
+    /// Idea Inbox lines are plain `- [ ] <body>` bullets with no index —
+    /// matched verbatim against the journal's stored body.
+    private static func removeLineFromInbox(_ line: String, path: String) throws {
+        let content = try String(contentsOfFile: path, encoding: .utf8)
+        var lines = content.components(separatedBy: "\n")
+        guard let idx = lines.firstIndex(where: {
+            let t = $0.trimmingCharacters(in: .whitespaces)
+            return t == "- [ ] \(line)" || t == "- \(line)"
+        }) else {
+            // Already gone (Steph deleted it by hand, or a sweep routed
+            // it). Not an error — the desired end state already holds.
+            return
+        }
+        lines.remove(at: idx)
+        try lines.joined(separator: "\n").write(toFile: path, atomically: true, encoding: .utf8)
     }
 
     /// v16qe (2026-06-07): mark a to-do DONE — checks the box in the

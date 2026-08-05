@@ -535,17 +535,17 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         // ── Marin memory repository (v16qc, 2026-06-06) ────────
         [
             "name": "memory",
-            "description": "Steph's voice memory repository — one gateway tool, four operations. USE operation='remember' whenever he says 'remember this/that…', 'remember for me…', 'don't let me forget…', 'make a note that…', 'add X to my to-dos', 'put X on my to-do list', 'add that to my memory/memory file' — pass his words as `content`; the app distills and files them (to-do phrasing → category='todos'). TWO HARD ROUTING RULES: (1) HIS TO-DOS LIVE HERE, NOT IN CLICKUP — never create a ClickUp task for 'to-dos'/'to-do list'/'remember to' phrasing; only use the clickup tool when he explicitly says 'ClickUp' or 'task'. (2) 'Remind me to X' / 'set/create a reminder to X' is the separate `create_reminder` tool (a TIMED Apple Reminders alert that pings him) — NOT memory and NOT ClickUp. `memory` is the passive list of things to RECALL later; anything that should ALERT him at a time goes to create_reminder. USE operation='recall' BEFORE ever saying you don't know/don't remember, whenever he asks 'what did I call X', 'where did I save Y', 'what did I say about Z', 'do you remember…' — pass the question as `content`; it searches his stored memories AND his Claude Memory notes by meaning. USE operation='complete' when he says a to-do is done — 'mark it as done', 'check that off', 'I did X', 'that's done', 'finished that' — it checks the box and KEEPS the line. USE operation='forget' ONLY when he explicitly says forget/delete/remove a memory — it deletes the line permanently; NEVER use forget for 'done' phrasing. USE operation='list' to read back stored memories (optional `category` filter: files, todos, personal, references). CONFIRMATION RULE for remember/forget/complete: a labeled indicator ('✓ Saved' / '✓ Forgot' / '✓ Done') appears at his cursor automatically — you MUST stay completely SILENT. No 'saved', no 'forgotten', no 'done', no 'got it', not one word; just wait for his next words. For recall: answer in ONE short sentence from the best match; mention the source only if he asks. If matches are weak/irrelevant, say you don't have it — never invent a memory.",
+            "description": "Steph's voice memory repository — one gateway tool, seven operations. USE operation='remember' whenever he says 'remember this/that…', 'remember for me…', 'don't let me forget…', 'make a note that…', 'add X to my to-dos', 'put X on my to-do list', 'add that to my memory/memory file' — pass his words as `content`; the app distills and files them (to-do phrasing → category='todos'). TWO HARD ROUTING RULES: (1) HIS TO-DOS LIVE HERE, NOT IN CLICKUP — never create a ClickUp task for 'to-dos'/'to-do list'/'remember to' phrasing; only use the clickup tool when he explicitly says 'ClickUp' or 'task'. (2) 'Remind me to X' / 'set/create a reminder to X' is the separate `create_reminder` tool (a TIMED Apple Reminders alert that pings him) — NOT memory and NOT ClickUp. `memory` is the passive list of things to RECALL later; anything that should ALERT him at a time goes to create_reminder. USE operation='recall' BEFORE ever saying you don't know/don't remember, whenever he asks 'what did I call X', 'where did I save Y', 'what did I say about Z', 'do you remember…' — pass the question as `content`; it searches his stored memories AND his Claude Memory notes by meaning. USE operation='complete' when he says a to-do is done — 'mark it as done', 'check that off', 'I did X', 'that's done', 'finished that' — it checks the box and KEEPS the line. USE operation='forget' ONLY when he explicitly says forget/delete/remove a memory — it deletes the line permanently; NEVER use forget for 'done' phrasing. USE operation='list' to read back stored memories (optional `category` filter: files, todos, personal, references). CONFIRMATION RULE for remember/forget/complete: a labeled indicator ('✓ Saved' / '✓ Forgot' / '✓ Done') appears at his cursor automatically — you MUST stay completely SILENT. No 'saved', no 'forgotten', no 'done', no 'got it', not one word; just wait for his next words. For recall: answer in ONE short sentence from the best match; mention the source only if he asks. If matches are weak/irrelevant, say you don't have it — never invent a memory. USE operation='undo_last' — NOT forget — whenever he wants the thing you JUST captured taken back without describing it: 'undo that', 'undo that last thing', 'delete the last thing you captured', 'remove what you just captured', 'scratch that', 'never mind that', 'that was a mistake', 'I meant to dictate that / I meant to hit transcription'. It deletes the most recent capture by RECENCY, works whether it went to the memory note or the Idea Inbox, and needs no `content`. forget requires him to describe the memory and only searches the memory note — it will MISS an Idea Inbox capture entirely, which is exactly the failure that made this operation necessary. USE operation='last_capture' when he asks what or where you just captured: 'where did you capture that', 'what did you just save', 'did that go anywhere'. NEVER answer 'I didn't capture anything' from memory — call last_capture and read back what it returns. For undo_last and last_capture you MUST speak (these are NOT silent ops): say in one short sentence what was removed/found and from where, so he can confirm you got the right one.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
                     "operation": [
                         "type": "STRING",
-                        "description": "One of: remember, recall, complete, forget, list.",
+                        "description": "One of: remember, recall, complete, forget, list, last_capture, undo_last.",
                     ],
                     "content": [
                         "type": "STRING",
-                        "description": "For remember: what to store (his words, lightly trimmed). For recall/complete/forget: the search query. Unused for list.",
+                        "description": "For remember: what to store (his words, lightly trimmed). For recall/complete/forget: the search query. Unused for list, last_capture, and undo_last — undo_last works purely by recency, so never invent a query for it.",
                     ],
                     "category": [
                         "type": "STRING",
@@ -1391,8 +1391,16 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 return await MarinMemoryStore.shared.complete(query: content)
             case "list":
                 return await MarinMemoryStore.shared.list(categoryKey: category)
+            // v16r17 (2026-08-04): recency-based undo. `forget` searches
+            // only the vector index, so an Idea Inbox capture was
+            // unreachable — "undo that last thing" got "I didn't find a
+            // matching memory" while the note sat in Idea Inbox.md.
+            case "last_capture":
+                return await MarinMemoryStore.shared.lastCapture()
+            case "undo_last":
+                return await MarinMemoryStore.shared.undoLastCapture()
             default:
-                return ["status": "error", "reason": "Unknown memory operation '\(op)'. Valid: remember, recall, forget, list."]
+                return ["status": "error", "reason": "Unknown memory operation '\(op)'. Valid: remember, recall, complete, forget, list, last_capture, undo_last."]
             }
         case "create_reminder":
             return await createReminder(args: args)

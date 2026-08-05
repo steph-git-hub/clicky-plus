@@ -869,7 +869,10 @@ actor MarinHelperSubAgent {
         }
         let inboxPath = NSString("~/Desktop/Claude Cowork/Obsidian/Steph Vault/Inbox/Idea Inbox.md").expandingTildeInPath
         let ts = ISO8601DateFormatter().string(from: Date())
-        let entry = "- [ ] \(trimmed) — *captured \(ts) via helper*\n"
+        // v16r17 (2026-08-04): `body` split out so the capture journal can
+        // store the exact line text (minus bullet) for undo_last to match.
+        let body = "\(trimmed) — *captured \(ts) via helper*"
+        let entry = "- [ ] \(body)\n"
         let parentDir = (inboxPath as NSString).deletingLastPathComponent
         try? FileManager.default.createDirectory(atPath: parentDir, withIntermediateDirectories: true, attributes: nil)
         if FileManager.default.fileExists(atPath: inboxPath) {
@@ -878,6 +881,7 @@ actor MarinHelperSubAgent {
                 let joiner = existing.hasSuffix("\n") ? "" : "\n"
                 let updated = existing + joiner + entry
                 try updated.write(toFile: inboxPath, atomically: true, encoding: .utf8)
+                MarinCaptureJournal.record(kind: .inbox, line: body, path: inboxPath)
                 return "OK: appended to Idea Inbox"
             } catch {
                 return "ERROR appending to inbox: \(error.localizedDescription)"
@@ -886,6 +890,7 @@ actor MarinHelperSubAgent {
             do {
                 let header = "# Idea Inbox\n\n"
                 try (header + entry).write(toFile: inboxPath, atomically: true, encoding: .utf8)
+                MarinCaptureJournal.record(kind: .inbox, line: body, path: inboxPath)
                 return "OK: created Idea Inbox with first entry"
             } catch {
                 return "ERROR creating inbox: \(error.localizedDescription)"
