@@ -3455,6 +3455,124 @@ async function handleVoiceCommandPolish(
 }
 
 /**
+ * v16r18 (2026-08-06): shared trailing-leak repair for /repunctuate and
+ * /polish.
+ *
+ * Failure mode this exists for: the model emits the correct transformed
+ * text and THEN keeps going, appending commentary, a question back to
+ * the user, or raw chain-of-thought. Because the wanted text is fully
+ * present and correct at the head, none of the shrink-direction guards
+ * (conversational-response, pronoun-flip, word-drop) can detect it —
+ * word overlap with the input is ~1.0 by construction.
+ *
+ * Detection: greedily align the input's word tokens against the head of
+ * the output, allowing a small lookahead window so legitimate insertions
+ * (colloquial expansion, "wanna" -> "want to") don't break the walk. If
+ * nearly all input words are accounted for well before the output ends,
+ * everything past the last matched word is leak.
+ *
+ * Repair, not fallback: the head IS the output we want, so truncate
+ * there rather than discarding good punctuation and pasting raw ASR.
+ *
+ * Conservative by design — returns the output untouched unless the
+ * alignment is strong AND the tail actually contains words.
+ */
+const TRAILING_LEAK_MIN_ALIGNMENT = 0.85;
+const TRAILING_LEAK_LOOKAHEAD = 4;
+
+function repairTrailingLeak(
+  inputText: string,
+  outputText: string
+): { text: string; repaired: boolean; alignment: number; dropped: string } {
+  const unchanged = {
+    text: outputText,
+    repaired: false,
+    alignment: 1,
+    dropped: "",
+  };
+  const normalize = (w: string) => w.toLowerCase().replace(/[^a-z0-9']/g, "");
+
+  const inputTokens = (inputText.match(/[A-Za-z0-9']+/g) ?? [])
+    .map(normalize)
+    .filter((w) => w.length > 0);
+  // Tokenize the output while keeping each token's end offset so we know
+  // where to cut in the ORIGINAL string (preserving punctuation/spacing).
+  const outputTokens: Array<{ word: string; end: number }> = [];
+  const tokenPattern = /[A-Za-z0-9']+/g;
+  let match: RegExpExecArray | null;
+  while ((match = tokenPattern.exec(outputText)) !== null) {
+    const word = normalize(match[0]);
+    if (word.length > 0) {
+      outputTokens.push({ word, end: match.index + match[0].length });
+    }
+  }
+
+  // Too short to judge, or the output isn't actually longer — nothing
+  // to repair. (Shrinkage is the word-drop guard's job, not ours.)
+  if (inputTokens.length < 4 || outputTokens.length <= inputTokens.length) {
+    return unchanged;
+  }
+
+  let cursor = 0;
+  let matched = 0;
+  let lastMatchedEnd = -1;
+  for (const inputWord of inputTokens) {
+    const windowEnd = Math.min(outputTokens.length, cursor + TRAILING_LEAK_LOOKAHEAD);
+    let found = -1;
+    for (let k = cursor; k < windowEnd; k++) {
+      if (outputTokens[k].word === inputWord) {
+        found = k;
+        break;
+      }
+    }
+    if (found >= 0) {
+      matched += 1;
+      lastMatchedEnd = outputTokens[found].end;
+      cursor = found + 1;
+    }
+    // On a miss the model dropped or substituted that word — hold the
+    // cursor so we stay aligned instead of skidding out of sync.
+  }
+
+  const alignment = inputTokens.length > 0 ? matched / inputTokens.length : 0;
+  if (alignment < TRAILING_LEAK_MIN_ALIGNMENT || lastMatchedEnd < 0) {
+    return unchanged;
+  }
+
+  const tail = outputText.slice(lastMatchedEnd);
+  // Tail is only punctuation/whitespace — that's a normal ending, not a leak.
+  if (!/[A-Za-z0-9]/.test(tail)) {
+    return unchanged;
+  }
+
+  // Keep a sentence terminator (and any closing quote/bracket) that sits
+  // immediately after the last matched word — it belongs to the transcript.
+  const terminator = tail.match(/^["')\]]*[.?!…]+["')\]]*/);
+  const cut = lastMatchedEnd + (terminator ? terminator[0].length : 0);
+  let repaired = outputText.slice(0, cut).trimEnd();
+
+  // If the cut landed mid-sentence but the input ended on a terminator,
+  // carry that terminator over so the paste doesn't end bare.
+  if (!/[.?!…]["')\]]*$/.test(repaired)) {
+    const inputTerminator = inputText.trimEnd().match(/[.?!…]$/);
+    if (inputTerminator) {
+      repaired += inputTerminator[0];
+    }
+  }
+
+  if (repaired.length === 0) {
+    return unchanged;
+  }
+
+  return {
+    text: repaired,
+    repaired: true,
+    alignment,
+    dropped: outputText.slice(cut).trim(),
+  };
+}
+
+/**
  * /repunctuate — context-aware punctuation pass.
  *
  * AssemblyAI's pause-detection auto-punctuation inserts a comma every
@@ -3776,11 +3894,32 @@ async function handleRepunctuate(request: Request, env: Env): Promise<Response> 
   const anthropicResponseJson = (await anthropicResponse.json()) as {
     content?: Array<{ type: string; text?: string }>;
   };
-  const punctuatedText = (anthropicResponseJson.content ?? [])
+  const punctuatedTextRaw = (anthropicResponseJson.content ?? [])
     .filter((block) => block.type === "text" && typeof block.text === "string")
     .map((block) => block.text as string)
     .join("")
     .trim();
+
+  // v16r18 (2026-08-06): trailing-leak repair. Caught 2026-08-06 twice —
+  // Haiku returned the CORRECT punctuated transcript and then kept
+  // talking, appending its own commentary after it ("Wait, I need to
+  // flag something: you've got a sentence fragment...", and a full
+  // chain-of-thought dump on the polish route). Every guard below is
+  // shrink-direction — they assume meta-text REPLACES the transcript —
+  // so a leak APPENDED to an otherwise-perfect output sailed through
+  // all three. Repair rather than fall back: the head of the output is
+  // genuinely the punctuated text we want, so truncate at the end of
+  // the last input word instead of throwing away good punctuation.
+  const trailingLeak = repairTrailingLeak(inputTextRaw, punctuatedTextRaw);
+  if (trailingLeak.repaired) {
+    console.error(
+      `[/repunctuate] trailing leak repaired ` +
+        `(alignment=${trailingLeak.alignment.toFixed(2)}, ` +
+        `droppedChars=${punctuatedTextRaw.length - trailingLeak.text.length}; ` +
+        `dropped="${trailingLeak.dropped.slice(0, 120)}")`
+    );
+  }
+  const punctuatedText = trailingLeak.text;
 
   // v15p3ap (2026-05-11): post-validation. Despite the strict system
   // prompt above, Haiku still occasionally responds conversationally —
@@ -3957,10 +4096,55 @@ async function handleRepunctuate(request: Request, env: Env): Promise<Response> 
     );
   }
 
-  return new Response(JSON.stringify({ output: punctuatedText }), {
-    status: 200,
-    headers: { "content-type": "application/json" },
-  });
+  // v16r18 (2026-08-06): word-GROWTH guard — the missing ceiling under
+  // the word-drop floor above. word_drop trips at ratio < 0.85 but had
+  // no upper bound, so a 127-char input coming back as 1,245 chars of
+  // model commentary passed every check. This is the backstop for leaks
+  // repairTrailingLeak couldn't align (e.g. the model reworded the head
+  // heavily AND appended commentary).
+  //
+  // Legitimate growth is real but small: /repunctuate expands colloquial
+  // reductions ("wanna" -> "want to", "gonna" -> "going to"), so a
+  // reduction-heavy utterance can gain a handful of words. Require BOTH
+  // a >30% ratio jump AND >=6 net words added before tripping, so short
+  // utterances and normal expansion stay clear.
+  const netWordsAdded = outputAlnumWordCount - inputAlnumWordCount;
+  const wordGrowthDetected = inputAlnumWordCount >= 4
+    && wordCountRatio > 1.30
+    && netWordsAdded >= 6;
+
+  if (wordGrowthDetected) {
+    console.error(
+      `[/repunctuate] guard tripped: word-growth detected ` +
+        `(inputWords=${inputAlnumWordCount}, outputWords=${outputAlnumWordCount}, ` +
+        `ratio=${wordCountRatio.toFixed(2)}, added=${netWordsAdded}; ` +
+        `input="${inputTextRaw.slice(0, 80)}", ` +
+        `output="${punctuatedText.slice(0, 120)}") — falling back to raw input`
+    );
+    return new Response(
+      JSON.stringify({
+        output: inputTextRaw,
+        guardTripped: "word_growth",
+        diagnostic: {
+          inputWordCount: inputAlnumWordCount,
+          outputWordCount: outputAlnumWordCount,
+          ratio: wordCountRatio,
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  return new Response(
+    JSON.stringify({
+      output: punctuatedText,
+      ...(trailingLeak.repaired ? { repaired: "trailing_leak" } : {}),
+    }),
+    {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }
+  );
 }
 
 /**

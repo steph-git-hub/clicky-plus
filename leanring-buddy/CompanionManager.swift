@@ -4899,7 +4899,39 @@ final class CompanionManager: ObservableObject {
                 // paste only contains the actual polished output.
                 // Pattern: optional intro phrase + colon + optional
                 // newlines at the very start of the response.
-                let polishedText = Self.stripPolishPreamble(rawPolishedText)
+                let preambleStrippedText = Self.stripPolishPreamble(rawPolishedText)
+
+                // v16r18 (2026-08-06): trailing-leak guard — the other half
+                // of the preamble strip above. Incident 2026-08-06 10:34:
+                // 127 chars in, 1,245 out. The model returned the correct
+                // text and then appended its own chain-of-thought ("Hmm,
+                // that doesn't quite make sense. Let me re-read the
+                // guidance."), which pasted straight into Steph's field.
+                // Preamble-strip is prefix-only and never looked at the
+                // tail. Polish runs on local qwen3.5-4b (a thinking model),
+                // so leaked reasoning is a live risk on every call.
+                //
+                // minAlignment 0.90 + allowRejection:false is deliberately
+                // conservative: it only fires when the head reproduced the
+                // input near-verbatim, i.e. a light-touch polish that was
+                // never asked to ADD content. A Full Polish rewrite aligns
+                // well below 0.90 and is left completely alone.
+                let polishGuardResult = Self.guardTransformedText(
+                    input: textToPolish,
+                    output: preambleStrippedText,
+                    minAlignment: 0.90,
+                    allowRejection: false
+                )
+                Self.appendTransformGuardLog(
+                    stage: isFormatResponseIntent ? "polish-format-response" : "polish",
+                    input: textToPolish,
+                    output: preambleStrippedText,
+                    result: polishGuardResult
+                )
+                if polishGuardResult.repaired {
+                    print("✂️ Polish: trailing leak trimmed (\(preambleStrippedText.count) → \(polishGuardResult.text.count) chars)")
+                }
+                let polishedText = polishGuardResult.text
 
                 let trimmedPolishedText = polishedText.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -5700,6 +5732,242 @@ final class CompanionManager: ObservableObject {
         return raw
     }
 
+    // MARK: - Trailing-leak guard (v16r18, 2026-08-06)
+    //
+    // Incident 2026-08-06: two dictations pasted the correct text and
+    // then the model's own commentary after it —
+    //   polish  10:34 — 127 chars in, 1,245 out; tail was raw
+    //           chain-of-thought ("Hmm, that doesn't quite make sense.
+    //           Let me re-read the guidance.")
+    //   toggle  10:51 — tail was Marin-style dialogue back at Steph
+    //           ("Wait, I need to flag something: you've got a sentence
+    //           fragment...")
+    //
+    // Why nothing caught it:
+    //   1. stripPolishPreamble above is PREFIX-only — a fixed list of 25
+    //      opener strings. Trailing leakage was never in scope.
+    //   2. The Worker's three guards (conversational-response,
+    //      pronoun-flip, word-drop) are all SHRINK-direction. They assume
+    //      meta-text REPLACES the transcript; here it was APPENDED, so
+    //      word overlap with the input was ~1.0 and word_drop's ratio
+    //      floor (0.85) has no matching ceiling.
+    //   3. Most importantly: repunctuate and polish now run LOCALLY on
+    //      qwen3.5-4b (v16pv/v16py local-first), so the Worker's guards
+    //      never even executed. qwen3.5 is a thinking model — when the
+    //      server's think-tag router doesn't catch a reasoning block, it
+    //      lands verbatim in Steph's text field. The guard has to live
+    //      here, on the client, where both paths converge.
+    //
+    // Repair rather than reject: the HEAD of the output is genuinely the
+    // text we want, so truncate at the end of the last input word instead
+    // of throwing away good punctuation and pasting raw ASR.
+
+    struct TransformGuardResult {
+        /// Text to use. Equals the input-side fallback when `rejected`.
+        let text: String
+        /// True when a trailing leak was detected and truncated.
+        let repaired: Bool
+        /// True when the output was unsalvageable and the caller should
+        /// fall back (to the Worker path, or to the raw transcript).
+        let rejected: Bool
+        /// Short machine-readable reason, for the diag log.
+        let reason: String?
+        /// What got cut, for the diag log.
+        let dropped: String
+    }
+
+    /// Lowercased, apostrophe-stripped word tokens paired with the index
+    /// (into the source's Character array) just past the token's last
+    /// character — so we can cut the ORIGINAL string and keep its
+    /// punctuation and spacing intact.
+    private static func alignmentTokens(_ source: [Character]) -> [(word: String, end: Int)] {
+        var tokens: [(String, Int)] = []
+        var current = ""
+        for (index, character) in source.enumerated() {
+            if character.isLetter || character.isNumber || character == "'" || character == "’" {
+                current.append(character)
+            } else if !current.isEmpty {
+                let normalized = current.lowercased().replacingOccurrences(of: "'", with: "")
+                    .replacingOccurrences(of: "’", with: "")
+                if !normalized.isEmpty { tokens.append((normalized, index)) }
+                current = ""
+            }
+        }
+        if !current.isEmpty {
+            let normalized = current.lowercased().replacingOccurrences(of: "'", with: "")
+                .replacingOccurrences(of: "’", with: "")
+            if !normalized.isEmpty { tokens.append((normalized, source.count)) }
+        }
+        return tokens
+    }
+
+    /// How far ahead to look for the next input word before treating it
+    /// as dropped. Absorbs legitimate insertions (colloquial expansion,
+    /// "wanna" -> "want to") without losing sync.
+    private static let transformGuardLookahead = 4
+
+    /// Validate a transformed transcript (repunctuate or polish output)
+    /// against the text that went in.
+    ///
+    /// - `minAlignment`: how much of the input must be reproduced in the
+    ///   output's head before we're willing to call the tail a leak.
+    ///   0.85 for repunctuate (near-verbatim transform). Callers doing a
+    ///   substantive rewrite (Full Polish) should pass a HIGHER bar, so
+    ///   that a genuine restructure — which necessarily aligns poorly —
+    ///   is left alone rather than truncated.
+    /// - `allowRejection`: when true, an output that grew implausibly
+    ///   without aligning is rejected outright so the caller can fall
+    ///   back. Off for Full Polish, where large rewrites are the point.
+    static func guardTransformedText(
+        input: String,
+        output: String,
+        minAlignment: Double = 0.85,
+        allowRejection: Bool = true
+    ) -> TransformGuardResult {
+        let passthrough = TransformGuardResult(
+            text: output, repaired: false, rejected: false, reason: nil, dropped: ""
+        )
+
+        let outputCharacters = Array(output)
+        let inputTokens = alignmentTokens(Array(input)).map(\.word)
+        let outputTokens = alignmentTokens(outputCharacters)
+
+        // Too short to judge. Shrinkage is the word-drop guard's job.
+        guard inputTokens.count >= 4 else { return passthrough }
+        guard outputTokens.count > inputTokens.count else { return passthrough }
+
+        var cursor = 0
+        var matched = 0
+        var lastMatchedEnd = -1
+        for inputWord in inputTokens {
+            let windowEnd = min(outputTokens.count, cursor + transformGuardLookahead)
+            var found = -1
+            var k = cursor
+            while k < windowEnd {
+                if outputTokens[k].word == inputWord { found = k; break }
+                k += 1
+            }
+            if found >= 0 {
+                matched += 1
+                lastMatchedEnd = outputTokens[found].end
+                cursor = found + 1
+            }
+            // On a miss the model dropped or substituted that word — hold
+            // the cursor so we stay aligned instead of skidding out of sync.
+        }
+
+        let alignment = Double(matched) / Double(inputTokens.count)
+        let growthRatio = Double(outputTokens.count) / Double(inputTokens.count)
+        let netWordsAdded = outputTokens.count - inputTokens.count
+
+        if alignment >= minAlignment, lastMatchedEnd >= 0 {
+            let tail = String(outputCharacters[lastMatchedEnd...])
+            // Tail is only punctuation/whitespace — a normal ending, not a leak.
+            guard tail.contains(where: { $0.isLetter || $0.isNumber }) else {
+                return passthrough
+            }
+            // Keep a sentence terminator (plus any closing quote/bracket)
+            // sitting immediately after the last matched word — it belongs
+            // to the transcript.
+            var cut = lastMatchedEnd
+            var sawTerminator = false
+            var index = lastMatchedEnd
+            while index < outputCharacters.count {
+                let character = outputCharacters[index]
+                if character == "\"" || character == "'" || character == ")" || character == "]"
+                    || character == "”" || character == "’" {
+                    index += 1
+                } else if character == "." || character == "?" || character == "!" || character == "…" {
+                    sawTerminator = true
+                    index += 1
+                    cut = index
+                } else {
+                    break
+                }
+            }
+            if !sawTerminator { cut = lastMatchedEnd }
+
+            var repairedText = String(outputCharacters[..<cut])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            // Cut landed mid-sentence but the input ended on a terminator —
+            // carry it over so the paste doesn't end bare.
+            if let inputLast = input.trimmingCharacters(in: .whitespacesAndNewlines).last,
+               ".?!…".contains(inputLast),
+               let repairedLast = repairedText.last,
+               !".?!…\"')]”’".contains(repairedLast) {
+                repairedText.append(inputLast)
+            }
+            guard !repairedText.isEmpty else { return passthrough }
+
+            return TransformGuardResult(
+                text: repairedText,
+                repaired: true,
+                rejected: false,
+                reason: "trailing_leak",
+                dropped: String(outputCharacters[cut...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+
+        // Didn't align well enough to repair. If it ALSO ballooned, the
+        // output isn't a transform of the input at all — reject so the
+        // caller falls back. Both conditions required: legitimate growth
+        // (colloquial expansion) is small, and a poor-aligning rewrite at
+        // similar length is normal for Full Polish.
+        if allowRejection, growthRatio > 1.30, netWordsAdded >= 6 {
+            return TransformGuardResult(
+                text: input,
+                repaired: false,
+                rejected: true,
+                reason: "word_growth",
+                dropped: output
+            )
+        }
+
+        return passthrough
+    }
+
+    private static let transformGuardLogPath = "/tmp/clicky_transform_guard.log"
+    private static let transformGuardLogQueue = DispatchQueue(
+        label: "com.stephenpierson.clickyplus.transform-guard-log"
+    )
+
+    /// Log every guard trip so this failure mode stops being invisible.
+    /// No-op when the guard passed the text through untouched.
+    static func appendTransformGuardLog(
+        stage: String,
+        input: String,
+        output: String,
+        result: TransformGuardResult
+    ) {
+        guard result.repaired || result.rejected else { return }
+        transformGuardLogQueue.async {
+            let escape: (String) -> String = { text in
+                text.replacingOccurrences(of: "\n", with: "\\n")
+                    .replacingOccurrences(of: "\t", with: " ")
+            }
+            let line = [
+                ISO8601DateFormatter().string(from: Date()),
+                stage,
+                result.reason ?? "unknown",
+                result.rejected ? "REJECTED" : "REPAIRED",
+                "inLen=\(input.count)",
+                "outLen=\(output.count)",
+                "keptLen=\(result.text.count)",
+                "dropped=\"\(escape(String(result.dropped.prefix(200))))\"",
+            ].joined(separator: "\t") + "\n"
+            guard let data = line.data(using: .utf8) else { return }
+            let url = URL(fileURLWithPath: transformGuardLogPath)
+            if FileManager.default.fileExists(atPath: transformGuardLogPath),
+               let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            } else {
+                try? data.write(to: url)
+            }
+        }
+    }
+
     /// Appends the raw transcript to the user's Obsidian Idea Inbox.
     /// Format: `- YYYY-MM-DD — [?] <transcript>\n`. Empty transcripts
     /// are dropped so a mis-triggered hotkey can't fill the inbox with
@@ -5909,6 +6177,32 @@ final class CompanionManager: ObservableObject {
                     )
                     if localText == nil {
                         print("⚠️ Repunctuate (local) failed — falling back to Worker")
+                    }
+                }
+                // v16r18 (2026-08-06): the local model's output has never
+                // been validated — the Worker's guard chain doesn't run on
+                // this path. Check it here before it reaches the paste.
+                // A rejection falls through to the Worker exactly like any
+                // other local failure.
+                if let candidate = localText {
+                    let guardResult = Self.guardTransformedText(
+                        input: preSubstitutedText,
+                        output: candidate
+                    )
+                    Self.appendTransformGuardLog(
+                        stage: "repunctuate-local",
+                        input: preSubstitutedText,
+                        output: candidate,
+                        result: guardResult
+                    )
+                    if guardResult.rejected {
+                        print("⚠️ Repunctuate (local) rejected by guard (\(guardResult.reason ?? "unknown")) — falling back to Worker")
+                        localText = nil
+                    } else {
+                        if guardResult.repaired {
+                            print("✂️ Repunctuate (local): trailing leak trimmed (\(candidate.count) → \(guardResult.text.count) chars)")
+                        }
+                        localText = guardResult.text
                     }
                 }
                 if let localText {
