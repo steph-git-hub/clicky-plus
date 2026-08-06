@@ -476,6 +476,55 @@ final class CompanionManager: ObservableObject {
     /// / "scribe" / "parakeet".
     @AppStorage("clicky.vtt.provider") private(set) var selectedVTTProvider: String = "deepgram"
 
+    /// v16r20 (2026-08-06): user-facing notice when the VTT engine was
+    /// switched out from under the user, or when the current one is
+    /// refusing. Nil when nothing to show; auto-clears after ~8s.
+    @Published private(set) var vttProviderFallbackNotice: String?
+    private var vttProviderFallbackNoticeDismissTask: DispatchWorkItem?
+
+    /// v16r20 (2026-08-06): the engine we fall back to when the selected
+    /// one refuses at the account level. Deepgram is the historical
+    /// default and bills separately, so an exhausted ElevenLabs quota
+    /// can't take dictation down with it.
+    private static let fallbackVTTProvider = "deepgram"
+
+    /// Handles a provider refusing to work for reasons no retry can fix
+    /// (quota exhausted, auth revoked). Switches to the fallback engine
+    /// and surfaces the provider's own explanation, so the next engage
+    /// simply works and the user knows what to go fix.
+    ///
+    /// Deliberately one-way: it does NOT switch back automatically, since
+    /// we'd have no way to know the account was topped up short of
+    /// burning an engage to find out.
+    fileprivate func handleVTTProviderFatalError(label: String, reason: String) {
+        let previous = selectedVTTProvider
+        guard previous != Self.fallbackVTTProvider else {
+            // Already on the fallback — nothing to switch to. Surface the
+            // reason and leave the selection alone.
+            vttProviderFallbackNotice = "\(label): \(reason)"
+            scheduleVTTProviderFallbackNoticeDismissal()
+            return
+        }
+
+        selectedVTTProvider = Self.fallbackVTTProvider
+        ScribeStreamingTranscriptionProvider.appendSessionDiag(
+            "PROVIDER FALLBACK \(previous) → \(Self.fallbackVTTProvider): \(label) — \(reason)"
+        )
+        print("🔀 VTT engine: \(previous) → \(Self.fallbackVTTProvider) (\(label): \(reason))")
+        vttProviderFallbackNotice =
+            "\(label) unavailable — \(reason) Switched to Deepgram."
+        scheduleVTTProviderFallbackNoticeDismissal()
+    }
+
+    private func scheduleVTTProviderFallbackNoticeDismissal() {
+        vttProviderFallbackNoticeDismissTask?.cancel()
+        let task = DispatchWorkItem { [weak self] in
+            self?.vttProviderFallbackNotice = nil
+        }
+        vttProviderFallbackNoticeDismissTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: task)
+    }
+
     /// Returns the provider instance matching the current selection.
     /// Falls back to Deepgram if the stored value is unrecognized.
     fileprivate var activeVTTProvider: any BuddyTranscriptionProvider {
@@ -1271,6 +1320,13 @@ final class CompanionManager: ObservableObject {
         // v16 (2026-06-04): point prewarm at the SELECTED VTT engine so
         // Scribe/Parakeet get warmed (not just the base factory provider).
         buddyDictationManager.activeVTTProviderResolver = { [weak self] in self?.activeVTTProvider }
+        // v16r20 (2026-08-06): auto-switch engines when the selected one
+        // refuses at the account level. Incident 2026-08-06: ElevenLabs
+        // returned quota_exceeded on every Scribe session for hours and
+        // the only symptom was a live indicator that never transcribed.
+        buddyDictationManager.onProviderFatalError = { [weak self] label, reason in
+            self?.handleVTTProviderFatalError(label: label, reason: reason)
+        }
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI

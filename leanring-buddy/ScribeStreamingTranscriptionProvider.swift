@@ -25,13 +25,47 @@
 import AVFoundation
 import Foundation
 
-struct ScribeStreamingTranscriptionProviderError: LocalizedError {
+struct ScribeStreamingTranscriptionProviderError: LocalizedError, BuddyProviderFatalError {
     let message: String
+    /// True when the server refused the session for an account-level
+    /// reason (quota, auth) — retrying or reconnecting cannot help, so
+    /// the caller should switch engines rather than fail silently.
+    var isAccountFatal: Bool = false
     var errorDescription: String? { message }
+
+    var isProviderFatal: Bool { isAccountFatal }
+    var providerFatalReason: String { message }
+    var providerFatalLabel: String { "Scribe" }
 }
 
 final class ScribeStreamingTranscriptionProvider: BuddyTranscriptionProvider {
     private static let tokenProxyURL = "https://clicky-proxy.sapierso.workers.dev/scribe-token"
+
+    /// v16r20 (2026-08-06): session-lifecycle diag at
+    /// /tmp/clicky_scribe_session.log. Scribe previously logged only
+    /// latency, so a server-side refusal — the actual cause of the
+    /// 2026-08-06 outage — left no record anywhere. Shared with the
+    /// engine-fallback path in CompanionManager so the switch and its
+    /// reason land in the same file.
+    private static let sessionDiagQueue = DispatchQueue(
+        label: "com.learningbuddy.scribe.session-diag"
+    )
+
+    static func appendSessionDiag(_ message: String) {
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        sessionDiagQueue.async {
+            let path = "/tmp/clicky_scribe_session.log"
+            guard let data = line.data(using: .utf8) else { return }
+            if FileManager.default.fileExists(atPath: path),
+               let handle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) {
+                defer { try? handle.close() }
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            } else {
+                try? data.write(to: URL(fileURLWithPath: path))
+            }
+        }
+    }
 
     let displayName = "Scribe v2"
     let requiresSpeechRecognitionPermission = false
@@ -101,7 +135,30 @@ final class ScribeStreamingTranscriptionProvider: BuddyTranscriptionProvider {
 
     /// Consume a fresh pre-warmed token if available (single-use), else
     /// fetch one on the spot.
+    /// v16r20 (2026-08-06): last token handed out, kept ONLY to support
+    /// the fault-injection flag below.
+    private var lastIssuedToken: String?
+
+    /// Fault injection for the account-fatal path. Set with:
+    ///   defaults write com.stephenpierson.clickyplus \
+    ///       clicky.debug.forceScribeAuthFailure -bool true
+    /// and the next engage replays a spent single-use token, which
+    /// ElevenLabs refuses with a real `auth_error` — the same shape as a
+    /// quota refusal. That exercises classification → error → engine
+    /// fallback → user notice against the live server.
+    ///
+    /// Exists because the alternative is waiting for a real outage to
+    /// find out whether the recovery path works. On 2026-08-06 it didn't,
+    /// and the cost was a day.
+    private var shouldForceAuthFailure: Bool {
+        UserDefaults.standard.bool(forKey: "clicky.debug.forceScribeAuthFailure")
+    }
+
     private func tokenForEngage() async throws -> String {
+        if shouldForceAuthFailure, let spent = warmingQueue.sync(execute: { lastIssuedToken }) {
+            print("🧪 Scribe: forcing auth failure — replaying spent token")
+            return spent
+        }
         let cached: String? = warmingQueue.sync {
             if let c = cachedToken,
                Date().timeIntervalSince(c.fetchedAt) < Self.tokenFreshnessSeconds {
@@ -111,8 +168,13 @@ final class ScribeStreamingTranscriptionProvider: BuddyTranscriptionProvider {
             cachedToken = nil
             return nil
         }
-        if let cached { return cached }
-        return try await fetchSingleUseToken()
+        if let cached {
+            warmingQueue.async { self.lastIssuedToken = cached }
+            return cached
+        }
+        let fresh = try await fetchSingleUseToken()
+        warmingQueue.async { self.lastIssuedToken = fresh }
+        return fresh
     }
 
     private func fetchSingleUseToken() async throws -> String {
@@ -324,11 +386,22 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
                 // We don't request timestamps; ignore if it arrives.
                 break
             default:
-                if envelope.message_type.lowercased().contains("error") {
-                    let err = try? JSONDecoder().decode(ScribeErrorMessage.self, from: messageData)
-                    let reason = err?.message ?? err?.error ?? err?.reason
-                        ?? "Scribe error (\(envelope.message_type))."
-                    failSession(with: ScribeStreamingTranscriptionProviderError(message: reason))
+                // v16r20 (2026-08-06): classify explicitly instead of
+                // sniffing for the substring "error". `quota_exceeded`
+                // doesn't contain it, so the old heuristic dropped a
+                // hard account failure into the no-op branch below and
+                // the user got a live indicator with no transcript and
+                // no explanation. See BuddyProviderFatalError.
+                if let fatal = ScribeFatalMessageClassifier.classify(text) {
+                    ScribeStreamingTranscriptionProvider.appendSessionDiag(
+                        "FATAL server message type=\(envelope.message_type) "
+                        + "accountFatal=\(fatal.isAccountFatal) reason=\(fatal.reason)"
+                    )
+                    print("[Scribe] ❌ Server refused the session (\(envelope.message_type)): \(fatal.reason)")
+                    failSession(with: ScribeStreamingTranscriptionProviderError(
+                        message: fatal.reason,
+                        isAccountFatal: fatal.isAccountFatal
+                    ))
                 }
                 // Other informational message types: no-op.
             }

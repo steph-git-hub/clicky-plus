@@ -590,6 +590,12 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     @Published private(set) var microphoneButtonRecordingStartedAt: Date?
     @Published private(set) var transcriptionProviderDisplayName = ""
     @Published var lastErrorMessage: String?
+
+    /// v16r20 (2026-08-06): called when a provider reports an
+    /// account-level refusal (quota, auth) that no retry can fix.
+    /// CompanionManager owns the engine selection, so it performs the
+    /// actual switch; this just reports label + reason.
+    var onProviderFatalError: ((_ label: String, _ reason: String) -> Void)?
     @Published private(set) var currentPermissionProblem: BuddyDictationPermissionProblem?
 
     /// v15p3v (2026-05-09): live partial transcript for the in-progress
@@ -1507,6 +1513,21 @@ final class BuddyDictationManager: NSObject, ObservableObject {
 
     private func handleRecognitionError(_ error: Error) {
         if hasFinishedCurrentDictationSession {
+            return
+        }
+
+        // v16r20 (2026-08-06): an account-level refusal (quota exhausted,
+        // auth revoked) will fail identically on every subsequent engage,
+        // so retrying the same engine is pointless. Show the provider's
+        // own wording — which is usually directly actionable, e.g. "You
+        // have exceeded your quota." — and hand off to the fallback engine
+        // so dictation keeps working. Before this, the message was
+        // discarded and the failure presented as a dead indicator.
+        if let fatal = error as? BuddyProviderFatalError, fatal.isProviderFatal {
+            print("❌ \(fatal.providerFatalLabel) refused the session: \(fatal.providerFatalReason)")
+            lastErrorMessage = "\(fatal.providerFatalLabel): \(fatal.providerFatalReason)"
+            onProviderFatalError?(fatal.providerFatalLabel, fatal.providerFatalReason)
+            cancelCurrentDictation(preserveDraftText: false)
             return
         }
 

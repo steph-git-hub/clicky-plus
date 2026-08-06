@@ -53,6 +53,34 @@ extension BuddyTranscriptionProvider {
     }
 }
 
+/// v16r20 (2026-08-06): marks an error as "this provider will not work
+/// until something changes OUTSIDE the app" — an exhausted quota, a
+/// revoked key, a billing lapse — as distinct from a transient network
+/// fault where retrying is the right move.
+///
+/// Incident 2026-08-06: ElevenLabs began answering every Scribe session
+/// with `{"message_type":"quota_exceeded","error":"You have exceeded your
+/// quota."}` immediately after `session_started`. The provider only
+/// escalated messages whose `message_type` CONTAINED the substring
+/// "error", so `quota_exceeded` fell through to the informational no-op
+/// branch and was discarded. The server stated the problem in plain
+/// English and the app threw it away — the user saw an engage sound, a
+/// live indicator, and no transcript, with nothing to act on. Hours went
+/// into chasing tokens and transport bugs for what the first frame had
+/// already explained.
+///
+/// The lesson encoded here: a provider telling us it refuses to work is
+/// information, and it belongs in front of the user.
+protocol BuddyProviderFatalError: Error {
+    /// False for ordinary transport failures from the same error type —
+    /// only an account-level refusal should trigger an engine switch.
+    var isProviderFatal: Bool { get }
+    /// Human-readable reason, ideally the provider's own wording.
+    var providerFatalReason: String { get }
+    /// Short provider label for the message ("Scribe", "Deepgram").
+    var providerFatalLabel: String { get }
+}
+
 enum BuddyTranscriptionProviderFactory {
     private enum PreferredProvider: String {
         case assemblyAI = "assemblyai"
