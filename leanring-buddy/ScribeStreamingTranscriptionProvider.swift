@@ -38,6 +38,63 @@ struct ScribeStreamingTranscriptionProviderError: LocalizedError, BuddyProviderF
     var providerFatalLabel: String { "Scribe" }
 }
 
+/// v16r21 (2026-08-10): transport seam.
+///
+/// The session used to build its own `URLSessionWebSocketTask` inline, so
+/// the only way to execute it was against the live ElevenLabs endpoint.
+/// There was no way to make the connection stall, half-close, or reject a
+/// write on demand — which is why v16r19's stall watchdog shipped
+/// unexercised and took the app down inside ten seconds of real use.
+///
+/// Nothing about the session's behavior changes: in the app it is handed a
+/// `URLSessionWebSocketTask` exactly as before. In
+/// `scripts/verify_scribe_stall_recovery.swift` it is handed a fake that
+/// misbehaves to order — and the SHIPPED session logic is what runs
+/// against it, not a transcribed copy that can drift.
+enum ScribeSocketFrame {
+    case text(String)
+    case binary(Data)
+    /// A frame kind URLSession may add in future — ignored, exactly as
+    /// the original `@unknown default: break` did.
+    case unsupported
+}
+
+protocol ScribeWebSocketChannel: AnyObject {
+    func resume()
+    func send(text: String, completionHandler: @escaping (Error?) -> Void)
+    func receive(completionHandler: @escaping (Result<ScribeSocketFrame, Error>) -> Void)
+    /// Close with `.goingAway`, matching the original call sites.
+    func cancelGoingAway()
+}
+
+extension URLSessionWebSocketTask: ScribeWebSocketChannel {
+    func send(text: String, completionHandler: @escaping (Error?) -> Void) {
+        send(.string(text), completionHandler: completionHandler)
+    }
+
+    func receive(completionHandler: @escaping (Result<ScribeSocketFrame, Error>) -> Void) {
+        receive { result in
+            switch result {
+            case .success(let message):
+                switch message {
+                case .string(let text):
+                    completionHandler(.success(.text(text)))
+                case .data(let data):
+                    completionHandler(.success(.binary(data)))
+                @unknown default:
+                    completionHandler(.success(.unsupported))
+                }
+            case .failure(let error):
+                completionHandler(.failure(error))
+            }
+        }
+    }
+
+    func cancelGoingAway() {
+        cancel(with: .goingAway, reason: nil)
+    }
+}
+
 final class ScribeStreamingTranscriptionProvider: BuddyTranscriptionProvider {
     private static let tokenProxyURL = "https://clicky-proxy.sapierso.workers.dev/scribe-token"
 
@@ -96,10 +153,11 @@ final class ScribeStreamingTranscriptionProvider: BuddyTranscriptionProvider {
         let tokenFetchMs = Int(Date().timeIntervalSince(tokenStart) * 1000)
         print("🎙️ Scribe: using single-use token (\(token.prefix(16))...) tokenMs=\(tokenFetchMs)")
 
+        let urlSession = sharedWebSocketURLSession
         let session = ScribeStreamingTranscriptionSession(
             token: token,
             tokenFetchMs: tokenFetchMs,
-            urlSession: sharedWebSocketURLSession,
+            makeChannel: { url in urlSession.webSocketTask(with: URLRequest(url: url)) },
             keyterms: keyterms,
             onTranscriptUpdate: onTranscriptUpdate,
             onFinalTranscriptReady: onFinalTranscriptReady,
@@ -204,7 +262,10 @@ final class ScribeStreamingTranscriptionProvider: BuddyTranscriptionProvider {
     }
 }
 
-private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscriptionSession {
+/// v16r21: internal rather than file-private so the standalone harness in
+/// `scripts/verify_scribe_stall_recovery.swift` can construct it directly
+/// with a fake channel. Nothing outside this file constructs it in the app.
+final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscriptionSession {
     private struct MessageEnvelope: Decodable {
         let message_type: String
     }
@@ -246,9 +307,12 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
     private let stateQueue = DispatchQueue(label: "com.learningbuddy.scribe.state")
     private let sendQueue = DispatchQueue(label: "com.learningbuddy.scribe.send")
     private let audioPCM16Converter = BuddyPCM16AudioConverter(targetSampleRate: targetSampleRate)
-    private let urlSession: URLSession
+    /// v16r21: the connection is handed in rather than built here. In the
+    /// app this returns a `URLSessionWebSocketTask`; in the harness it
+    /// returns a fake that can stall, half-close, or reject writes.
+    private let makeChannel: (URL) -> ScribeWebSocketChannel
 
-    private var webSocketTask: URLSessionWebSocketTask?
+    private var channel: ScribeWebSocketChannel?
     private var readyContinuation: CheckedContinuation<Void, Error>?
     private var hasResolvedReadyContinuation = false
     private var hasDeliveredFinalTranscript = false
@@ -265,7 +329,7 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
     init(
         token: String,
         tokenFetchMs: Int,
-        urlSession: URLSession,
+        makeChannel: @escaping (URL) -> ScribeWebSocketChannel,
         keyterms: [String],
         onTranscriptUpdate: @escaping (String) -> Void,
         onFinalTranscriptReady: @escaping (String) -> Void,
@@ -273,7 +337,7 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
     ) {
         self.token = token
         self.tokenFetchMs = tokenFetchMs
-        self.urlSession = urlSession
+        self.makeChannel = makeChannel
         self.keyterms = keyterms
         self.onTranscriptUpdate = onTranscriptUpdate
         self.onFinalTranscriptReady = onFinalTranscriptReady
@@ -282,12 +346,11 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
 
     func open() async throws {
         let websocketURL = try Self.makeWebsocketURL(token: token)
-        let websocketRequest = URLRequest(url: websocketURL)
         // Auth is carried in the `token` query param — no header needed.
 
-        let webSocketTask = urlSession.webSocketTask(with: websocketRequest)
-        self.webSocketTask = webSocketTask
-        webSocketTask.resume()
+        let channel = makeChannel(websocketURL)
+        self.channel = channel
+        channel.resume()
 
         receiveNextMessage()
 
@@ -342,22 +405,22 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
             self.explicitFinalTranscriptDeadlineWorkItem = nil
             self.hasFailedOrTerminated = true
         }
-        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        channel?.cancelGoingAway()
     }
 
     private func receiveNextMessage() {
-        webSocketTask?.receive { [weak self] result in
+        channel?.receive { [weak self] result in
             guard let self else { return }
             switch result {
-            case .success(let message):
-                switch message {
-                case .string(let text):
+            case .success(let frame):
+                switch frame {
+                case .text(let text):
                     self.handleIncomingTextMessage(text)
-                case .data(let data):
+                case .binary(let data):
                     if let text = String(data: data, encoding: .utf8) {
                         self.handleIncomingTextMessage(text)
                     }
-                @unknown default:
+                case .unsupported:
                     break
                 }
                 self.receiveNextMessage()
@@ -490,7 +553,7 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
         explicitFinalTranscriptDeadlineWorkItem?.cancel()
         explicitFinalTranscriptDeadlineWorkItem = nil
         onFinalTranscriptReady(transcriptText)
-        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        channel?.cancelGoingAway()
     }
 
     private func sendJSONMessage(_ payload: [String: Any]) {
@@ -499,8 +562,8 @@ private final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamin
             return
         }
         sendQueue.async { [weak self] in
-            guard let self, let webSocketTask = self.webSocketTask else { return }
-            webSocketTask.send(.string(jsonString)) { [weak self] error in
+            guard let self, let channel = self.channel else { return }
+            channel.send(text: jsonString) { [weak self] error in
                 if let error {
                     self?.failSession(with: error)
                 }
