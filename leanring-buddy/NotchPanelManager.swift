@@ -876,6 +876,21 @@ private struct NotchPillView: View {
             )
         }
 
+        // v16r22 (2026-08-10): polish FAILED (red, ~2.5s). Placed ABOVE
+        // the purple polish pill so a failure is never hidden behind the
+        // "Polishing" state it replaces. States the outcome in words —
+        // the sound says something went wrong, this says what.
+        if companionManager.isPolishFailureFlashActive {
+            return PillStateView(
+                id: "polish-failed",
+                tint: DS.Colors.overlayCursorRed,
+                kind: .live,
+                statusLabel: "Polish failed — raw text",
+                transcript: nil,
+                showsWaveform: false
+            )
+        }
+
         // 6. Polish flash (purple, brief).
         if companionManager.isPolishCommandFlashActive
             || companionManager.isPolishHotkeyModifierCaptureModeActive {

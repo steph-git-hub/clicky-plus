@@ -1208,6 +1208,24 @@ final class CompanionManager: ObservableObject {
     /// polish was triggered.
     @Published private(set) var isPolishCommandFlashActive: Bool = false
     private var polishCommandFlashClearTask: Task<Void, Never>?
+
+    /// v16r22 (2026-08-10): true for ~2.5s after a polish attempt FAILED
+    /// and raw punctuated text was pasted instead. Drives a red indicator
+    /// dot and a red notch pill.
+    ///
+    /// Why this exists: polish failed silently 3 times in 20 toggle
+    /// dictations on 2026-08-10 (all `The request timed out.`) and Steph
+    /// had no way to know. Worse, the completion chime was selected by
+    /// whether polish was REQUESTED, not whether it succeeded — so a
+    /// failed polish played the same `.polishDone` sound as a clean one.
+    /// The app was actively reporting success. The only record was a line
+    /// in the transcript JSONL and a print to the Xcode console.
+    @Published private(set) var isPolishFailureFlashActive: Bool = false
+    private var polishFailureFlashClearTask: Task<Void, Never>?
+
+    /// Long enough to register while reading the pasted text, short
+    /// enough not to linger into the next dictation.
+    private static let polishFailureFlashSeconds: TimeInterval = 2.5
     /// True while the polish hotkey has been held past the tap-vs-hold
     /// threshold and dictation is actively capturing the spoken modifier.
     /// Drives the sustained cyan tint on the orb (vs the brief flash
@@ -1559,6 +1577,9 @@ final class CompanionManager: ObservableObject {
         polishCommandFlashClearTask?.cancel()
         polishCommandFlashClearTask = nil
         isPolishCommandFlashActive = false
+        polishFailureFlashClearTask?.cancel()
+        polishFailureFlashClearTask = nil
+        isPolishFailureFlashActive = false
         polishHotkeyHoldEngageTask?.cancel()
         polishHotkeyHoldEngageTask = nil
         pendingPolishHotkeyDictationTask?.cancel()
@@ -5306,6 +5327,26 @@ final class CompanionManager: ObservableObject {
         }
     }
 
+    /// v16r22: announce that polish FAILED and the text you're looking at
+    /// is unpolished. Held for 2.5s (not 250ms like the command flash) —
+    /// this reports a bad outcome the user has to notice, not a
+    /// confirmation they were already expecting.
+    @MainActor
+    fileprivate func triggerPolishFailureFlash(reason: String) {
+        polishFailureFlashClearTask?.cancel()
+        isPolishFailureFlashActive = true
+        print("🚨 VTT polish FAILED — pasted unpolished text. Reason: \(reason)")
+        polishFailureFlashClearTask = Task { [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64(Self.polishFailureFlashSeconds * 1_000_000_000)
+            )
+            await MainActor.run {
+                guard let self else { return }
+                self.isPolishFailureFlashActive = false
+            }
+        }
+    }
+
     /// POST to the Worker's /voice-command route with the polish payload.
     /// Returns the Worker's `output` field (the polished text). Throws
     /// on transport errors and on non-2xx responses.
@@ -6292,6 +6333,20 @@ final class CompanionManager: ObservableObject {
             let textToFormat: String
             if polishAfterRepunctuate {
                 do {
+                    // v16r22: fault injection for the polish-failure alarm.
+                    //   defaults write com.stephenpierson.clickyplus \
+                    //       clicky.debug.forcePolishFailure -bool true
+                    // Next toggle dictation fails polish deterministically,
+                    // so the error sound / red dot / notch pill can be
+                    // exercised on demand instead of waiting for a real
+                    // timeout. The v16r19 lesson: an alarm nobody has heard
+                    // ring is not an alarm.
+                    if UserDefaults.standard.bool(forKey: "clicky.debug.forcePolishFailure") {
+                        throw NSError(
+                            domain: "ClickyDebug", code: -1,
+                            userInfo: [NSLocalizedDescriptionKey: "Forced polish failure (debug flag)"]
+                        )
+                    }
                     // v12i: restore screenshot to polish — Steph's preference
                     // is tone-matching > strict list-formatting fidelity.
                     // Polish prompt simplified to be less aggressive, so the
@@ -6334,6 +6389,13 @@ final class CompanionManager: ObservableObject {
                     print("⚠️ VTT polish failed (\(error)) — using punctuated raw text")
                     textToFormat = punctuatedText
                     pipelineStatus = "failed:polish:\((error as NSError).localizedDescription.prefix(80))"
+                    // v16r22: make the failure impossible to miss. Before
+                    // this, the only trace was this print and a JSONL
+                    // field, and the completion chime still said "polished".
+                    let failureReason = (error as NSError).localizedDescription
+                    await MainActor.run {
+                        self?.triggerPolishFailureFlash(reason: failureReason)
+                    }
                 }
             } else {
                 textToFormat = punctuatedText
@@ -6417,8 +6479,16 @@ final class CompanionManager: ObservableObject {
             // v15p3cu (2026-05-14): VTT success sound cue — fires only
             // after the clipboard paste actually completes, so Steph
             // hears the chime when the text has truly landed.
+            // v16r22: the chime used to be chosen by whether polish was
+            // REQUESTED, so a failed polish played `.polishDone` — the app
+            // told Steph it had polished text it had not polished. Choose
+            // on the OUTCOME instead: a polish that threw gets the error
+            // sound, because what landed in the document is raw text.
+            let polishDidFail = pipelineStatus?.hasPrefix("failed:polish") == true
             await MainActor.run {
-                if polishAfterRepunctuate {
+                if polishDidFail {
+                    ClickySoundEngine.shared.play(.vttError)
+                } else if polishAfterRepunctuate {
                     ClickySoundEngine.shared.play(.polishDone)
                 } else {
                     ClickySoundEngine.shared.play(.vttSuccess)

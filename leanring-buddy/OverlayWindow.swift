@@ -425,6 +425,13 @@ struct BlueCursorView: View {
     }
 
     private var currentCursorTint: Color {
+        // v16r22 (2026-08-10): polish FAILED — red wins over every other
+        // tint. Deliberately first: this is the only tint that reports a
+        // bad outcome, and the text is already pasted, so nothing else
+        // being active is a reason to hide it.
+        if companionManager.isPolishFailureFlashActive {
+            return DS.Colors.overlayCursorRed
+        }
         if companionManager.isPolishCommandFlashActive
             || companionManager.isPolishHotkeyModifierCaptureModeActive {
             // v15p3gz (2026-05-18): swapped with Deepgram VTT (was cyan).
@@ -787,6 +794,9 @@ struct BlueCursorView: View {
                 .animation(.linear(duration: 0.04), value: cursorPosition)
                 .animation(.easeInOut(duration: 0.2), value: companionManager.voiceState)
                 .animation(.easeOut(duration: 0.12), value: companionManager.isVoiceToTextModeActive)
+                // v16r22: snap TO red instantly so the failure is caught
+                // even at a glance, then ease back out.
+                .animation(.easeOut(duration: 0.35), value: companionManager.isPolishFailureFlashActive)
 
             // v15g: top-edge line — full-screen-width horizontal line.
             // Universal indicator across all voice states — color from
