@@ -158,6 +158,17 @@ final class ScribeStreamingTranscriptionProvider: BuddyTranscriptionProvider {
             token: token,
             tokenFetchMs: tokenFetchMs,
             makeChannel: { url in urlSession.webSocketTask(with: URLRequest(url: url)) },
+            // v16r23: reconnect needs a FRESH single-use token — the one
+            // used for the original socket is spent. Bounded at 4s so a
+            // slow token endpoint can't hang a recovery.
+            tokenProvider: { [weak self] in
+                guard let self else {
+                    throw ScribeStreamingTranscriptionProviderError(
+                        message: "Scribe provider deallocated during reconnect."
+                    )
+                }
+                return try await self.fetchSingleUseToken()
+            },
             keyterms: keyterms,
             onTranscriptUpdate: onTranscriptUpdate,
             onFinalTranscriptReady: onFinalTranscriptReady,
@@ -326,10 +337,79 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
     private var explicitFinalTranscriptDeadlineWorkItem: DispatchWorkItem?
     private var hasFailedOrTerminated = false
 
+    // MARK: - Reconnect on transport failure (v16r23, 2026-08-10)
+    //
+    // The toggle-mode cutoff: the receive loop took ONE `.failure` and
+    // stopped reading forever. The socket was dead, the user kept talking,
+    // the halo kept moving, and every word after that point was discarded.
+    // Confirmed live on 2026-08-10 at 12:51 — a capture cut mid-word at
+    // "...Anything nailed-".
+    //
+    // SCOPE: this recovers from an ACTUAL transport failure (the socket
+    // errors). It deliberately does NOT include v16r19's stall watchdog,
+    // which tried to infer "the server went quiet while you were talking"
+    // from audio levels. That inference is the risky half and is a separate
+    // job; `STALL-SUSPECT` diag lines below exist to tell us whether it's
+    // even needed.
+    //
+    // WHY THIS IS SAFER THAN v16r19: that version shipped before the
+    // v16r20 fatal classifier. During the ElevenLabs quota outage the
+    // server refused every connection, reconnect read those refusals as
+    // transient, burned its budget in seconds, and killed the session —
+    // turning an account problem into an app failure. `shouldAttemptReconnect`
+    // now refuses to reconnect on any account-fatal error, so that
+    // amplification cannot recur.
+
+    /// Fetches a fresh single-use token for a replacement socket. Injected
+    /// so the harness can drive reconnect without network.
+    private let tokenProvider: () async throws -> String
+
+    /// Monotonic socket identity. EVERY receive and send completion compares
+    /// this before acting. Without it, cancelling a dead socket completes its
+    /// pending read with a cancellation error, which tears down the
+    /// replacement — turning every recovery into a session kill. This was
+    /// the single most important correctness property in v16r19.
+    private var socketGeneration = 0
+
+    private var isReconnecting = false
+    private var reconnectAttempts = 0
+    private var totalReconnectCount = 0
+    private static let maxReconnectAttempts = 3
+
+    /// Audio captured while there is no usable socket. Replayed in order
+    /// once the replacement is live, so the gap isn't a hole in the words.
+    private var bufferedAudioBase64DuringReconnect: [String] = []
+    private static let maxBufferedAudioChunksDuringReconnect = 400
+    private var didLogReconnectBufferOverflow = false
+
+    /// The last few seconds of audio ALREADY sent to the (now dead) socket,
+    /// timestamped. Detection is not instant, so some speech was fired at a
+    /// socket that was already gone. Replaying the entries newer than the
+    /// last acknowledged transcript closes that hole without duplicating
+    /// words the server had already transcribed.
+    private var preStallAudioRing: [(base64: String, capturedAt: Date)] = []
+    private static let preStallRingBufferChunks = 120
+
+    /// When the server last sent us a transcript frame. Used as the replay
+    /// watermark, and to spot a silent stall for diagnostics.
+    private var lastTranscriptMessageAt = Date()
+
+    /// The user released the key while a rebuild was in flight, so the
+    /// commit frame hit a nil socket. Latch it and re-issue on the new
+    /// socket, or the server never commits and the tail is lost — the
+    /// original symptom, reproduced by its own fix.
+    private var pendingCommitAfterReconnect = false
+
+    /// Terminal = nothing may act on this session any more.
+    private var isTerminated: Bool {
+        hasFailedOrTerminated || hasDeliveredFinalTranscript
+    }
+
     init(
         token: String,
         tokenFetchMs: Int,
         makeChannel: @escaping (URL) -> ScribeWebSocketChannel,
+        tokenProvider: @escaping () async throws -> String,
         keyterms: [String],
         onTranscriptUpdate: @escaping (String) -> Void,
         onFinalTranscriptReady: @escaping (String) -> Void,
@@ -338,6 +418,7 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
         self.token = token
         self.tokenFetchMs = tokenFetchMs
         self.makeChannel = makeChannel
+        self.tokenProvider = tokenProvider
         self.keyterms = keyterms
         self.onTranscriptUpdate = onTranscriptUpdate
         self.onFinalTranscriptReady = onFinalTranscriptReady
@@ -349,10 +430,14 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
         // Auth is carried in the `token` query param — no header needed.
 
         let channel = makeChannel(websocketURL)
-        self.channel = channel
+        let generation: Int = stateQueue.sync {
+            self.socketGeneration += 1
+            self.channel = channel
+            return self.socketGeneration
+        }
         channel.resume()
 
-        receiveNextMessage()
+        receiveNextMessage(on: channel, generation: generation)
 
         // Resolve readiness as soon as the WSS handshake completes
         // (resume() returns), mirroring the proven Deepgram flow — the
@@ -376,6 +461,41 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
         if firstAudioSentMs == nil {
             firstAudioSentMs = Int(Date().timeIntervalSince(engageStartedAt) * 1000)
         }
+
+        // v16r23: route by session state instead of firing blindly.
+        // Previously this pumped audio into a dead socket, and each send
+        // error re-entered failSession — one fault became one fault per
+        // 20ms of speech.
+        enum AudioRoute { case send, buffer, drop }
+        let route: AudioRoute = stateQueue.sync {
+            if self.isTerminated { return .drop }
+            if self.isReconnecting || self.channel == nil {
+                if self.bufferedAudioBase64DuringReconnect.count
+                    >= Self.maxBufferedAudioChunksDuringReconnect {
+                    if !self.didLogReconnectBufferOverflow {
+                        self.didLogReconnectBufferOverflow = true
+                        ScribeStreamingTranscriptionProvider.appendSessionDiag(
+                            "RECONNECT buffer full at "
+                            + "\(Self.maxBufferedAudioChunksDuringReconnect) chunks — dropping audio"
+                        )
+                    }
+                    return .drop
+                }
+                self.bufferedAudioBase64DuringReconnect.append(base64)
+                return .buffer
+            }
+            // Live: keep a short timestamped tail so the seconds already
+            // fired at a socket that turns out to be dead can be replayed.
+            self.preStallAudioRing.append((base64: base64, capturedAt: Date()))
+            if self.preStallAudioRing.count > Self.preStallRingBufferChunks {
+                self.preStallAudioRing.removeFirst(
+                    self.preStallAudioRing.count - Self.preStallRingBufferChunks
+                )
+            }
+            return .send
+        }
+
+        guard route == .send else { return }
         sendJSONMessage([
             "message_type": "input_audio_chunk",
             "audio_base_64": base64,
@@ -384,13 +504,33 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
     }
 
     func requestFinalTranscript() {
-        stateQueue.async {
-            guard !self.hasDeliveredFinalTranscript else { return }
+        let deferCommit: Bool = stateQueue.sync {
+            guard !self.hasDeliveredFinalTranscript else { return false }
             self.isAwaitingExplicitFinalTranscript = true
             self.scheduleExplicitFinalTranscriptDeadline()
+            // v16r23: released the key mid-rebuild. Firing the commit now
+            // would send it at a nil socket, the server would never commit,
+            // the 1.4s deadline would fire, and the tail of the dictation
+            // would be lost — the original bug, reproduced by its own fix.
+            // Latch it; reopenSocket re-issues it.
+            if self.isReconnecting || self.channel == nil {
+                self.pendingCommitAfterReconnect = true
+                return true
+            }
+            return false
         }
-        // Force a commit of the current buffer (manual commit strategy).
-        // Server responds with a committed_transcript for the segment.
+        guard !deferCommit else {
+            ScribeStreamingTranscriptionProvider.appendSessionDiag(
+                "COMMIT deferred — reconnect in flight at key release"
+            )
+            return
+        }
+        requestFinalTranscriptFrame()
+    }
+
+    /// Force a commit of the current buffer (manual commit strategy). The
+    /// server answers with a committed_transcript for the segment.
+    private func requestFinalTranscriptFrame() {
         sendJSONMessage([
             "message_type": "input_audio_chunk",
             "audio_base_64": "",
@@ -400,17 +540,35 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
     }
 
     func cancel() {
-        stateQueue.async {
+        // v16r23: retire the socket identity as part of going terminal, so
+        // a reconnect already in flight sees isTerminated in reopenSocket
+        // and refuses to install — a finished session can't be resurrected
+        // by its own recovery.
+        let doomed: ScribeWebSocketChannel? = stateQueue.sync {
             self.explicitFinalTranscriptDeadlineWorkItem?.cancel()
             self.explicitFinalTranscriptDeadlineWorkItem = nil
             self.hasFailedOrTerminated = true
+            self.socketGeneration += 1
+            self.bufferedAudioBase64DuringReconnect = []
+            self.preStallAudioRing = []
+            let channel = self.channel
+            self.channel = nil
+            return channel
         }
-        channel?.cancelGoingAway()
+        doomed?.cancelGoingAway()
     }
 
-    private func receiveNextMessage() {
-        channel?.receive { [weak self] result in
+    /// v16r23: reads are bound to the socket that issued them. A completion
+    /// from a retired generation is a straggler from a socket we already
+    /// cancelled — acting on it would tear down its own replacement.
+    private func receiveNextMessage(on channel: ScribeWebSocketChannel, generation: Int) {
+        channel.receive { [weak self] result in
             guard let self else { return }
+            let isCurrent: Bool = self.stateQueue.sync {
+                generation == self.socketGeneration && !self.isTerminated
+            }
+            guard isCurrent else { return }
+
             switch result {
             case .success(let frame):
                 switch frame {
@@ -423,11 +581,207 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
                 case .unsupported:
                     break
                 }
-                self.receiveNextMessage()
+                self.receiveNextMessage(on: channel, generation: generation)
             case .failure(let error):
-                self.failSession(with: error)
+                // THE CUTOFF. Before v16r23 this was `failSession(with:)`
+                // and the loop simply stopped — the socket died, the user
+                // kept talking, and every subsequent word was discarded.
+                self.handleTransportFailure(error, generation: generation)
             }
         }
+    }
+
+    // MARK: - Reconnect
+
+    /// Decide whether a transport fault is worth rebuilding the socket for.
+    ///
+    /// An account-level refusal (quota exhausted, auth revoked) must NEVER
+    /// reconnect: retrying cannot help, and retrying FAST is exactly how
+    /// v16r19 turned the 2026-08-06 ElevenLabs outage into an instant
+    /// session kill. Those route to failSession, which hands off to the
+    /// engine-fallback path built in v16r20.
+    private func handleTransportFailure(_ error: Error, generation: Int) {
+        if let fatal = error as? BuddyProviderFatalError, fatal.isProviderFatal {
+            ScribeStreamingTranscriptionProvider.appendSessionDiag(
+                "FATAL (no reconnect) — \(fatal.providerFatalReason)"
+            )
+            failSession(with: error)
+            return
+        }
+
+        let shouldReconnect: Bool = stateQueue.sync {
+            guard generation == self.socketGeneration, !self.isTerminated else { return false }
+            return true
+        }
+        guard shouldReconnect else { return }
+
+        ScribeStreamingTranscriptionProvider.appendSessionDiag(
+            "TRANSPORT FAILURE gen=\(generation) — \(error.localizedDescription). Reconnecting."
+        )
+        print("[Scribe] ⚠️ Transport failure — rebuilding socket: \(error.localizedDescription)")
+        beginReconnect()
+    }
+
+    private func beginReconnect() {
+        let proceed: Bool = stateQueue.sync {
+            guard !self.isReconnecting, !self.isTerminated else { return false }
+            guard self.reconnectAttempts < Self.maxReconnectAttempts else { return false }
+
+            self.isReconnecting = true
+            self.reconnectAttempts += 1
+            self.totalReconnectCount += 1
+
+            // Freeze the in-flight partial into the committed list before
+            // the replacement starts emitting its own partials — otherwise
+            // the new session's first partial overwrites it and we lose the
+            // words spoken immediately before the failure.
+            let trimmedPartial = self.activePartialTranscript
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedPartial.isEmpty {
+                self.finalizedSegments.append(trimmedPartial)
+                self.activePartialTranscript = ""
+            }
+
+            // Retire the old socket. Bump the generation FIRST so its
+            // pending read and in-flight sends are recognised as stragglers
+            // rather than mistaken for a fresh fault on the new socket.
+            self.socketGeneration += 1
+            let dead = self.channel
+            self.channel = nil
+            dead?.cancelGoingAway()
+            return true
+        }
+
+        guard proceed else {
+            let exhausted: Bool = stateQueue.sync {
+                self.reconnectAttempts >= Self.maxReconnectAttempts && !self.isTerminated
+            }
+            if exhausted {
+                ScribeStreamingTranscriptionProvider.appendSessionDiag(
+                    "RECONNECT giving up after \(Self.maxReconnectAttempts) attempts"
+                )
+                failSession(with: ScribeStreamingTranscriptionProviderError(
+                    message: "Transcription connection was lost and could not be re-established."
+                ))
+            }
+            return
+        }
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let freshToken = try await self.tokenProvider()
+                try await self.reopenSocket(token: freshToken)
+            } catch {
+                ScribeStreamingTranscriptionProvider.appendSessionDiag(
+                    "RECONNECT failed: \(error.localizedDescription)"
+                )
+                print("[Scribe] ❌ Reconnect failed: \(error.localizedDescription)")
+                let giveUp: Bool = self.stateQueue.sync {
+                    guard !self.isTerminated else { return false }
+                    self.isReconnecting = false
+                    return self.reconnectAttempts >= Self.maxReconnectAttempts
+                }
+                if giveUp {
+                    self.failSession(with: error)
+                } else {
+                    // Budget left — try again immediately. Audio stays
+                    // buffered in the meantime rather than being fired at
+                    // a nil socket and silently dropped.
+                    self.beginReconnect()
+                }
+            }
+        }
+    }
+
+    /// Build a replacement socket and replay the audio spanning the gap.
+    /// Does NOT touch readyContinuation — that belongs to the original
+    /// open() and resolved long ago.
+    private func reopenSocket(token freshToken: String) async throws {
+        let websocketURL = try Self.makeWebsocketURL(token: freshToken)
+        let replacement = makeChannel(websocketURL)
+
+        // The token fetch above is a network round-trip. The user may have
+        // released the key in that window, so the session can already be
+        // over. Install only if it's still live — otherwise this socket is
+        // owned by nothing, never cancelled, and fires transcripts into a
+        // finished session.
+        let generation: Int? = stateQueue.sync {
+            guard !self.isTerminated else { return nil }
+            self.socketGeneration += 1
+            self.channel = replacement
+            return self.socketGeneration
+        }
+        guard let generation else {
+            replacement.cancelGoingAway()
+            ScribeStreamingTranscriptionProvider.appendSessionDiag(
+                "RECONNECT abandoned — session ended during token fetch"
+            )
+            return
+        }
+
+        replacement.resume()
+        receiveNextMessage(on: replacement, generation: generation)
+
+        // Replay = the pre-failure ring (speech already fired at the dead
+        // socket) + everything buffered while we were down. Drain BEFORE
+        // clearing isReconnecting, or a live buffer races ahead of the
+        // replay and the server hears newer audio before older audio.
+        let replayed: [String] = stateQueue.sync {
+            // Only entries newer than the last frame the server actually
+            // acknowledged — anything older it already transcribed, and
+            // re-sending duplicates words in the output.
+            let watermark = self.lastTranscriptMessageAt
+            let ring = self.preStallAudioRing
+                .filter { $0.capturedAt >= watermark }
+                .map(\.base64)
+            self.preStallAudioRing = []
+            self.lastTranscriptMessageAt = Date()
+            let all = ring + self.bufferedAudioBase64DuringReconnect
+            self.bufferedAudioBase64DuringReconnect = []
+            return all
+        }
+
+        for chunk in replayed {
+            sendJSONMessage([
+                "message_type": "input_audio_chunk",
+                "audio_base_64": chunk,
+                "sample_rate": 16000,
+            ])
+        }
+
+        // Anything captured DURING the replay loop is still classified as
+        // buffered. Drain it in the SAME critical section that clears the
+        // flag, or those chunks are stranded.
+        let (shouldReissueCommit, segmentCount, tailCount): (Bool, Int, Int) = stateQueue.sync {
+            let tail = self.bufferedAudioBase64DuringReconnect
+            self.bufferedAudioBase64DuringReconnect = []
+            for chunk in tail {
+                self.sendJSONMessage([
+                    "message_type": "input_audio_chunk",
+                    "audio_base_64": chunk,
+                    "sample_rate": 16000,
+                ])
+            }
+            self.isReconnecting = false
+            self.didLogReconnectBufferOverflow = false
+            let reissue = self.pendingCommitAfterReconnect
+            self.pendingCommitAfterReconnect = false
+            return (reissue, self.finalizedSegments.count, tail.count)
+        }
+
+        if shouldReissueCommit {
+            ScribeStreamingTranscriptionProvider.appendSessionDiag(
+                "RECONNECT re-issuing dropped commit frame"
+            )
+            requestFinalTranscriptFrame()
+        }
+
+        ScribeStreamingTranscriptionProvider.appendSessionDiag(
+            "RECONNECT ok (gen \(generation)) — replayed \(replayed.count + tailCount) chunks, "
+            + "preserved \(segmentCount) committed segments"
+        )
+        print("[Scribe] ✅ Reconnected — replayed \(replayed.count + tailCount) audio chunks")
     }
 
     private func handleIncomingTextMessage(_ text: String) {
@@ -495,7 +849,21 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
         }
 
         stateQueue.async {
+            // v16r23: the server is talking to us, so this socket works.
+            // Doubles as the replay watermark — audio older than this was
+            // already transcribed and must not be re-sent.
+            self.lastTranscriptMessageAt = Date()
             if isFinal {
+                // Budget is earned back only by a COMMITTED transcript, not
+                // by a partial. A socket that reconnects and then produces
+                // nothing usable shouldn't get an unlimited retry supply.
+                if self.reconnectAttempts > 0 {
+                    ScribeStreamingTranscriptionProvider.appendSessionDiag(
+                        "RECONNECT budget restored after committed transcript "
+                        + "(total reconnects this session: \(self.totalReconnectCount))"
+                    )
+                }
+                self.reconnectAttempts = 0
                 if !transcriptText.isEmpty {
                     self.finalizedSegments.append(transcriptText)
                 }
@@ -562,11 +930,22 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
             return
         }
         sendQueue.async { [weak self] in
-            guard let self, let channel = self.channel else { return }
-            channel.send(text: jsonString) { [weak self] error in
-                if let error {
-                    self?.failSession(with: error)
-                }
+            guard let self else { return }
+            // v16r23: capture the socket AND its generation together, so a
+            // completion arriving after that socket was retired is ignored
+            // rather than tearing down its replacement.
+            let snapshot: (channel: ScribeWebSocketChannel, generation: Int)? = self.stateQueue.sync {
+                guard let channel = self.channel, !self.isTerminated else { return nil }
+                return (channel, self.socketGeneration)
+            }
+            guard let snapshot else { return }
+            snapshot.channel.send(text: jsonString) { [weak self] error in
+                guard let self, let error else { return }
+                // A write failure means this socket is gone. Recover it the
+                // same way a read failure is recovered — the old behavior
+                // (straight to failSession) is what made a single dropped
+                // write end the whole dictation.
+                self.handleTransportFailure(error, generation: snapshot.generation)
             }
         }
     }
@@ -574,7 +953,11 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
     private func failSession(with error: Error) {
         resolveReadyContinuationIfNeeded(with: .failure(error))
         stateQueue.async {
+            // v16r23: idempotent. Without this guard one fault became one
+            // onError per audio buffer — a fault storm at 50/second.
+            guard !self.hasFailedOrTerminated else { return }
             self.hasFailedOrTerminated = true
+            self.channel = nil
             let latestTranscriptText = self.bestAvailableTranscriptText()
             if self.isAwaitingExplicitFinalTranscript
                 && !self.hasDeliveredFinalTranscript

@@ -289,39 +289,74 @@ final class SessionRecorder {
     }
 }
 
-struct Rig {
-    let session: ScribeStreamingTranscriptionSession
-    let channel: FakeScribeChannel
-    let recorder: SessionRecorder
+/// Every channel the session has built, in order. v16r23 reconnect makes
+/// a NEW one on each rebuild, so tests need the whole sequence — index 0
+/// is the original socket, index 1 the first replacement, and so on.
+final class ChannelLog {
+    private let lock = NSLock()
+    private var channels: [FakeScribeChannel] = []
+    /// Set to make the NEXT channel built reject writes from birth.
+    var nextChannelWriteBehavior: FakeScribeChannel.WriteBehavior?
+
+    func record(_ channel: FakeScribeChannel) {
+        lock.lock()
+        if let behavior = nextChannelWriteBehavior { channel.setWriteBehavior(behavior) }
+        channels.append(channel)
+        lock.unlock()
+    }
+
+    var count: Int { lock.lock(); defer { lock.unlock() }; return channels.count }
+    var first: FakeScribeChannel? { lock.lock(); defer { lock.unlock() }; return channels.first }
+    var latest: FakeScribeChannel? { lock.lock(); defer { lock.unlock() }; return channels.last }
+    func at(_ i: Int) -> FakeScribeChannel? {
+        lock.lock(); defer { lock.unlock() }
+        return i < channels.count ? channels[i] : nil
+    }
 }
 
-/// Build a session wired to a fake channel. No network, no token fetch —
-/// the token is only ever a query-string value, and open() does not
-/// validate it, so a literal is faithful.
-func makeRig() -> Rig {
+struct Rig {
+    let session: ScribeStreamingTranscriptionSession
+    let channels: ChannelLog
+    let recorder: SessionRecorder
+    /// The socket the session is currently using.
+    var channel: FakeScribeChannel { channels.latest! }
+    /// The original socket, which reconnect retires.
+    var firstChannel: FakeScribeChannel { channels.first! }
+}
+
+/// Build a session wired to fake channels. No network and no token fetch —
+/// the token is only ever a query-string value and open() doesn't validate
+/// it, so a literal is faithful.
+func makeRig(tokenFetchFails: Bool = false) -> Rig {
     let recorder = SessionRecorder()
-    var built: FakeScribeChannel?
+    let channels = ChannelLog()
     let session = ScribeStreamingTranscriptionSession(
         token: "harness-token",
         tokenFetchMs: 0,
         makeChannel: { url in
             let channel = FakeScribeChannel(url: url)
-            built = channel
+            channels.record(channel)
             return channel
+        },
+        tokenProvider: {
+            if tokenFetchFails {
+                throw FakeSocketError(message: "token endpoint unavailable")
+            }
+            return "harness-token-reconnect"
         },
         keyterms: [],
         onTranscriptUpdate: { recorder.recordUpdate($0) },
         onFinalTranscriptReady: { recorder.recordFinal($0) },
         onError: { recorder.recordError($0) }
     )
-    // open() is what constructs the channel; do it here so every test
-    // starts from a live session.
+    // open() is what constructs the first channel; do it here so every
+    // test starts from a live session.
     syncOpen(session)
-    guard let channel = built else {
-        print("❌ FATAL: channel was never constructed by open()")
+    guard channels.count == 1 else {
+        print("❌ FATAL: open() did not construct exactly one channel (got \(channels.count))")
         exit(2)
     }
-    return Rig(session: session, channel: channel, recorder: recorder)
+    return Rig(session: session, channels: channels, recorder: recorder)
 }
 
 /// Bridge open()'s async signature into the harness's synchronous flow.
@@ -441,86 +476,194 @@ func testHappyPath() {
     report.check("socket closed after the final", rig.channel.cancelCount >= 1)
 }
 
-func testHalfCloseCutoff() {
-    report.section("T2 — half-close = the toggle-mode cutoff, reproduced deterministically")
+func testHalfCloseRecovers() {
+    report.section("T2 — THE CUTOFF: half-close mid-dictation now recovers")
     let rig = makeRig()
 
     rig.session.appendAudioBuffer(makeAudioBuffer(amplitude: speechAmplitude))
-    rig.channel.deliver(text: partialFrame("no way to scale it? Because"))
+    rig.firstChannel.deliver(text: partialFrame("no way to scale it? Because"))
     waitUntil("first partial") { rig.recorder.updateCount >= 1 }
-    let updatesBeforeCut = rig.recorder.updateCount
 
-    // The read side dies. Writes still succeed — which is why the app
-    // shows a live indicator and a moving halo the whole time.
-    rig.channel.failRead()
-    waitUntil("failure surfaced") { rig.recorder.errorCount >= 1 }
-    report.check("a read failure is reported to the caller", rig.recorder.errorCount >= 1)
+    // The read side dies mid-sentence. Writes still appear to work, which
+    // is why the app used to show a live indicator and a moving halo while
+    // recording nothing. This is the exact shape of the 12:51 cut on
+    // 2026-08-10 ("...Anything nailed-").
+    rig.firstChannel.failRead()
 
-    // The server has not stopped transcribing. The session has stopped
-    // listening.
+    waitUntil("replacement socket built") { rig.channels.count >= 2 }
+    report.check(
+        "a replacement socket is built instead of the session dying",
+        rig.channels.count >= 2,
+        "channels: \(rig.channels.count)"
+    )
+    report.check("the dead socket was closed", rig.firstChannel.cancelCount >= 1)
+    report.check(
+        "no error was surfaced to the user — this is recoverable",
+        rig.recorder.errorCount == 0,
+        "errors: \(rig.recorder.firstErrorMessage)"
+    )
+
+    // Speech continues after the failure and must reach the NEW socket.
+    rig.session.appendAudioBuffer(makeAudioBuffer(amplitude: speechAmplitude))
+    waitUntil("audio on new socket") { rig.channel.audioChunkCount() >= 1 }
+    report.check(
+        "audio after the failure reaches the replacement",
+        rig.channel.audioChunkCount() >= 1,
+        "chunks on new socket: \(rig.channel.audioChunkCount())"
+    )
+
     rig.channel.deliver(text: partialFrame("we should scale it anyway"))
-    settle()
+    waitUntil("post-recovery partial") { rig.recorder.updateCount >= 2 }
+
+    rig.session.requestFinalTranscript()
+    waitUntil("commit on new socket") { rig.channel.commitFrameCount() >= 1 }
+    rig.channel.deliver(text: committedFrame("We should scale it anyway."))
+    waitUntil("final") { rig.recorder.finalCount == 1 }
+
+    let final = rig.recorder.firstFinal ?? ""
     report.check(
-        "CUTOFF REPRODUCED — no transcript after one read failure",
-        rig.recorder.updateCount == updatesBeforeCut,
-        "updates went \(updatesBeforeCut) → \(rig.recorder.updateCount)"
+        "words spoken BEFORE the failure survive in the final transcript",
+        final.contains("Because"),
+        "got: \(final)"
     )
     report.check(
-        "the rest of the speech is stranded on the socket",
-        rig.channel.strandedFrameCount >= 1,
-        "stranded: \(rig.channel.strandedFrameCount)"
+        "words spoken AFTER the failure are in it too",
+        final.contains("We should scale it anyway."),
+        "got: \(final)"
     )
-    report.check("no read is ever posted again", !rig.channel.hasOutstandingRead)
 }
 
-func testDeadSessionKeepsPumping() {
-    report.section("T3 — GAP: no dead-session guard on appendAudioBuffer")
+func testGenerationIdentity() {
+    report.section("T9 — a dead socket's late failure must not kill its replacement")
+    // v16r19's most important correctness property. Cancelling a socket
+    // completes its pending read with a cancellation error; without
+    // generation tracking that straggler tears down the socket that just
+    // replaced it, turning every recovery into a session kill.
     let rig = makeRig()
-
-    rig.channel.failRead()
-    waitUntil("session dead") { rig.recorder.errorCount >= 1 }
-    let chunksAtDeath = rig.channel.audioChunkCount()
-
     rig.session.appendAudioBuffer(makeAudioBuffer(amplitude: speechAmplitude))
-    waitUntil("post-mortem audio") { rig.channel.audioChunkCount() > chunksAtDeath }
-    report.check(
-        "GAP CONFIRMED — audio is still pumped into a dead session",
-        rig.channel.audioChunkCount() > chunksAtDeath,
-        "chunks \(chunksAtDeath) → \(rig.channel.audioChunkCount())"
-    )
+    rig.firstChannel.failRead()
+    waitUntil("replacement built") { rig.channels.count >= 2 }
+    let channelsAfterFirstRecovery = rig.channels.count
 
-    // And once the socket also starts rejecting writes, every buffer
-    // re-enters failSession, because failSession has no idempotency
-    // guard. One fault becomes a fault per 20ms of speech.
-    rig.channel.setWriteBehavior(.reject("Socket is not connected"))
-    let errorsBeforeStorm = rig.recorder.errorCount
+    // The retired socket now emits its cancellation straggler, late.
+    rig.firstChannel.failRead("Operation cancelled")
+    settle(0.4)
+
+    report.check(
+        "the straggler is ignored — no second rebuild",
+        rig.channels.count == channelsAfterFirstRecovery,
+        "channels: \(channelsAfterFirstRecovery) → \(rig.channels.count)"
+    )
+    report.check("the session is still alive", rig.recorder.errorCount == 0)
+
+    // And the replacement still works.
+    rig.channel.deliver(text: partialFrame("still here"))
+    waitUntil("replacement live") { rig.recorder.latestUpdate?.contains("still here") == true }
+    report.check(
+        "the replacement socket still delivers transcripts",
+        rig.recorder.latestUpdate?.contains("still here") == true,
+        "got: \(rig.recorder.latestUpdate ?? "nil")"
+    )
+}
+
+func testGapAudioIsBufferedNotLost() {
+    report.section("T3 — audio spoken during the rebuild is buffered, not dropped")
+    // Token fetch fails, so the session sits in the reconnecting state and
+    // the test can speak into the gap deterministically.
+    let rig = makeRig(tokenFetchFails: true)
+
+    rig.firstChannel.failRead()
+    settle(0.3)
+
+    // Speak while there is no usable socket.
+    let chunksOnDeadSocket = rig.firstChannel.audioChunkCount()
     for _ in 0..<5 {
         rig.session.appendAudioBuffer(makeAudioBuffer(amplitude: speechAmplitude))
     }
-    waitUntil("storm") { rig.recorder.errorCount >= errorsBeforeStorm + 5 }
+    settle(0.3)
     report.check(
-        "GAP CONFIRMED — failSession is not idempotent, so errors multiply",
-        rig.recorder.errorCount >= errorsBeforeStorm + 5,
-        "errors \(errorsBeforeStorm) → \(rig.recorder.errorCount)"
+        "nothing is fired at the retired socket",
+        rig.firstChannel.audioChunkCount() == chunksOnDeadSocket,
+        "chunks \(chunksOnDeadSocket) → \(rig.firstChannel.audioChunkCount())"
+    )
+
+    // Budget exhausts (3 attempts, token fetch failing every time) and the
+    // session fails ONCE — not once per audio buffer.
+    waitUntil("budget spent", timeout: 4.0) { rig.recorder.errorCount >= 1 }
+    for _ in 0..<5 {
+        rig.session.appendAudioBuffer(makeAudioBuffer(amplitude: speechAmplitude))
+    }
+    settle(0.3)
+    report.check(
+        "failSession is idempotent — one fault, one error, not a storm",
+        rig.recorder.errorCount == 1,
+        "errors: \(rig.recorder.errorCount)"
+    )
+    report.check(
+        "reconnect gives up after a bounded number of attempts",
+        rig.channels.count <= 4,
+        "channels built: \(rig.channels.count)"
     )
 }
 
-func testTerminalFlagIsWriteOnly() {
-    report.section("T4 — GAP: hasFailedOrTerminated is write-only")
+func testCancelIsTerminal() {
+    report.section("T4 — cancel() is terminal and cannot be resurrected")
     let rig = makeRig()
 
     rig.session.cancel()
     settle()
-    let chunksAfterCancel = rig.channel.audioChunkCount()
+    let chunksAfterCancel = rig.firstChannel.audioChunkCount()
+    let channelsAfterCancel = rig.channels.count
 
     rig.session.appendAudioBuffer(makeAudioBuffer(amplitude: speechAmplitude))
-    waitUntil("post-cancel audio") { rig.channel.audioChunkCount() > chunksAfterCancel }
+    settle(0.3)
     report.check(
-        "GAP CONFIRMED — audio is still sent after cancel()",
-        rig.channel.audioChunkCount() > chunksAfterCancel,
-        "chunks \(chunksAfterCancel) → \(rig.channel.audioChunkCount())"
+        "no audio is sent after cancel()",
+        rig.firstChannel.audioChunkCount() == chunksAfterCancel,
+        "chunks \(chunksAfterCancel) → \(rig.firstChannel.audioChunkCount())"
     )
-    report.check("cancel() did close the socket", rig.channel.cancelCount >= 1)
+    report.check("cancel() closed the socket", rig.firstChannel.cancelCount >= 1)
+
+    // A failure arriving after cancel must NOT trigger a rebuild — a
+    // finished session cannot be resurrected by its own recovery.
+    rig.firstChannel.failRead()
+    settle(0.4)
+    report.check(
+        "a post-cancel failure does not build a replacement",
+        rig.channels.count == channelsAfterCancel,
+        "channels \(channelsAfterCancel) → \(rig.channels.count)"
+    )
+    report.check("no error surfaced from a cancelled session", rig.recorder.errorCount == 0)
+}
+
+func testCommitDeferredDuringRebuild() {
+    report.section("T10 — releasing the key mid-rebuild still commits")
+    // The nastiest regression this fix can cause: the commit frame hits a
+    // nil socket, the server never commits, the 1.4s deadline fires, and
+    // the tail is lost — the original bug, reproduced by its own fix.
+    let rig = makeRig()
+    rig.session.appendAudioBuffer(makeAudioBuffer(amplitude: speechAmplitude))
+    rig.firstChannel.deliver(text: partialFrame("mid rebuild release"))
+    waitUntil("partial") { rig.recorder.updateCount >= 1 }
+
+    rig.firstChannel.failRead()
+    waitUntil("replacement built") { rig.channels.count >= 2 }
+
+    rig.session.requestFinalTranscript()
+    waitUntil("commit lands on the replacement") { rig.channel.commitFrameCount() >= 1 }
+    report.check(
+        "the commit frame reaches the replacement socket",
+        rig.channel.commitFrameCount() >= 1,
+        "commits on new socket: \(rig.channel.commitFrameCount())"
+    )
+
+    rig.channel.deliver(text: committedFrame("Mid rebuild release."))
+    waitUntil("final") { rig.recorder.finalCount == 1 }
+    report.check(
+        "a final transcript is still delivered",
+        rig.recorder.finalCount == 1,
+        "finals: \(rig.recorder.finalCount)"
+    )
 }
 
 func testFirstWriteRejection() {
@@ -530,40 +673,57 @@ func testFirstWriteRejection() {
     // upgrade returned "Socket is not connected". Any future reconnect
     // logic MUST survive this case; that is why it is pinned here.
     let rig = makeRig()
-    rig.channel.setWriteBehavior(.reject("The operation couldn't be completed. Socket is not connected"))
+    rig.firstChannel.setWriteBehavior(.reject("The operation couldn't be completed. Socket is not connected"))
 
     rig.session.appendAudioBuffer(makeAudioBuffer(amplitude: speechAmplitude))
-    waitUntil("write rejected") { rig.recorder.errorCount >= 1 }
-    report.check("a rejected write is reported, not swallowed", rig.recorder.errorCount >= 1)
+    waitUntil("replacement built") { rig.channels.count >= 2 }
     report.check(
-        "the reported error carries the transport's own wording",
-        rig.recorder.firstErrorMessage.contains("Socket is not connected"),
-        "got: \(rig.recorder.firstErrorMessage)"
+        "a rejected write rebuilds the socket instead of ending the dictation",
+        rig.channels.count >= 2,
+        "channels: \(rig.channels.count)"
     )
-    report.check("no transcript is produced", rig.recorder.finalCount == 0)
 
-    // Pin today's behavior so the next attempt has something to beat:
-    // one write error per buffer, forever, with no recovery and no cap.
-    let errorsBefore = rig.recorder.errorCount
-    for _ in 0..<4 {
-        rig.session.appendAudioBuffer(makeAudioBuffer(amplitude: speechAmplitude))
-    }
-    waitUntil("unbounded") { rig.recorder.errorCount >= errorsBefore + 4 }
+    // The replacement works — this is the recovery v16r19 never achieved.
+    rig.session.appendAudioBuffer(makeAudioBuffer(amplitude: speechAmplitude))
+    rig.channel.deliver(text: partialFrame("recovered after write failure"))
+    waitUntil("transcript flows") { rig.recorder.updateCount >= 1 }
     report.check(
-        "BASELINE — every rejected write is its own session failure (no cap, no recovery)",
-        rig.recorder.errorCount >= errorsBefore + 4,
-        "errors \(errorsBefore) → \(rig.recorder.errorCount)"
+        "transcription continues on the replacement",
+        rig.recorder.latestUpdate?.contains("recovered") == true,
+        "got: \(rig.recorder.latestUpdate ?? "nil")"
     )
+    report.check(
+        "the user is never shown an error for a recoverable fault",
+        rig.recorder.errorCount == 0,
+        "errors: \(rig.recorder.firstErrorMessage)"
+    )
+
+    rig.session.requestFinalTranscript()
+    rig.channel.deliver(text: committedFrame("Recovered after write failure."))
+    waitUntil("final") { rig.recorder.finalCount == 1 }
+    report.check("a final transcript is still delivered", rig.recorder.finalCount == 1)
 }
 
-func testAccountFatalFrameStillEscalates() {
-    report.section("T6 — v16r20 quota/auth escalation survives the seam")
+func testAccountFatalNeverReconnects() {
+    report.section("T6 — quota/auth refusals must NEVER trigger reconnect")
+    // THE v16r19 POST-MORTEM, ENCODED. On 2026-08-06 ElevenLabs refused
+    // every session for quota. v16r19 read those refusals as transient,
+    // burned its retry budget in seconds, and killed the session —
+    // amplifying an account problem into an app failure. Reconnect must
+    // stay away from anything the classifier calls account-fatal.
     let rig = makeRig()
 
-    rig.channel.deliver(
+    rig.firstChannel.deliver(
         text: #"{"message_type":"quota_exceeded","error":"You have exceeded your quota."}"#
     )
     waitUntil("escalated") { rig.recorder.errorCount >= 1 }
+
+    settle(0.5)
+    report.check(
+        "NO replacement socket is built for an account-fatal refusal",
+        rig.channels.count == 1,
+        "channels: \(rig.channels.count) (must stay 1)"
+    )
     report.check("quota_exceeded is escalated rather than discarded", rig.recorder.errorCount >= 1)
     report.check(
         "it is marked account-fatal, so CompanionManager switches engines",
@@ -616,11 +776,13 @@ struct ScribeStallRecoveryHarness {
         markHarnessLogBoundary("BEGIN")
 
         testHappyPath()
-        testHalfCloseCutoff()
-        testDeadSessionKeepsPumping()
-        testTerminalFlagIsWriteOnly()
+        testHalfCloseRecovers()
+        testGenerationIdentity()
+        testGapAudioIsBufferedNotLost()
+        testCancelIsTerminal()
+        testCommitDeferredDuringRebuild()
         testFirstWriteRejection()
-        testAccountFatalFrameStillEscalates()
+        testAccountFatalNeverReconnects()
         testBinaryFramePathPreserved()
         testScribeArtifactCleaning()
 
@@ -631,10 +793,11 @@ struct ScribeStallRecoveryHarness {
             print("✅ \(report.checks) checks passed.")
             print("""
 
-            NOTE: T2–T5 passing means the DEFECTS ARE STILL PRESENT and are now
-            pinned. They are the specification for the next attempt: when the
-            stall watchdog is re-added, those four tests must be rewritten to
-            assert recovery, and T1 must still pass unchanged.
+            v16r23: T2/T5 now assert RECOVERY rather than documenting the bug.
+            Still NOT covered — a socket that stays open while the server goes
+            silent. That needs the stall watchdog, which is deliberately out of
+            scope. Watch /tmp/clicky_scribe_session.log: if cuts persist with no
+            TRANSPORT FAILURE line, that's the remaining case.
             """)
             exit(0)
         } else {
