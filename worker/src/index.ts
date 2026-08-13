@@ -816,9 +816,95 @@ function describeDriveMimeType(mimeType: string): string {
 
 /// How many characters of exported document text we hand back. Marin is
 /// a realtime voice model — a 300-slide deck would blow her context and
-/// she can't usefully speak it anyway. She gets the top of the document
-/// and is told when it was cut.
+/// she can't usefully speak it anyway.
 const MAX_DRIVE_TEXT_CHARACTERS = 12000;
+
+/// Always include this much of the document head regardless of relevance:
+/// it carries the title and table of contents, which orient the answer.
+const DRIVE_TEXT_HEAD_CHARACTERS = 1200;
+
+/// Characters of context returned around each keyword hit.
+const DRIVE_EXCERPT_WINDOW_CHARACTERS = 1400;
+
+/// Pull the parts of a long document that actually bear on Steph's
+/// question, instead of blindly returning the first N characters.
+///
+/// WHY: the first cut of /drive/read returned `text.slice(0, 12000)`.
+/// Asked "what are the UK SKUs in the Glam in the City deck", Marin got
+/// the first 12k of a 73k-character deck — which contained the table-of-
+/// contents line "UK SKUs" but not the actual list, which lives at
+/// character 47,556. She correctly reported the detail wasn't there.
+/// The document was in Drive, the tool worked, and the answer was still
+/// unreachable purely because of where we cut.
+///
+/// Returns the head (title/TOC) plus windows around the best keyword
+/// clusters, in document order, separated by an elision marker.
+function extractRelevantExcerpts(
+  fullDocumentText: string,
+  lookingFor: string
+): { text: string; omittedMiddle: boolean } {
+  const searchTokens = splitSpokenRequestIntoSearchTokens(lookingFor);
+  if (searchTokens.length === 0 || fullDocumentText.length <= MAX_DRIVE_TEXT_CHARACTERS) {
+    return {
+      text: fullDocumentText.slice(0, MAX_DRIVE_TEXT_CHARACTERS),
+      omittedMiddle: fullDocumentText.length > MAX_DRIVE_TEXT_CHARACTERS,
+    };
+  }
+
+  const lowerCaseText = fullDocumentText.toLowerCase();
+
+  // Every position where any search token appears, tagged with which
+  // token it was — so a spot matching MORE distinct tokens can win.
+  const tokenHitPositions: Array<{ position: number; token: string }> = [];
+  for (const token of searchTokens) {
+    let searchFrom = 0;
+    while (tokenHitPositions.length < 400) {
+      const foundAt = lowerCaseText.indexOf(token, searchFrom);
+      if (foundAt === -1) break;
+      tokenHitPositions.push({ position: foundAt, token });
+      searchFrom = foundAt + token.length;
+    }
+  }
+  if (tokenHitPositions.length === 0) {
+    return { text: fullDocumentText.slice(0, MAX_DRIVE_TEXT_CHARACTERS), omittedMiddle: true };
+  }
+
+  // Score each hit by how many DISTINCT tokens appear nearby. A place
+  // where "uk" and "skus" sit together beats a lone stray "uk".
+  const scoredHits = tokenHitPositions.map((hit) => {
+    const nearbyTokens = new Set(
+      tokenHitPositions
+        .filter((other) => Math.abs(other.position - hit.position) < DRIVE_EXCERPT_WINDOW_CHARACTERS)
+        .map((other) => other.token)
+    );
+    return { position: hit.position, distinctTokenCount: nearbyTokens.size };
+  });
+  scoredHits.sort((left, right) => right.distinctTokenCount - left.distinctTokenCount);
+
+  // Take the best hits as windows until the character budget is spent,
+  // skipping any that overlap a window we already took.
+  const excerptBudget = MAX_DRIVE_TEXT_CHARACTERS - DRIVE_TEXT_HEAD_CHARACTERS;
+  const chosenWindows: Array<{ start: number; end: number }> = [];
+  let charactersUsed = 0;
+  for (const hit of scoredHits) {
+    if (charactersUsed + DRIVE_EXCERPT_WINDOW_CHARACTERS > excerptBudget) break;
+    const start = Math.max(0, hit.position - Math.floor(DRIVE_EXCERPT_WINDOW_CHARACTERS / 3));
+    const end = Math.min(fullDocumentText.length, start + DRIVE_EXCERPT_WINDOW_CHARACTERS);
+    if (chosenWindows.some((existing) => start < existing.end && end > existing.start)) continue;
+    chosenWindows.push({ start, end });
+    charactersUsed += end - start;
+  }
+  chosenWindows.sort((left, right) => left.start - right.start);
+
+  const documentHead = fullDocumentText.slice(0, DRIVE_TEXT_HEAD_CHARACTERS);
+  const excerptBlocks = chosenWindows.map(
+    (window) => `[…document characters ${window.start}-${window.end}…]\n${fullDocumentText.slice(window.start, window.end)}`
+  );
+  return {
+    text: [documentHead, ...excerptBlocks].join("\n\n"),
+    omittedMiddle: true,
+  };
+}
 
 /// /drive/read — export a Drive file's text so Marin can answer
 /// questions about it. body: { query? , file_id? } — ONE of the two.
@@ -829,7 +915,7 @@ const MAX_DRIVE_TEXT_CHARACTERS = 12000;
 /// Binary formats (PDF, images) are refused — the Worker has no parser,
 /// and pretending otherwise would produce confident nonsense.
 async function handleDriveRead(request: Request, env: Env): Promise<Response> {
-  let payload: { file_id?: string; query?: string };
+  let payload: { file_id?: string; query?: string; looking_for?: string };
   try {
     payload = (await request.json()) as typeof payload;
   } catch {
@@ -838,6 +924,7 @@ async function handleDriveRead(request: Request, env: Env): Promise<Response> {
 
   let fileId = (payload.file_id ?? "").trim();
   const spokenRequest = (payload.query ?? "").trim();
+  const lookingFor = (payload.looking_for ?? "").trim();
   if (!fileId && !spokenRequest) return jsonError("query or file_id is required", 400);
   if (!env.DRIVE_REFRESH_TOKEN) {
     return jsonError("Drive not configured (missing DRIVE_REFRESH_TOKEN secret)", 500);
@@ -909,6 +996,8 @@ async function handleDriveRead(request: Request, env: Env): Promise<Response> {
   }
   const fullDocumentText = await exportResponse.text();
   const wasTruncated = fullDocumentText.length > MAX_DRIVE_TEXT_CHARACTERS;
+  const extracted = extractRelevantExcerpts(fullDocumentText, lookingFor);
+  const usedTargetedExcerpts = wasTruncated && lookingFor.length > 0;
 
   return new Response(
     JSON.stringify({
@@ -917,15 +1006,21 @@ async function handleDriveRead(request: Request, env: Env): Promise<Response> {
       kind: describeDriveMimeType(mimeType),
       url: fileMetadata.webViewLink,
       truncated: wasTruncated,
+      total_characters: fullDocumentText.length,
+      // Tell Marin HOW the text was selected, so she can say something
+      // true about coverage instead of guessing.
+      excerpt_mode: usedTargetedExcerpts ? "relevant_sections" : "document_start",
       // A CSV export only ever covers the FIRST tab of a spreadsheet.
       // Say so, so Marin doesn't claim a number is absent when it's
       // just on another tab — she should use the `sheets` tool there.
       note: mimeType === "application/vnd.google-apps.spreadsheet"
         ? "First tab only. Use the sheets tool for a specific tab or range."
-        : wasTruncated
-          ? "Truncated — this is the beginning of the document only."
-          : undefined,
-      text: fullDocumentText.slice(0, MAX_DRIVE_TEXT_CHARACTERS),
+        : usedTargetedExcerpts
+          ? "Long document — you have the opening plus the sections matching what you searched for, not the whole file."
+          : wasTruncated
+            ? "Truncated — this is the beginning of the document only. If the answer isn't here, call again with looking_for set to the thing you need."
+            : undefined,
+      text: extracted.text,
     }),
     { status: 200, headers: { "content-type": "application/json" } }
   );
