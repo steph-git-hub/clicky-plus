@@ -346,6 +346,7 @@ enum MarinResearchTools {
 
         struct Scored { var title: String; var path: String; var snippet: String; var score: Int }
         var scored: [Scored] = []
+        var evictedFilesSkipped = 0
 
         guard let enumerator = fm.enumerator(atPath: obsidianVaultDir) else {
             return ["status": "error", "reason": "Could not enumerate vault"]
@@ -359,6 +360,22 @@ enum MarinResearchTools {
             // Bounding per-file cost keeps the whole search fast.
             if let attrs = try? fm.attributesOfItem(atPath: fullPath),
                let size = (attrs[.size] as? NSNumber)?.intValue, size > 512_000 { continue }
+            // v16r26 (2026-08-13): skip files iCloud has evicted (dataless — size
+            // on record but zero bytes allocated on disk). The vault sits on
+            // iCloud-synced Desktop; with the disk near full, macOS evicts vault
+            // files in bulk, and reading one blocks on a network download. A scan
+            // that should take ~1s then takes minutes, Gemini cancels the tool
+            // call, and Marin goes silent. Better a fast search that names its
+            // gap than a complete one that never arrives.
+            if let resourceValues = try? URL(fileURLWithPath: fullPath).resourceValues(
+                   forKeys: [.totalFileAllocatedSizeKey, .fileSizeKey]
+               ),
+               let allocatedSize = resourceValues.totalFileAllocatedSize,
+               let fileSize = resourceValues.fileSize,
+               allocatedSize == 0, fileSize > 0 {
+                evictedFilesSkipped += 1
+                continue
+            }
             guard let content = try? String(contentsOfFile: fullPath, encoding: .utf8) else { continue }
             let lower = content.lowercased()
             let titleRaw = ((relPath as NSString).lastPathComponent as NSString).deletingPathExtension
@@ -398,11 +415,16 @@ enum MarinResearchTools {
         let matches: [[String: Any]] = scored.prefix(maxResults).map {
             ["title": $0.title, "path": $0.path, "snippet": $0.snippet, "score": $0.score]
         }
-        return [
+        var searchResult: [String: Any] = [
             "matches": matches,
             "count": matches.count,
             "truncated": scored.count > maxResults,
         ]
+        if evictedFilesSkipped > 0 {
+            searchResult["skipped_not_downloaded"] = evictedFilesSkipped
+            searchResult["note"] = "\(evictedFilesSkipped) vault file(s) are offloaded to iCloud and were not searched. If the expected note is missing, mention this coverage gap to Steph."
+        }
+        return searchResult
     }
 
     // MARK: - 5. read_obsidian_note
