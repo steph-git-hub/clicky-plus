@@ -296,6 +296,26 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
     /// every frame (her audio level fluctuates above/below).
     @Published private(set) var marinAudioStartedThisTurn: Bool = false
 
+    /// v16r25 (2026-08-13): continuous-mode "thinking" indicator. True from
+    /// the moment the user goes silent after speaking (trailing-silence
+    /// window below) until Marin's response audio starts, the turn ends,
+    /// or the user speaks again. Before this, the whole gap between end of
+    /// user speech and first response audio showed a plain listening dot —
+    /// "heard you", "thinking", and "silently broken" looked identical.
+    /// OverlayWindow maps this to the processing spinner via
+    /// CompanionManager's realtimeAwaitingResponse binding.
+    @Published private(set) var awaitingResponseAfterUserSpeech: Bool = false
+
+    /// Timestamp of the most recent mic chunk that crossed the speech
+    /// threshold in continuous mode. Written from the audio tap thread,
+    /// same as the peak-level tracking around it.
+    private var lastContinuousSpeechDetectedAt: Date?
+
+    /// How long the user must stay silent (after having spoken this turn)
+    /// before the thinking indicator appears. Long enough to survive
+    /// natural mid-sentence pauses, short enough to feel immediate.
+    private static let continuousTrailingSilenceForThinkingSeconds: TimeInterval = 0.8
+
     // v15p3ek (2026-05-17): 0.04 was rejecting quiet first-syllable
     // speech (observed first chunk peak at 0.0045 then jumping to
     // 0.043 once Steph actually spoke — if release happened during
@@ -1330,6 +1350,68 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         else { try? line.write(toFile: path, atomically: true, encoding: .utf8) }
     }
 
+    /// v16r26 (2026-08-13): single-winner gate for racing a tool result
+    /// against a timeout. Whichever side claims first gets to resume the
+    /// continuation; the loser sees false and logs instead.
+    private final class FirstResumeGate: @unchecked Sendable {
+        private let lock = NSLock()
+        private var hasResumed = false
+        func claim() -> Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            if hasResumed { return false }
+            hasResumed = true
+            return true
+        }
+    }
+
+    /// v16r26 (2026-08-13): run a synchronous research tool off-main with a
+    /// hard timeout. Root cause of the "find that session" silent failure:
+    /// the Obsidian vault lives on iCloud-synced Desktop, and with the disk
+    /// near full macOS evicts vault files — each evicted file turns a read
+    /// into a blocking network download, so a ~1s scan became minutes.
+    /// Gemini Live cancels an unanswered tool call after ~15-20s (observed
+    /// toolCallCancellation at +19s, socket teardown at +14s), the session
+    /// died, and when the search finally finished sendToolResponse dropped
+    /// the result at its nil-socket guard without logging. Marin never got
+    /// ANY response, so she went silent — no prompt rule can fix that.
+    /// With this wrapper the model always receives a response while the
+    /// session is alive: the real result if it beats the deadline, an
+    /// explicit timeout error (with speaking instructions) if not.
+    nonisolated private static func runResearchToolWithTimeout(
+        name: String,
+        timeoutSeconds: TimeInterval,
+        operation: @escaping @Sendable () -> [String: Any]
+    ) async -> [String: Any] {
+        await withCheckedContinuation { (continuation: CheckedContinuation<[String: Any], Never>) in
+            let gate = FirstResumeGate()
+            let startedAt = Date()
+            Task.detached(priority: .userInitiated) {
+                let result = operation()
+                if gate.claim() {
+                    continuation.resume(returning: result)
+                } else {
+                    let elapsed = Int(Date().timeIntervalSince(startedAt))
+                    RealtimeConversationManager.appendDiag(
+                        "[gemini] \(name) finished AFTER its \(Int(timeoutSeconds))s timeout (took \(elapsed)s) — late result discarded"
+                    )
+                }
+            }
+            Task.detached {
+                try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+                if gate.claim() {
+                    RealtimeConversationManager.appendDiag(
+                        "[gemini] \(name) TIMED OUT after \(Int(timeoutSeconds))s — sending timeout error so Marin can speak"
+                    )
+                    continuation.resume(returning: [
+                        "status": "error",
+                        "reason": "\(name) timed out after \(Int(timeoutSeconds)) seconds — some vault files may be offloaded to iCloud and slow to read. TELL STEPH OUT LOUD that the search timed out; you may retry once. Never go silent.",
+                    ])
+                }
+            }
+        }
+    }
+
     private func dispatchTool(name: String, args: [String: Any]) async -> [String: Any] {
         Self.logToolCall(name, args)
         switch name {
@@ -1354,15 +1436,24 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             let query = (args["query"] as? String) ?? ""
             // v16qv: run off the main thread — this scans/reads the whole Obsidian
             // vault and was hanging the UI (main-thread deadlock) on @MainActor.
-            return await Task.detached(priority: .userInitiated) { MarinResearchTools.searchObsidian(query: query) }.value
+            // v16r24: hard 10s timeout — see runResearchToolWithTimeout for why.
+            return await Self.runResearchToolWithTimeout(name: "search_obsidian", timeoutSeconds: 10) {
+                MarinResearchTools.searchObsidian(query: query)
+            }
         case "read_obsidian_note":
             let path = (args["path"] as? String) ?? ""
             // v16qv: off the main thread — reads a note file synchronously.
-            return await Task.detached(priority: .userInitiated) { MarinResearchTools.readObsidianNote(path: path) }.value
+            // v16r24: timeout too — a single evicted note blocks on iCloud download.
+            return await Self.runResearchToolWithTimeout(name: "read_obsidian_note", timeoutSeconds: 10) {
+                MarinResearchTools.readObsidianNote(path: path)
+            }
         case "search_clicky_codebase":
             let query = (args["query"] as? String) ?? ""
             // v16qv: off the main thread — walks/reads the whole clicky-plus repo.
-            return await Task.detached(priority: .userInitiated) { MarinResearchTools.searchClickyCodebase(query: query) }.value
+            // v16r24: same timeout guard as the vault tools.
+            return await Self.runResearchToolWithTimeout(name: "search_clicky_codebase", timeoutSeconds: 10) {
+                MarinResearchTools.searchClickyCodebase(query: query)
+            }
         case "read_clicky_roadmap":
             return await MainActor.run { MarinResearchTools.readClickyRoadmap() }
         case "pin_playbook":
@@ -2119,7 +2210,16 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
     /// Send a tool result back to Gemini as a toolResponse message.
     /// The model integrates the response into its next generation.
     private func sendToolResponse(id: String, name: String, result: [String: Any]) async {
-        guard let task = websocketTask else { return }
+        guard let task = websocketTask else {
+            // v16r26 (2026-08-13): this bail used to be SILENT — a tool that
+            // finished after the session died vanished without a trace,
+            // which is exactly what made the search_obsidian silent failure
+            // undiagnosable from the logs. Every dropped response now says so.
+            RealtimeConversationManager.appendDiag(
+                "[gemini] tool_response DROPPED for \(name) — no websocket (session ended before the tool finished)"
+            )
+            return
+        }
         let payload: [String: Any] = [
             "tool_response": [
                 "function_responses": [
@@ -3417,6 +3517,10 @@ unless he asks for them).
             // the very first user-speech of the session captures fresh
             // vision (same as PTT's "vision before activity_start").
             awaitingFirstSpeechOfTurn = true
+            // v16r25 (2026-08-13): fresh session — clear any leftover
+            // thinking-indicator state from a previous session.
+            awaitingResponseAfterUserSpeech = false
+            lastContinuousSpeechDetectedAt = nil
             await startSessionInternal()
         }
     }
@@ -4852,6 +4956,37 @@ unless he asks for them).
                 }
             }
         }
+        // v16r25 (2026-08-13): drive the continuous-mode thinking
+        // indicator. While the user is audibly speaking, refresh the
+        // last-speech timestamp (and clear the indicator if a follow-up
+        // started). Once they've spoken this turn and then stayed silent
+        // past the trailing window — with Marin not yet responding —
+        // flip the indicator on so the overlay shows the spinner.
+        if continuousListeningActive && !isMarinSpeaking {
+            if level >= Self.silentPressThreshold {
+                lastContinuousSpeechDetectedAt = Date()
+                if awaitingResponseAfterUserSpeech {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.awaitingResponseAfterUserSpeech = false
+                    }
+                }
+            } else if !awaitingFirstSpeechOfTurn,
+                      !awaitingResponseAfterUserSpeech,
+                      let lastSpeechAt = lastContinuousSpeechDetectedAt,
+                      Date().timeIntervalSince(lastSpeechAt) >= Self.continuousTrailingSilenceForThinkingSeconds {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    // Re-check on main: if response audio already arrived,
+                    // .responding owns the indicator — don't double-claim.
+                    guard case .listening = self.state else { return }
+                    guard !self.awaitingResponseAfterUserSpeech else { return }
+                    self.awaitingResponseAfterUserSpeech = true
+                    RealtimeConversationManager.appendDiag(
+                        "[gemini] continuous: trailing silence after speech — thinking indicator ON"
+                    )
+                }
+            }
+        }
         // Ship to Gemini.
         sendMicChunk(pcmData)
     }
@@ -4977,6 +5112,9 @@ unless he asks for them).
             // spinner during her speech (vs the thinking phase
             // before audio starts).
             self.marinAudioStartedThisTurn = true
+            // v16r25 (2026-08-13): response is here — the continuous-mode
+            // thinking indicator's job is done for this turn.
+            self.awaitingResponseAfterUserSpeech = false
         }
         guard let geminiOutputFormat = AVAudioFormat(
             commonFormat: .pcmFormatInt16,
@@ -5084,6 +5222,10 @@ unless he asks for them).
             // started flag so next turn's thinking phase shows the
             // spinner correctly.
             marinAudioStartedThisTurn = false
+            // v16r25 (2026-08-13): reset the continuous-mode thinking
+            // indicator state for the next turn.
+            awaitingResponseAfterUserSpeech = false
+            lastContinuousSpeechDetectedAt = nil
         }
     }
 

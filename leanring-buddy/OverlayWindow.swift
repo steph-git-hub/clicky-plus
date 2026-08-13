@@ -271,7 +271,13 @@ struct BlueCursorView: View {
             && !companionManager.isRealtimeSuspendedByOtherMode {
             switch companionManager.realtimeSessionState {
             case .listening:
-                return .listening
+                // v16r25 (2026-08-13): user spoke and went silent with no
+                // response audio yet → show the thinking spinner. Was a
+                // plain listening dot, which made "heard you", "thinking",
+                // and "silently broken" indistinguishable in toggle mode.
+                return companionManager.realtimeAwaitingResponse
+                    ? .processing
+                    : .listening
             case .responding:
                 return companionManager.realtimeMarinAudioStarted
                     ? .listening
@@ -312,7 +318,10 @@ struct BlueCursorView: View {
         }
         if companionManager.isRealtimeModeActive
             && !companionManager.isRealtimeSuspendedByOtherMode {
+            // v16r25 (2026-08-13): while the thinking indicator is on,
+            // the listening visual yields to the spinner.
             return companionManager.realtimeSessionState == .listening
+                && !companionManager.realtimeAwaitingResponse
         }
         return companionManager.voiceState == .listening
     }
@@ -329,7 +338,11 @@ struct BlueCursorView: View {
                 return !companionManager.realtimeMarinAudioStarted
             case .connecting:
                 return false
-            case .listening, .idle, .errored:
+            case .listening:
+                // v16r25 (2026-08-13): thinking phase between the user
+                // going silent and the first response audio chunk.
+                return companionManager.realtimeAwaitingResponse
+            case .idle, .errored:
                 return false
             }
         }
@@ -372,7 +385,11 @@ struct BlueCursorView: View {
             && !companionManager.isRealtimeSuspendedByOtherMode {
             switch companionManager.realtimeSessionState {
             case .listening:
-                return .listening
+                // v16r25 (2026-08-13): mirror dot mode — thinking phase
+                // shows the processing visual.
+                return companionManager.realtimeAwaitingResponse
+                    ? .processing
+                    : .listening
             case .responding:
                 return companionManager.realtimeMarinAudioStarted
                     ? .listening

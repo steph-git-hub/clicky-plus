@@ -886,7 +886,13 @@ final class CompanionManager: ObservableObject {
     /// to a threshold (her audio fluctuates above/below every frame).
     /// True from first audio chunk per turn until turn end.
     @Published private(set) var realtimeMarinAudioStarted: Bool = false
+    /// v16r25 (2026-08-13): continuous-mode thinking indicator — user
+    /// spoke, went silent, and Marin's response audio hasn't started.
+    /// Mirrors GeminiRealtimeConversationManager.awaitingResponseAfterUserSpeech;
+    /// OverlayWindow shows the processing spinner while true.
+    @Published private(set) var realtimeAwaitingResponse: Bool = false
     private var geminiMarinAudioStartedCancellable: AnyCancellable?
+    private var geminiAwaitingResponseCancellable: AnyCancellable?
 
     /// v15p2 (2026-05-03): Marin's session state, exposed so the
     /// indicator can pick `.listening` mode (audio-reactive halo)
@@ -3039,8 +3045,14 @@ final class CompanionManager: ObservableObject {
     // means cancelCurrentDictation itself bailed).
     private func ensureDictationReady() -> Bool {
         if buddyDictationManager.isDictationInProgress {
-            print("🔧 ensureDictationReady: dictation manager has stuck state — recovering before engage")
-            buddyDictationManager.cancelCurrentDictation(preserveDraftText: false)
+            // v16r24 (2026-08-13): this used to call cancelCurrentDictation
+            // directly, which DESTROYED the uncommitted transcript — a
+            // double-tap Option (Marin engage) mid-dictation wiped minutes
+            // of speech (Option sits next to Control, so it happens by
+            // accident). Stash-and-cancel preserves the words; they're
+            // restored on the next dictation commit.
+            print("🔧 ensureDictationReady: dictation in progress — stashing transcript, then cancelling before engage")
+            buddyDictationManager.stashTranscriptAndCancelCurrentDictation()
         }
         return !buddyDictationManager.isDictationInProgress
     }
@@ -4613,6 +4625,14 @@ final class CompanionManager: ObservableObject {
             .sink { [weak self] started in
                 self?.realtimeMarinAudioStarted = started
             }
+        // v16r25 (2026-08-13): mirror the continuous-mode thinking
+        // indicator so OverlayWindow can show the spinner between the
+        // user going silent and Marin's response audio starting.
+        geminiAwaitingResponseCancellable = manager.$awaitingResponseAfterUserSpeech
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] awaiting in
+                self?.realtimeAwaitingResponse = awaiting
+            }
     }
 
     /// v15p3di (2026-05-16): dispatch helpers. All call sites that
@@ -5410,6 +5430,13 @@ final class CompanionManager: ObservableObject {
     /// worth the timeout risk: the transcript itself carries plenty of tone.
     static let polishScreenshotMaxTextLength = 1200
 
+    /// v16r27 (2026-08-13): extra request budget when a context screenshot
+    /// rides along. The JPEG's upload + vision processing costs seconds
+    /// that the text-length scaling doesn't see; without this, short
+    /// screenshot-attached toggle polishes sat at the bare 9.5s budget and
+    /// timed out sporadically (6 failures 8/10-8/13, all with screenshots).
+    static let polishScreenshotTimeoutSurchargeSeconds: TimeInterval = 4.0
+
     private static func sendPolishCommandToWorkerDetailed(
         workerBaseURL: String,
         fieldText: String,
@@ -5448,6 +5475,14 @@ final class CompanionManager: ObservableObject {
         // Budget now scales with length; the VTT path re-arms the watchdog
         // above this value so the ordering guarantee above still holds.
         request.timeoutInterval = Self.polishTimeoutSeconds(forTextLength: fieldText.count)
+        // v16r27 (2026-08-13): screenshot surcharge. Every one of the six
+        // polish failures from 8/10-8/13 was a SHORT text (208-1262 chars,
+        // budget 9.5-12s) WITH a screenshot attached — the v16r16 scaling
+        // budgets for text length but never accounted for the JPEG's
+        // upload + vision cost, which is what actually eats the margin.
+        if contextImageJPEG != nil {
+            request.timeoutInterval += Self.polishScreenshotTimeoutSurchargeSeconds
+        }
 
         var requestBody: [String: Any] = [
             "command": "polish",
@@ -6364,8 +6399,13 @@ final class CompanionManager: ObservableObject {
                     // above the (now length-scaled) request timeout so a slow
                     // polish still fails gracefully to punctuated text rather
                     // than being force-cancelled mid-call.
-                    let polishBudget = Self.polishTimeoutSeconds(forTextLength: punctuatedText.count)
                     let sendScreenshot = punctuatedText.count <= Self.polishScreenshotMaxTextLength
+                    // v16r27: include the screenshot surcharge so the
+                    // watchdog re-arm below stays ABOVE the actual request
+                    // timeout (the ordering guarantee that lets a slow
+                    // polish fail gracefully instead of being force-killed).
+                    let polishBudget = Self.polishTimeoutSeconds(forTextLength: punctuatedText.count)
+                        + (sendScreenshot && contextScreenshot != nil ? Self.polishScreenshotTimeoutSurchargeSeconds : 0)
                     if polishBudget > 9.5 || !sendScreenshot {
                         print("✨ VTT polish: \(punctuatedText.count) chars → budget \(String(format: "%.1f", polishBudget))s, screenshot=\(sendScreenshot)")
                     }
