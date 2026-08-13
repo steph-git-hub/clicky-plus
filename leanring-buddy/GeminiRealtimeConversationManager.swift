@@ -773,6 +773,40 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
                 "required": ["filename"],
             ],
         ],
+        // ── Google Drive: open / read by inexact spoken name (2026-08-12)
+        //
+        // NAMED `open_drive_file`, NOT `find_drive_file`. The original
+        // name cost two failed test rounds: "find" reads like a lookup
+        // step, so Marin reached for it to ANSWER content questions and
+        // the browser-open came along as an invisible side effect. On
+        // 2026-08-12 she answered a "what's the launch date" question by
+        // reading the date off the returned FILENAME, having never
+        // called read_drive_file at all. The verb in a tool's name drives
+        // selection harder than any amount of description text — two
+        // rounds of description edits failed to fix what the rename did.
+        [
+            "name": "open_drive_file",
+            "description": "Open a Google Drive file — Sheet, Doc, Slides deck, PDF — in the browser, when Steph wants to LOOK at it: 'pull up the Glam and the City marketing sheet', 'open the Sephora forecast', 'show me the holiday launch deck'. This tool's whole purpose is putting a file on his screen. \n\nYou do not need the exact filename and should never ask for one. Pass what he actually said as `query`; the tool splits it into words and searches on all of them, so 'Glam and the City marketing sheet' finds '[INTERNAL] Holiday Glam In The City _Marketing Sheet'. \n\nNOT FOR QUESTIONS. If he asks what a file says or contains — 'what's the launch date', 'summarize it', 'does it mention UK', 'what are the SKUs' — use read_drive_file instead. Opening a file does not answer a question. Do not use this to look something up and then answer from the filename; the filename is not the document. \n\nCheck the 'Marin Nav' memory file first for his regular destinations (revenue models, dashboards) — those are instant. Use this for anything not on that list, and open_file for files on his Mac's local disk rather than Drive. \n\nBenign and reversible, so say nothing before: call the tool, then confirm in one word after. Handle by `status`: 'ok' → the top match is already open in Chrome; say 'Opened.' and, only if `others` is non-empty, add one short sentence naming the alternates ('Opened. I also saw a launch deck and an info deck.') so he can redirect. 'not_found' → say nothing matched and read back what you searched for. 'error' → say it failed and read the reason. Never claim you opened something unless status is 'ok'. \n\nDon't filter by file type even if he says 'sheet' or 'deck' — he's often wrong about the type (that 'marketing sheet' is actually a Slides deck) and the tool handles it. Pass his words through as-is.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "query": ["type": "STRING", "description": "What Steph called the file, in his own words — e.g. 'Glam and the City marketing sheet'. Do NOT clean it up, guess at the real filename, or add words like 'Google Sheet'. Filler words are stripped for you."],
+                ],
+                "required": ["query"],
+            ],
+        ],
+        [
+            "name": "read_drive_file",
+            "description": "Answer a QUESTION ABOUT WHAT IS INSIDE a Google Doc, Slides deck, or Sheet — 'what's the launch date in the Glam in the City deck', 'what does the info deck say about pricing', 'summarize that doc', 'does the marketing sheet mention UK'. \n\nPICKING BETWEEN THIS AND open_drive_file — decide on the VERB, not the file: if he wants the file ON SCREEN ('open', 'pull up', 'show me'), use open_drive_file. If he wants an ANSWER ('what does it say', 'what's the date', 'summarize'), use THIS ONE. This tool does NOT open anything, which is the point — he asked a question, not for a browser tab. \n\nJust pass what he SAID as `query` — 'the Glam in the City deck'. This tool finds the file itself, so this is a ONE-CALL job: do NOT call open_drive_file first. And never pass a file_id you did not receive from a tool result in this same conversation — a made-up id looks real and will fail. If you have no id, you have `query`, and `query` is enough. \n\nANSWER FROM `text`, NOT FROM THE FILE'S NAME. A filename sometimes contains a date or a label that looks like the answer; it is not the answer, and quoting it while ignoring the document is a wrong result even when it happens to be right. \n\nHandle by `status`: 'ok' → answer his question from `text`; if `truncated` is true you only have the beginning, so say that rather than claiming something isn't in there. 'not_found' → nothing matched; say so. 'unsupported' → it's a PDF or image you can't read as text; tell him and offer to open it instead. For a SPECIFIC tab or cell range of a spreadsheet, prefer the `sheets` tool — this returns the first tab only. \n\nSpeak the ANSWER, never the raw document.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "query": ["type": "STRING", "description": "What Steph called the file, in his own words — e.g. 'the Glam in the City deck'. This is the normal way to use this tool. Filler words are stripped for you."],
+                    "file_id": ["type": "STRING", "description": "Optional. ONLY use this if a tool result earlier in THIS conversation gave you the id. Never guess or reconstruct one — prefer `query`."],
+                ],
+                "required": [String](),
+            ],
+        ],
         // ── Slack (worker-backed) ──────────────────────────────
         [
             "name": "search_slack",
@@ -1598,6 +1632,21 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             return clickupResult
         case "sheets":
             return await safeWorkerCall(path: "/sheets", body: args)
+        // ── Google Drive: open by spoken name, and read contents (2026-08-12)
+        // Search runs on the Worker (it holds the Drive credential); the
+        // OPEN happens here, because only the app can drive NSWorkspace.
+        case "open_drive_file":
+            let spokenFileRequest = (args["query"] as? String) ?? ""
+            guard !spokenFileRequest.isEmpty else {
+                return ["status": "error", "reason": "No file name given."]
+            }
+            let searchResult = await safeWorkerCall(
+                path: "/drive/search",
+                body: ["query": spokenFileRequest, "max_results": 4]
+            )
+            return await openTopDriveMatch(searchResult: searchResult, spokenRequest: spokenFileRequest)
+        case "read_drive_file":
+            return await safeWorkerCall(path: "/drive/read", body: args)
         // ── fill_cells: paste into the focused cell on screen (v16po)
         case "fill_cells":
             return await fillCells(args: args)
@@ -1621,6 +1670,54 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
         } catch {
             return ["status": "error", "reason": error.localizedDescription]
         }
+    }
+
+    /// Open the best Drive match immediately and hand Marin the runners-up
+    /// so she can offer them in the same breath.
+    ///
+    /// Why open-then-offer rather than read-back-and-wait: the ranking is
+    /// by how recently STEPH last opened each file, which in practice puts
+    /// the one he means first. Making him arbitrate a list every time
+    /// would cost a round-trip on every lookup to fix the rare miss — and
+    /// a wrong tab is trivially recoverable, unlike a wrong write.
+    private func openTopDriveMatch(
+        searchResult: [String: Any],
+        spokenRequest: String
+    ) async -> [String: Any] {
+        guard (searchResult["status"] as? String) == "ok",
+              let matchedFiles = searchResult["files"] as? [[String: Any]],
+              let topMatch = matchedFiles.first,
+              let topMatchURLString = topMatch["url"] as? String,
+              let topMatchURL = URL(string: topMatchURLString) else {
+            // Pass the Worker's own status ("not_found" / "error") straight
+            // through — its `note` already explains what was searched.
+            return searchResult
+        }
+
+        let didOpen = await MainActor.run { NSWorkspace.shared.open(topMatchURL) }
+        guard didOpen else {
+            return ["status": "error",
+                    "reason": "Found \"\(topMatch["name"] as? String ?? "the file")\" but macOS wouldn't open it."]
+        }
+
+        // Runners-up, named so Marin can say "I also saw ..." without a
+        // second lookup. Kept to 3 — this is spoken aloud.
+        let alternateMatches = matchedFiles.dropFirst().prefix(3).map { alternateFile -> [String: Any] in
+            [
+                "id": alternateFile["id"] as? String ?? "",
+                "name": alternateFile["name"] as? String ?? "",
+                "kind": alternateFile["kind"] as? String ?? "file",
+            ]
+        }
+
+        return [
+            "status": "ok",
+            "opened": topMatch["name"] as? String ?? spokenRequest,
+            "file_id": topMatch["id"] as? String ?? "",
+            "kind": topMatch["kind"] as? String ?? "file",
+            "url": topMatchURLString,
+            "others": Array(alternateMatches),
+        ]
     }
 
     /// v16po (2026-06-05): fill_cells — paste a grid of values into the

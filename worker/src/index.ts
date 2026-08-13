@@ -81,6 +81,14 @@ interface Env {
   /// gateway tool (read/update/append/info). Worker-side token exchange,
   /// same pattern as getCalendarAccessToken.
   SHEETS_REFRESH_TOKEN: string;
+  /// Drive connector (2026-08-12). Separate Google OAuth refresh token
+  /// scoped to https://www.googleapis.com/auth/drive.readonly, minted on
+  /// the SAME OAuth client as Gmail/Calendar/Sheets. Backs Marin's
+  /// `open_drive_file` and `read_drive_file` tools. drive.readonly (not
+  /// drive.metadata.readonly) because Marin needs to EXPORT Docs/Slides
+  /// text, which metadata-only scope cannot do. Read-only — there is no
+  /// write path to Drive anywhere in this Worker, by design.
+  DRIVE_REFRESH_TOKEN: string;
 }
 
 export default {
@@ -211,6 +219,14 @@ export default {
 
       if (url.pathname === "/sheets") {
         return await handleSheets(request, env);
+      }
+
+      if (url.pathname === "/drive/search") {
+        return await handleDriveSearch(request, env);
+      }
+
+      if (url.pathname === "/drive/read") {
+        return await handleDriveRead(request, env);
       }
     } catch (error) {
       console.error(`[${url.pathname}] Unhandled error:`, error);
@@ -500,6 +516,419 @@ async function handleSheets(request: Request, env: Env): Promise<Response> {
     status: 200,
     headers: { "content-type": "application/json" },
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Drive connector (2026-08-12)
+//
+// WHY THIS EXISTS: Marin could open Google files only if they were on
+// her hardcoded "Marin Nav" list. Ask for anything else and she had to
+// ask for the exact filename, which defeats the point of voice.
+//
+// THE HARD PART IS NOT THE API CALL, IT IS THE MATCHING. Drive's
+// `name contains 'X'` requires a CONTIGUOUS substring, so the phrase a
+// person actually says almost never matches the filename someone else
+// typed. Verified failure that motivated this: Steph said "Glam and the
+// City marketing sheet"; the real file is
+// "[INTERNAL] Holiday Glam In The City _Marketing Sheet".
+//   name contains 'Glam and the City'                     → 0 results
+//   name contains 'glam' AND 'city' AND 'marketing'       → 1 result, correct
+// So we split the spoken phrase into tokens, AND them together, and
+// progressively relax until something comes back.
+//
+// DELIBERATELY NOT DONE: filtering or boosting by mimeType when the
+// person says a file-type word. In the motivating case he said "sheet"
+// but the file is a SLIDES deck literally named "..._Marketing Sheet".
+// Trusting the spoken type word would have ranked the correct answer
+// last or excluded it. Type words are treated as ordinary name tokens
+// and are the first thing dropped when relaxing.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Mint a Google access token scoped to Drive (read-only). Mirrors
+/// getSheetsAccessToken but uses DRIVE_REFRESH_TOKEN, on the same OAuth
+/// client. The refresh token never leaves the Worker.
+async function getDriveAccessToken(env: Env): Promise<string> {
+  const params = new URLSearchParams({
+    client_id: env.GOOGLE_OAUTH_CLIENT_ID,
+    client_secret: env.GOOGLE_OAUTH_CLIENT_SECRET,
+    refresh_token: env.DRIVE_REFRESH_TOKEN,
+    grant_type: "refresh_token",
+  });
+  const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: params.toString(),
+  });
+  if (!tokenResponse.ok) {
+    const errorBody = await tokenResponse.text();
+    throw new Error(`Drive token exchange failed (${tokenResponse.status}): ${errorBody}`);
+  }
+  const tokenJSON = (await tokenResponse.json()) as { access_token?: string };
+  if (!tokenJSON.access_token) {
+    throw new Error("Drive token response missing access_token");
+  }
+  return tokenJSON.access_token;
+}
+
+/// Words that carry no identifying information in a spoken request.
+/// Stripped before we build any Drive query. "and"/"the"/"in" matter a
+/// lot here: they are exactly what differ between "Glam and the City"
+/// (what he said) and "Glam In The City" (what the file is called).
+const SPOKEN_FILLER_WORDS = new Set([
+  "a", "an", "and", "the", "of", "for", "to", "in", "on", "at", "by", "or",
+  "my", "our", "his", "her", "their", "its", "that", "this", "it",
+  "up", "open", "pull", "find", "get", "show", "me", "please",
+  "latest", "current", "newest", "recent", "last",
+]);
+
+/// File-type words. Kept for the FIRST (most precise) query pass, then
+/// dropped first when relaxing — a file called "Marketing Sheet" can be
+/// a Slides deck, and a deck can be called a "sheet" in conversation.
+/// Never used to filter on mimeType. See the block comment above.
+const GENERIC_DOCUMENT_TYPE_WORDS = new Set([
+  "sheet", "sheets", "spreadsheet", "spreadsheets",
+  "doc", "docs", "document", "documents",
+  "deck", "decks", "slide", "slides", "presentation", "presentations",
+  "file", "files", "folder", "pdf",
+]);
+
+/// Split a spoken request into distinctive lowercase search tokens.
+/// Drops filler words, punctuation, and 1-character leftovers.
+function splitSpokenRequestIntoSearchTokens(spokenRequest: string): string[] {
+  return spokenRequest
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((token) => token.length > 1 && !SPOKEN_FILLER_WORDS.has(token));
+}
+
+/// Escape a value for embedding in a Drive query string literal.
+/// Drive uses single-quoted literals; backslash and single quote escape.
+function escapeDriveQueryLiteral(value: string): string {
+  return value.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+}
+
+/// Build the ordered list of Drive queries to try, most precise first.
+/// We stop at the first one that returns anything, so ordering IS the
+/// ranking of precision.
+function buildProgressivelyRelaxedDriveQueries(
+  spokenRequest: string,
+  searchTokens: string[]
+): string[] {
+  const notTrashed = "trashed = false";
+  const queries: string[] = [];
+
+  // Pass 1 — the literal phrase. Wins when he said the name exactly.
+  const literalPhrase = escapeDriveQueryLiteral(spokenRequest.trim());
+  if (literalPhrase) {
+    queries.push(`name contains '${literalPhrase}' and ${notTrashed}`);
+  }
+
+  // Pass 2 — every token must appear somewhere in the name, in any
+  // order. This is the pass that solves the motivating failure.
+  if (searchTokens.length > 0) {
+    const allTokensClause = searchTokens
+      .map((token) => `name contains '${escapeDriveQueryLiteral(token)}'`)
+      .join(" and ");
+    queries.push(`${allTokensClause} and ${notTrashed}`);
+  }
+
+  // Pass 3 — same, minus file-type words ("sheet", "deck", ...), which
+  // are the tokens most likely to be absent from the real filename.
+  const tokensWithoutTypeWords = searchTokens.filter(
+    (token) => !GENERIC_DOCUMENT_TYPE_WORDS.has(token)
+  );
+  if (tokensWithoutTypeWords.length > 0 && tokensWithoutTypeWords.length < searchTokens.length) {
+    const clause = tokensWithoutTypeWords
+      .map((token) => `name contains '${escapeDriveQueryLiteral(token)}'`)
+      .join(" and ");
+    queries.push(`${clause} and ${notTrashed}`);
+  }
+
+  // Pass 4..N — keep dropping the LAST token until only one is left.
+  //
+  // Dropping from the END (not shortest-first) is deliberate. People
+  // front-load the identifying part of a name and trail off into
+  // generic qualifiers: "Ulta revenue model", "DTC revenue forecast",
+  // "Glam and the City marketing sheet". Shortest-first looked
+  // reasonable and was wrong — it relaxed "Ulta revenue model" to
+  // `revenue AND model`, discarding "ulta", the one word that
+  // identifies the file, because it happens to be four letters.
+  for (let keepCount = tokensWithoutTypeWords.length - 1; keepCount >= 1; keepCount -= 1) {
+    const clause = tokensWithoutTypeWords
+      .slice(0, keepCount)
+      .map((token) => `name contains '${escapeDriveQueryLiteral(token)}'`)
+      .join(" and ");
+    queries.push(`${clause} and ${notTrashed}`);
+  }
+
+  // Last resort — search file CONTENTS, not names. Catches the case
+  // where he refers to a doc by something written inside it.
+  if (literalPhrase) {
+    queries.push(`fullText contains '${literalPhrase}' and ${notTrashed}`);
+  }
+
+  return queries;
+}
+
+interface DriveFileSummary {
+  id: string;
+  name: string;
+  mimeType: string;
+  webViewLink: string;
+  modifiedTime: string;
+  viewedByMeTime?: string;
+}
+
+/// Rank candidates by how recently STEPH last opened the file, falling
+/// back to when it was last modified by anyone. Rationale: among files
+/// whose names all match equally well, the one he actually works in is
+/// overwhelmingly the one he means. In the motivating case this is what
+/// separates the three "Glam In The City" files correctly.
+function rankDriveFilesByRecentInteraction(driveFiles: DriveFileSummary[]): DriveFileSummary[] {
+  const interactionTimestamp = (driveFile: DriveFileSummary): number => {
+    const lastOpenedByUser = driveFile.viewedByMeTime
+      ? Date.parse(driveFile.viewedByMeTime)
+      : NaN;
+    if (!Number.isNaN(lastOpenedByUser)) return lastOpenedByUser;
+    const lastModified = Date.parse(driveFile.modifiedTime ?? "");
+    return Number.isNaN(lastModified) ? 0 : lastModified;
+  };
+  return [...driveFiles].sort(
+    (leftFile, rightFile) => interactionTimestamp(rightFile) - interactionTimestamp(leftFile)
+  );
+}
+
+/// Run the progressive-relaxation search and return the ranked matches
+/// for the first query that hits anything.
+///
+/// Shared by BOTH /drive/search and /drive/read. /drive/read needs it
+/// because requiring a file_id there forced a two-call chain (search,
+/// remember a 44-char id, read) that Marin could not hold reliably — on
+/// 2026-08-12 she skipped the search and INVENTED an id
+/// (1xR3oX5Ew6L_...) which 404'd. Letting her pass the spoken name
+/// straight to /drive/read removes the id from her working memory
+/// entirely, so there is nothing left to fabricate.
+async function findDriveFilesBySpokenName(
+  spokenRequest: string,
+  accessToken: string
+): Promise<{ files: DriveFileSummary[]; matchedQuery: string } | null> {
+  const searchTokens = splitSpokenRequestIntoSearchTokens(spokenRequest);
+  const queriesToTry = buildProgressivelyRelaxedDriveQueries(spokenRequest, searchTokens);
+  const requestedFields = "files(id,name,mimeType,webViewLink,modifiedTime,viewedByMeTime)";
+
+  for (const driveQuery of queriesToTry) {
+    const searchURL = new URL("https://www.googleapis.com/drive/v3/files");
+    searchURL.searchParams.set("q", driveQuery);
+    searchURL.searchParams.set("fields", requestedFields);
+    searchURL.searchParams.set("pageSize", "25");
+    searchURL.searchParams.set("supportsAllDrives", "true");
+    searchURL.searchParams.set("includeItemsFromAllDrives", "true");
+    searchURL.searchParams.set("corpora", "allDrives");
+
+    const upstream = await fetch(searchURL.toString(), {
+      headers: { authorization: `Bearer ${accessToken}` },
+    });
+    if (!upstream.ok) {
+      const errorBody = await upstream.text();
+      // A malformed relaxation shouldn't kill the whole lookup — log it
+      // and let the next, simpler pass run.
+      console.error(`[drive] query failed (${upstream.status}) for: ${driveQuery} — ${errorBody}`);
+      continue;
+    }
+    const data = (await upstream.json()) as { files?: DriveFileSummary[] };
+    const foundFiles = data.files ?? [];
+    if (foundFiles.length === 0) continue;
+
+    return {
+      files: rankDriveFilesByRecentInteraction(foundFiles),
+      matchedQuery: driveQuery,
+    };
+  }
+  return null;
+}
+
+/// /drive/search — find a Google Drive file from a SPOKEN, inexact name.
+/// body: { query (required), max_results? }
+/// Returns { status, files: [{ id, name, mime_type, url, kind }], matched_query }
+async function handleDriveSearch(request: Request, env: Env): Promise<Response> {
+  let payload: { query?: string; max_results?: number };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+
+  const spokenRequest = (payload.query ?? "").trim();
+  if (!spokenRequest) return jsonError("query is required", 400);
+  if (!env.DRIVE_REFRESH_TOKEN) {
+    return jsonError("Drive not configured (missing DRIVE_REFRESH_TOKEN secret)", 500);
+  }
+  const maxResults = Math.min(Math.max(payload.max_results ?? 5, 1), 10);
+
+  let accessToken: string;
+  try {
+    accessToken = await getDriveAccessToken(env);
+  } catch (err) {
+    console.error(`[/drive/search] token exchange failed: ${err}`);
+    return jsonError(`Drive auth failed: ${err}`, 500);
+  }
+
+  const searchOutcome = await findDriveFilesBySpokenName(spokenRequest, accessToken);
+  if (!searchOutcome) {
+    return new Response(
+      JSON.stringify({
+        status: "not_found",
+        note: `Nothing in Drive matched "${spokenRequest}".`,
+        files: [],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  return new Response(
+    JSON.stringify({
+      status: "ok",
+      matched_query: searchOutcome.matchedQuery,
+      total_matches: searchOutcome.files.length,
+      files: searchOutcome.files.slice(0, maxResults).map((driveFile) => ({
+        id: driveFile.id,
+        name: driveFile.name,
+        mime_type: driveFile.mimeType,
+        kind: describeDriveMimeType(driveFile.mimeType),
+        url: driveFile.webViewLink,
+      })),
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
+}
+
+/// Plain-English file kind, so Marin can say "a Slides deck" out loud
+/// instead of reading a MIME type.
+function describeDriveMimeType(mimeType: string): string {
+  if (mimeType === "application/vnd.google-apps.document") return "Google Doc";
+  if (mimeType === "application/vnd.google-apps.spreadsheet") return "Google Sheet";
+  if (mimeType === "application/vnd.google-apps.presentation") return "Slides deck";
+  if (mimeType === "application/vnd.google-apps.folder") return "folder";
+  if (mimeType === "application/pdf") return "PDF";
+  return "file";
+}
+
+/// How many characters of exported document text we hand back. Marin is
+/// a realtime voice model — a 300-slide deck would blow her context and
+/// she can't usefully speak it anyway. She gets the top of the document
+/// and is told when it was cut.
+const MAX_DRIVE_TEXT_CHARACTERS = 12000;
+
+/// /drive/read — export a Drive file's text so Marin can answer
+/// questions about it. body: { query? , file_id? } — ONE of the two.
+/// `query` is the spoken name and is the preferred form: it resolves the
+/// file here, in one call, so Marin never has to carry a file id between
+/// turns. `file_id` still works when she genuinely has one already.
+/// Google-native Docs/Slides export as plain text; Sheets as CSV.
+/// Binary formats (PDF, images) are refused — the Worker has no parser,
+/// and pretending otherwise would produce confident nonsense.
+async function handleDriveRead(request: Request, env: Env): Promise<Response> {
+  let payload: { file_id?: string; query?: string };
+  try {
+    payload = (await request.json()) as typeof payload;
+  } catch {
+    return jsonError("Invalid JSON body", 400);
+  }
+
+  let fileId = (payload.file_id ?? "").trim();
+  const spokenRequest = (payload.query ?? "").trim();
+  if (!fileId && !spokenRequest) return jsonError("query or file_id is required", 400);
+  if (!env.DRIVE_REFRESH_TOKEN) {
+    return jsonError("Drive not configured (missing DRIVE_REFRESH_TOKEN secret)", 500);
+  }
+
+  let accessToken: string;
+  try {
+    accessToken = await getDriveAccessToken(env);
+  } catch (err) {
+    console.error(`[/drive/read] token exchange failed: ${err}`);
+    return jsonError(`Drive auth failed: ${err}`, 500);
+  }
+  const authHeaders = { authorization: `Bearer ${accessToken}` };
+
+  // Spoken name → file id, right here. Prefer the search result over any
+  // id we were also handed: a hallucinated id looks syntactically valid
+  // and would otherwise 404 with a confusing "file not found".
+  if (spokenRequest) {
+    const searchOutcome = await findDriveFilesBySpokenName(spokenRequest, accessToken);
+    if (!searchOutcome) {
+      return new Response(
+        JSON.stringify({
+          status: "not_found",
+          note: `Nothing in Drive matched "${spokenRequest}".`,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    }
+    fileId = searchOutcome.files[0].id;
+  }
+
+  const metadataURL = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?fields=id,name,mimeType,webViewLink&supportsAllDrives=true`;
+  const metadataResponse = await fetch(metadataURL, { headers: authHeaders });
+  if (!metadataResponse.ok) {
+    const errorBody = await metadataResponse.text();
+    return sanitizedUpstreamError("/drive/read", metadataResponse.status, errorBody);
+  }
+  const fileMetadata = (await metadataResponse.json()) as {
+    name?: string;
+    mimeType?: string;
+    webViewLink?: string;
+  };
+  const mimeType = fileMetadata.mimeType ?? "";
+
+  const exportFormatByMimeType: Record<string, string> = {
+    "application/vnd.google-apps.document": "text/plain",
+    "application/vnd.google-apps.presentation": "text/plain",
+    "application/vnd.google-apps.spreadsheet": "text/csv",
+  };
+  const exportFormat = exportFormatByMimeType[mimeType];
+  if (!exportFormat) {
+    return new Response(
+      JSON.stringify({
+        status: "unsupported",
+        name: fileMetadata.name,
+        kind: describeDriveMimeType(mimeType),
+        url: fileMetadata.webViewLink,
+        note: `Can't read a ${describeDriveMimeType(mimeType)} as text — open it instead.`,
+      }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  }
+
+  const exportURL = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}/export?mimeType=${encodeURIComponent(exportFormat)}`;
+  const exportResponse = await fetch(exportURL, { headers: authHeaders });
+  if (!exportResponse.ok) {
+    const errorBody = await exportResponse.text();
+    return sanitizedUpstreamError("/drive/read", exportResponse.status, errorBody);
+  }
+  const fullDocumentText = await exportResponse.text();
+  const wasTruncated = fullDocumentText.length > MAX_DRIVE_TEXT_CHARACTERS;
+
+  return new Response(
+    JSON.stringify({
+      status: "ok",
+      name: fileMetadata.name,
+      kind: describeDriveMimeType(mimeType),
+      url: fileMetadata.webViewLink,
+      truncated: wasTruncated,
+      // A CSV export only ever covers the FIRST tab of a spreadsheet.
+      // Say so, so Marin doesn't claim a number is absent when it's
+      // just on another tab — she should use the `sheets` tool there.
+      note: mimeType === "application/vnd.google-apps.spreadsheet"
+        ? "First tab only. Use the sheets tool for a specific tab or range."
+        : wasTruncated
+          ? "Truncated — this is the beginning of the document only."
+          : undefined,
+      text: fullDocumentText.slice(0, MAX_DRIVE_TEXT_CHARACTERS),
+    }),
+    { status: 200, headers: { "content-type": "application/json" } }
+  );
 }
 
 /// v15p3u (2026-05-09): web search via Anthropic's web_search tool. Marin
