@@ -8,6 +8,7 @@
 //
 
 import ServiceManagement
+import SQLite3
 import SwiftUI
 import Sparkle
 
@@ -41,6 +42,11 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         // v16r17 (2026-08-05): single-instance guard. MUST run before
         // anything else starts — see the comment on the method.
         terminateOtherInstances()
+
+        // v16r27 (2026-08-13): purge CFNetwork's per-app Alt-Svc cache
+        // before the voice pipelines open any connections — see the
+        // comment on the method for why.
+        purgeAltServicesCache()
 
         print("🎯 Clicky: Starting...")
         print("🎯 Clicky: Version \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "unknown")")
@@ -140,6 +146,44 @@ final class CompanionAppDelegate: NSObject, NSApplicationDelegate {
         for app in others where !app.isTerminated {
             print("⚠️ Clicky: stale instance (pid \(app.processIdentifier)) ignored quit — forcing")
             app.forceTerminate()
+        }
+    }
+
+    /// v16r27 (2026-08-13): clear CFNetwork's per-app Alt-Svc cache at
+    /// launch.
+    ///
+    /// WHY. Root cause of the 2026-08-12 total outage: the router mangles
+    /// UDP, HTTP/3/QUIC silently dies, but CFNetwork's per-app Alt-Svc
+    /// store (~/Library/HTTPStorages/<bundle-id>/httpstorages.sqlite,
+    /// alt_services table) keeps steering every request onto broken h3 —
+    /// an app-only network death that survives reboot. The store was
+    /// cleared manually on 8/12 and the app RE-LEARNED h3 steering for
+    /// all three critical hosts (worker proxy, generativelanguage,
+    /// ElevenLabs) within a day — observed again 2026-08-13, alongside
+    /// polish timeouts and Gemini socket deaths. Clearing at launch
+    /// bounds the damage to one app session instead of persisting
+    /// indefinitely. Fresh Alt-Svc hints are re-learned per run; if the
+    /// network is healthy, h3 works and nothing is lost — the cache
+    /// only ever saves one upgrade round-trip per host.
+    private func purgeAltServicesCache() {
+        guard let bundleID = Bundle.main.bundleIdentifier else { return }
+        let dbPath = NSString(
+            string: "~/Library/HTTPStorages/\(bundleID)/httpstorages.sqlite"
+        ).expandingTildeInPath
+        guard FileManager.default.fileExists(atPath: dbPath) else { return }
+        var db: OpaquePointer?
+        guard sqlite3_open(dbPath, &db) == SQLITE_OK else {
+            print("⚠️ Clicky: could not open HTTPStorages db to clear Alt-Svc cache")
+            return
+        }
+        defer { sqlite3_close(db) }
+        if sqlite3_exec(db, "DELETE FROM alt_services;", nil, nil, nil) == SQLITE_OK {
+            let cleared = sqlite3_changes(db)
+            if cleared > 0 {
+                print("🌐 Clicky: cleared \(cleared) Alt-Svc entr\(cleared == 1 ? "y" : "ies") (h3 steering) at launch")
+            }
+        } else {
+            print("⚠️ Clicky: Alt-Svc cache clear failed: \(String(cString: sqlite3_errmsg(db)))")
         }
     }
 
