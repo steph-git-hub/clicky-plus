@@ -61,6 +61,12 @@ enum ClickyInteractionMode: String, Codable {
     /// v15p2 (2026-05-02): OpenAI Realtime conversation. One log entry
     /// per turn (user utterance + Marin's response).
     case realtime = "realtime"
+    /// v16r28 (2026-08-13): a dictation that was interrupted before commit
+    /// (mode switch, Marin engage, Escape, provider error). Input-only —
+    /// rawTranscript holds the words, finalOutput is nil, and polishStatus
+    /// carries "interrupted:<reason>" so Steph can recover the text from
+    /// the transcript log and see what killed the session.
+    case vttInterrupted = "vtt_interrupted"
 
     var displayLabel: String {
         switch self {
@@ -72,6 +78,7 @@ enum ClickyInteractionMode: String, Codable {
         case .burst: return "Burst"
         case .captureInbox: return "Capture-to-inbox"
         case .realtime: return "Realtime (Marin)"
+        case .vttInterrupted: return "VTT (interrupted)"
         }
     }
 }
@@ -355,7 +362,7 @@ final class ClickyTranscriptLogger {
         if let status = interaction.polishStatus,
            !status.isEmpty,
            status != "ok" {
-            let icon = status.hasPrefix("failed") ? "⚠️" : "ℹ️"
+            let icon = (status.hasPrefix("failed") || status.hasPrefix("interrupted")) ? "⚠️" : "ℹ️"
             sectionLines.append("\(icon) **Polish status:** `\(status)`")
             sectionLines.append("")
         }
@@ -1344,6 +1351,24 @@ final class CompanionManager: ObservableObject {
         // v16 (2026-06-04): point prewarm at the SELECTED VTT engine so
         // Scribe/Parakeet get warmed (not just the base factory provider).
         buddyDictationManager.activeVTTProviderResolver = { [weak self] in self?.activeVTTProvider }
+        // v16r28 (2026-08-13): interrupted dictations land in the Clicky
+        // transcript log — input-only, reason attached — so an accidental
+        // mode switch, Escape, or provider error never destroys dictated
+        // words. Steph copies the text back out of the transcript note.
+        buddyDictationManager.onDictationInterrupted = { interruptedTranscriptText, interruptionReason in
+            ClickyTranscriptLogger.shared.log(ClickyInteractionLog(
+                id: ClickyTranscriptLogger.newInteractionId(),
+                timestamp: Date(),
+                mode: .vttInterrupted,
+                rawTranscript: interruptedTranscriptText,
+                finalOutput: nil,
+                claudeResponse: nil,
+                polishModifier: nil,
+                appName: NSWorkspace.shared.frontmostApplication?.localizedName,
+                screenshotPaths: [],
+                polishStatus: "interrupted:\(interruptionReason)"
+            ))
+        }
         // v16r20 (2026-08-06): auto-switch engines when the selected one
         // refuses at the account level. Incident 2026-08-06: ElevenLabs
         // returned quota_exceeded on every Scribe session for hours and
@@ -2188,7 +2213,7 @@ final class CompanionManager: ObservableObject {
         case .pressed:
             // v15p2 (2026-05-03): suspend Marin if she's running.
             markOtherModePressed("basePTT")
-            guard ensureDictationReady() else { return }
+            guard ensureDictationReady(interruptedBy: "switched to Base PTT") else { return }
             // Don't register push-to-talk while the onboarding video is playing
             guard !showOnboardingVideo else { return }
 
@@ -2304,7 +2329,7 @@ final class CompanionManager: ObservableObject {
 
         switch transition {
         case .pressed:
-            guard ensureDictationReady() else { return }
+            guard ensureDictationReady(interruptedBy: "switched to burst mode") else { return }
             guard !showOnboardingVideo else { return }
 
             // Bring the overlay forward if it's currently hidden
@@ -2897,7 +2922,7 @@ final class CompanionManager: ObservableObject {
             BuddyDictationManager.appendAudioDiag("TYPING_PRESS")
             // v15p2 (2026-05-03): suspend Marin if she's running.
             markOtherModePressed("typing")
-            guard ensureDictationReady() else {
+            guard ensureDictationReady(interruptedBy: "switched to typing mode") else {
                 BuddyDictationManager.appendAudioDiag("TYPING_BAIL_ensureDictationReady=false")
                 return
             }
@@ -3043,16 +3068,18 @@ final class CompanionManager: ObservableObject {
     // ready (either was never running, or stuck state was recovered).
     // Returns false only if recovery failed (very rare — usually
     // means cancelCurrentDictation itself bailed).
-    private func ensureDictationReady() -> Bool {
+    private func ensureDictationReady(interruptedBy reason: String) -> Bool {
         if buddyDictationManager.isDictationInProgress {
             // v16r24 (2026-08-13): this used to call cancelCurrentDictation
             // directly, which DESTROYED the uncommitted transcript — a
             // double-tap Option (Marin engage) mid-dictation wiped minutes
             // of speech (Option sits next to Control, so it happens by
-            // accident). Stash-and-cancel preserves the words; they're
-            // restored on the next dictation commit.
-            print("🔧 ensureDictationReady: dictation in progress — stashing transcript, then cancelling before engage")
-            buddyDictationManager.stashTranscriptAndCancelCurrentDictation()
+            // accident).
+            // v16r28: per Steph — preserve the transcript to the Clicky
+            // transcript log (input-only, with the interrupting mode as
+            // the reason) instead of the invisible stash-and-restore.
+            print("🔧 ensureDictationReady: dictation in progress — preserving transcript, then cancelling (reason: \(reason))")
+            buddyDictationManager.cancelCurrentDictationPreservingTranscript(reason: reason)
         }
         return !buddyDictationManager.isDictationInProgress
     }
@@ -3074,7 +3101,7 @@ final class CompanionManager: ObservableObject {
             // v15p3s (2026-05-09): generalized into ensureDictationReady()
             // and applied to all 12 mode-engage call sites. Same effect,
             // single source of truth.
-            guard ensureDictationReady() else { return }
+            guard ensureDictationReady(interruptedBy: "switched to VTT (AssemblyAI)") else { return }
             guard !showOnboardingVideo else { return }
 
             // Bring the overlay forward if hidden so the purple
@@ -3207,7 +3234,7 @@ final class CompanionManager: ObservableObject {
             // Parakeet runs get tagged "parakeet" not "deepgram".
             VTTLatencyDiag.markPress(provider: selectedVTTProvider)
             markOtherModePressed("vtt-deepgram")
-            guard ensureDictationReady() else { return }
+            guard ensureDictationReady(interruptedBy: "new VTT engage") else { return }
             guard !showOnboardingVideo else { return }
 
             transientHideTask?.cancel()
@@ -3694,6 +3721,15 @@ final class CompanionManager: ObservableObject {
             currentStreamingState = nil
         }
 
+        // v16r28 (2026-08-13): preserve any in-flight dictation transcript
+        // BEFORE the toggle disengages below tear the session down. Esc
+        // mid-dictation used to lose the words; now they land in the
+        // Clicky transcript log tagged with the reason, and nothing is
+        // pasted (Esc means abort, not commit).
+        if buddyDictationManager.isDictationInProgress {
+            buddyDictationManager.cancelCurrentDictationPreservingTranscript(reason: "Escape pressed")
+        }
+
         // Disengage any locked-on toggle so the user isn't stuck in a
         // hands-free session they wanted to escape from.
         if isVoiceToTextToggleLocked {
@@ -3855,7 +3891,7 @@ final class CompanionManager: ObservableObject {
     private func handleVoiceModeDoubleTapEngage() {
         guard !isVoiceModeToggleLocked else { return }
         // Don't engage if dictation is mid-flight from a different mode.
-        guard ensureDictationReady() else { return }
+        guard ensureDictationReady(interruptedBy: "switched to voice mode") else { return }
         guard !showOnboardingVideo else { return }
         print("🔒 Voice mode toggle: engaging (double-tap Opt) — click-to-capture armed")
 
@@ -3906,7 +3942,7 @@ final class CompanionManager: ObservableObject {
     /// flag. Same hotkey, same hands-free UX, runtime-swappable via
     /// the panel toggle.
     private func handleOptionDoubleTapForRealtimeHandsFree() {
-        guard ensureDictationReady() else { return }
+        guard ensureDictationReady(interruptedBy: "switched to Marin (double-tap Option)") else { return }
         guard !showOnboardingVideo else { return }
         // v15p2 hotfix (2026-05-03): only no-op if BOTH the persisted
         // flag is on AND a session is actually running. Previous logic
@@ -4162,7 +4198,7 @@ final class CompanionManager: ObservableObject {
         _ transition: BuddyPushToTalkShortcut.ShortcutTransition
     ) {
         guard transition == .pressed else { return }
-        guard ensureDictationReady() else { return }
+        guard ensureDictationReady(interruptedBy: "switched to voice mode (Fn+Shift+Opt)") else { return }
         guard !showOnboardingVideo else { return }
         if isVoiceModeToggleLocked {
             print("🔒 Base voice-mode toggle: disengaging (Fn+Shift+Opt)")
@@ -4245,7 +4281,7 @@ final class CompanionManager: ObservableObject {
         case .pressed:
             // v15p2 (2026-05-03): suspend Marin if she's running.
             markOtherModePressed("captureToInbox")
-            guard ensureDictationReady() else { return }
+            guard ensureDictationReady(interruptedBy: "switched to capture-to-inbox") else { return }
             guard !showOnboardingVideo else { return }
 
             // Bring the overlay forward so the yellow waveform gives
@@ -4338,7 +4374,7 @@ final class CompanionManager: ObservableObject {
     private func handleRealtimeTransition(_ transition: BuddyPushToTalkShortcut.ShortcutTransition) {
         switch transition {
         case .pressed:
-            guard ensureDictationReady() else { return }
+            guard ensureDictationReady(interruptedBy: "switched to Marin PTT") else { return }
             guard !showOnboardingVideo else { return }
 
             // Cancel any in-flight Claude/TTS so Realtime doesn't fight
@@ -4680,7 +4716,7 @@ final class CompanionManager: ObservableObject {
         _ transition: BuddyPushToTalkShortcut.ShortcutTransition
     ) {
         guard transition == .pressed else { return }
-        guard ensureDictationReady() else { return }
+        guard ensureDictationReady(interruptedBy: "toggled Marin hands-free") else { return }
         guard !showOnboardingVideo else { return }
 
         // Flip the persisted flag.
@@ -4747,7 +4783,7 @@ final class CompanionManager: ObservableObject {
             markOtherModePressed("polish")
             // Don't fire if any other capture is in progress — polish is a
             // pure write path and shouldn't overlap with active dictation.
-            guard ensureDictationReady() else { return }
+            guard ensureDictationReady(interruptedBy: "switched to polish") else { return }
             guard !showOnboardingVideo else { return }
             // Don't double-fire if a polish call is already in flight.
             guard pendingPolishCommandTask == nil else { return }
@@ -4844,7 +4880,7 @@ final class CompanionManager: ObservableObject {
     /// the structure of handleVoiceToTextTransition's pressed branch but
     /// scoped to polish modifier capture.
     private func engagePolishHotkeyDictationForSpokenModifier() {
-        guard ensureDictationReady() else { return }
+        guard ensureDictationReady(interruptedBy: "switched to polish modifier capture") else { return }
         guard !showOnboardingVideo else { return }
 
         isPolishHotkeyDictatingForModifier = true

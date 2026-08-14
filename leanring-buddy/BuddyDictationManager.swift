@@ -720,18 +720,15 @@ final class BuddyDictationManager: NSObject, ObservableObject {
     private var draftCallbacks: BuddyDictationDraftCallbacks?
     private var draftTextBeforeCurrentDictation = ""
     private var latestRecognizedText = ""
-    /// v16r24 (2026-08-13): transcript stashed when a mode engage force-
-    /// cancelled an in-progress dictation (e.g. double-tap Option engaging
-    /// Marin mid-dictation — Option sits next to Control, so an accidental
-    /// tap destroyed minutes of uncommitted speech). The stash is restored
-    /// by prepending it to the next keyboard-shortcut dictation's committed
-    /// transcript, so no mode switch can destroy uncommitted words.
-    private var stashedTranscriptFromInterruptedDictation: String?
-    private var stashedTranscriptFromInterruptedDictationStashedAt: Date?
-    /// How long a stashed transcript stays restorable. After this window the
-    /// user has almost certainly moved on, and silently prepending old words
-    /// to an unrelated dictation would be its own kind of data corruption.
-    private static let stashedTranscriptRestoreWindowSeconds: TimeInterval = 10 * 60
+    /// v16r28 (2026-08-13): called when a live dictation is interrupted
+    /// (mode switch, Marin engage, Escape, provider error, superseded)
+    /// with a non-empty uncommitted transcript. CompanionManager wires
+    /// this to the Clicky transcript log so the words land there —
+    /// input-only, with the interruption reason — instead of being
+    /// destroyed. Replaces v16r24's invisible stash-and-restore per
+    /// Steph's feedback: he'd rather copy the text from the transcript
+    /// log than have it silently prepended to a later dictation.
+    var onDictationInterrupted: ((_ interruptedTranscriptText: String, _ interruptionReason: String) -> Void)?
     private var shouldAutomaticallySubmitFinalDraft = false
     private var hasFinishedCurrentDictationSession = false
     private var finalizeFallbackWorkItem: DispatchWorkItem?
@@ -917,38 +914,21 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         prewarmTranscriptionProvider()
     }
 
-    /// v16r24 (2026-08-13): cancel like `cancelCurrentDictation`, but first
-    /// stash whatever has been recognized so far so the words survive the
-    /// mode switch. Called by CompanionManager's ensureDictationReady() —
-    /// i.e. every mode-engage path that force-cancels a live dictation.
-    func stashTranscriptAndCancelCurrentDictation() {
+    /// v16r28 (2026-08-13): cancel like `cancelCurrentDictation`, but first
+    /// hand the uncommitted transcript to `onDictationInterrupted` so it
+    /// gets preserved in the Clicky transcript log with the interruption
+    /// reason. Called from every path that force-cancels a live dictation:
+    /// mode engages (via ensureDictationReady), Escape, provider errors,
+    /// and rapid re-engage supersession.
+    func cancelCurrentDictationPreservingTranscript(reason: String) {
         let interruptedTranscriptText = latestRecognizedText
             .trimmingCharacters(in: .whitespacesAndNewlines)
         if isDictationInProgress && !interruptedTranscriptText.isEmpty {
-            stashedTranscriptFromInterruptedDictation = interruptedTranscriptText
-            stashedTranscriptFromInterruptedDictationStashedAt = Date()
-            print("🎙️ Stashed \(interruptedTranscriptText.count) chars of uncommitted transcript — will restore on next dictation commit")
-            Self.appendAudioDiag("STASHED_TRANSCRIPT chars=\(interruptedTranscriptText.count)")
+            print("🛟 Dictation interrupted (\(reason)) — preserving \(interruptedTranscriptText.count) chars to the transcript log")
+            Self.appendAudioDiag("DICTATION_INTERRUPTED reason=\(reason) chars=\(interruptedTranscriptText.count)")
+            onDictationInterrupted?(interruptedTranscriptText, reason)
         }
         cancelCurrentDictation(preserveDraftText: false)
-    }
-
-    /// Returns the stashed transcript if one exists and is still inside the
-    /// restore window, clearing it either way. Returns nil when there is
-    /// nothing to restore.
-    private func consumeStashedTranscriptIfFresh() -> String? {
-        guard let stashedTranscript = stashedTranscriptFromInterruptedDictation,
-              let stashedAt = stashedTranscriptFromInterruptedDictationStashedAt else {
-            return nil
-        }
-        stashedTranscriptFromInterruptedDictation = nil
-        stashedTranscriptFromInterruptedDictationStashedAt = nil
-        guard Date().timeIntervalSince(stashedAt) < Self.stashedTranscriptRestoreWindowSeconds else {
-            print("🎙️ Stashed transcript expired (\(Int(Date().timeIntervalSince(stashedAt)))s old) — dropping")
-            Self.appendAudioDiag("STASHED_TRANSCRIPT_EXPIRED ageSeconds=\(Int(Date().timeIntervalSince(stashedAt)))")
-            return nil
-        }
-        return stashedTranscript
     }
 
     /// v15p3bk (2026-05-12): kick off a background pre-warm of the
@@ -1117,11 +1097,10 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         if isFinalizingTranscript {
             print("🎙️ BuddyDictationManager: previous session still finalizing — force-resetting to allow new session")
             Self.appendAudioDiag("FORCE_RESET_FROM_FINALIZE startSource=\(startSource)")
-            // v16r24 (2026-08-13): stash instead of plain cancel — the
-            // finalizing session's text was about to be submitted, and a
-            // rapid re-engage shouldn't destroy it. The new session picks
-            // the stash up at its own commit.
-            stashTranscriptAndCancelCurrentDictation()
+            // v16r28 (2026-08-13): the finalizing session's text was about
+            // to be submitted — a rapid re-engage shouldn't destroy it.
+            // Preserve it to the transcript log before force-resetting.
+            cancelCurrentDictationPreservingTranscript(reason: "superseded by a new dictation engage")
         }
 
         guard !isDictationInProgress else { return }
@@ -1577,7 +1556,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             print("❌ \(fatal.providerFatalLabel) refused the session: \(fatal.providerFatalReason)")
             lastErrorMessage = "\(fatal.providerFatalLabel): \(fatal.providerFatalReason)"
             onProviderFatalError?(fatal.providerFatalLabel, fatal.providerFatalReason)
-            cancelCurrentDictation(preserveDraftText: false)
+            // v16r28: preserve whatever was recognized before the refusal.
+            cancelCurrentDictationPreservingTranscript(reason: "transcription provider refused (\(fatal.providerFatalLabel))")
             return
         }
 
@@ -1591,7 +1571,8 @@ final class BuddyDictationManager: NSObject, ObservableObject {
                 from: error,
                 fallback: "couldn't transcribe that. try again."
             )
-            cancelCurrentDictation(preserveDraftText: false)
+            // v16r28: preserve any partial transcript the error stranded.
+            cancelCurrentDictationPreservingTranscript(reason: "transcription error")
         }
     }
 
@@ -1628,27 +1609,7 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         prewarmTranscriptionProvider()
 
         guard shouldSubmitFinalDraft else { return }
-
-        // v16r24 (2026-08-13): restore a transcript stashed when a mode
-        // switch force-cancelled a live dictation. Consumed only on a
-        // submitting keyboard-shortcut session — the microphone-button
-        // path edits a visible panel draft, where an invisible prepend
-        // would surprise. Consumed here (not at session start) so the
-        // stash survives sessions that never reach a submit.
-        let restoredStashedTranscript: String? = startSourceForLogging == .keyboardShortcut
-            ? consumeStashedTranscriptIfFresh()
-            : nil
-
         guard !finalTranscriptText.isEmpty else {
-            if let restoredStashedTranscript {
-                // The new session heard nothing, but a stashed transcript
-                // is waiting — submit it alone, so a bare engage-and-release
-                // recovers the interrupted words.
-                print("🎙️ Empty transcript, but restoring \(restoredStashedTranscript.count) stashed chars from interrupted dictation")
-                Self.appendAudioDiag("RESTORED_STASHED_TRANSCRIPT_ALONE chars=\(restoredStashedTranscript.count)")
-                currentDraftCallbacks?.submitDraftText(restoredStashedTranscript)
-                return
-            }
             // v15p3 (2026-05-06): surface "no output" to the diagnostic log
             // so we can correlate with audio failures, network blips, or
             // user-spoke-too-softly cases. Used to be silent — user saw
@@ -1657,13 +1618,6 @@ final class BuddyDictationManager: NSObject, ObservableObject {
             // arrived; mic captured silence; first-buffer audio race.
             print("⚠️ BuddyDictationManager: empty final transcript — nothing to paste (startSource=\(String(describing: startSourceForLogging)))")
             Self.appendAudioDiag("EMPTY_TRANSCRIPT_ON_FINALIZE startSource=\(String(describing: startSourceForLogging))")
-            return
-        }
-
-        if let restoredStashedTranscript {
-            print("🎙️ Restoring \(restoredStashedTranscript.count) stashed chars ahead of this dictation's transcript")
-            Self.appendAudioDiag("RESTORED_STASHED_TRANSCRIPT chars=\(restoredStashedTranscript.count)")
-            currentDraftCallbacks?.submitDraftText(restoredStashedTranscript + " " + finalDraftText)
             return
         }
 
