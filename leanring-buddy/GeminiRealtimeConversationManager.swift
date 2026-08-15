@@ -487,8 +487,26 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             "parameters": ["type": "OBJECT", "properties": [String: Any](), "required": [String]()],
         ],
         [
+            "name": "list_cowork_sessions",
+            "description": "Steph's actual Cowork session list (the sidebar), newest first — titles plus when each started and was last active. THIS IS THE RIGHT TOOL for 'which session did I work on X in', 'what was that session called', 'what have I been working on today'. Prefer it over search_obsidian for ANY session-name lookup, and ALWAYS use it for recent sessions: session summaries are only written to the vault by a 6pm nightly sweep, so today's sessions do not exist in Obsidian yet but DO appear here. Dates come back already in Steph's local timezone — read them back as given, never convert or caveat them. If this returns nothing useful, fall back to search_obsidian for older archived sessions.",
+            "parameters": [
+                "type": "OBJECT",
+                "properties": [
+                    "query": [
+                        "type": "STRING",
+                        "description": "Optional keyword to filter session TITLES (titles are short labels like 'Dog ball sourcing side hustle'). Prefer one or two distinctive nouns. Omit entirely to just list the most recent sessions.",
+                    ],
+                    "limit": [
+                        "type": "INTEGER",
+                        "description": "How many sessions to return. Default 10, max 50. Keep it small for spoken answers.",
+                    ],
+                ],
+                "required": [String](),
+            ],
+        ],
+        [
             "name": "search_obsidian",
-            "description": "Ranked keyword search across Steph's Obsidian vault — matches individual terms (not just exact phrases) and ranks title hits highest. Use when he asks if he wrote anything about X, where his notes on Y are, OR which past Cowork session he worked on something in. Past Cowork sessions are archived under 'Chat Summaries/' as 'YYYY-MM-DD - Cowork - <topic>', so a topic search finds the session — read back the note title + date as the session name. NEVER use search_meetings to find a Cowork session; that tool is Fireflies MEETINGS, not Cowork work sessions.",
+            "description": "Ranked keyword search across Steph's Obsidian vault — matches individual terms (not just exact phrases) and ranks title hits highest. Use when he asks if he wrote anything about X, where his notes on Y are, or for DETAIL about what happened in a past session. To find a session by NAME or date, use list_cowork_sessions FIRST — it's the live sidebar list; this vault archive only covers sessions the 6pm nightly sweep has already written up, so it can't see today's. NEVER use search_meetings to find a Cowork session; that tool is Fireflies MEETINGS, not Cowork work sessions.",
             "parameters": [
                 "type": "OBJECT",
                 "properties": [
@@ -1432,6 +1450,15 @@ final class GeminiRealtimeConversationManager: NSObject, ObservableObject {
             return await MainActor.run { MarinResearchTools.listSkills() }
         case "list_plugins":
             return await MainActor.run { MarinResearchTools.listPlugins() }
+        case "list_cowork_sessions":
+            let query = (args["query"] as? String) ?? ""
+            // v16r29: reads only file heads (see listCoworkSessions), but it
+            // still touches the filesystem — same timeout guard as the other
+            // research tools so a slow disk can never strand the turn.
+            let limit = (args["limit"] as? Int) ?? (args["limit"] as? NSNumber)?.intValue ?? 10
+            return await Self.runResearchToolWithTimeout(name: "list_cowork_sessions", timeoutSeconds: 10) {
+                MarinResearchTools.listCoworkSessions(query: query, limit: limit)
+            }
         case "search_obsidian":
             let query = (args["query"] as? String) ?? ""
             // v16qv: run off the main thread — this scans/reads the whole Obsidian

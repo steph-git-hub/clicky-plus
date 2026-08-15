@@ -39,6 +39,15 @@ enum MarinResearchTools {
         NSString("~/clicky-plus").expandingTildeInPath
     }
 
+    /// v16r29 (2026-08-15): root of Cowork's local session store. Layout is
+    /// `local-agent-mode-sessions/<orgUuid>/<accountUuid>/local_*.json`, so
+    /// we glob the two UUID levels rather than hardcoding them — they change
+    /// if Steph's org/account changes and a hardcoded path would silently
+    /// return "no sessions" forever.
+    nonisolated private static var coworkSessionsRootDir: String {
+        NSString("~/Library/Application Support/Claude/local-agent-mode-sessions").expandingTildeInPath
+    }
+
     private static var clickyRoadmapPath: String {
         // v16 (2026-06-04): live roadmap moved to vault root "Clicky+ Roadmap.md"
         // (the old Projects/"Clicky Plus - Roadmap.md" was archived). The new doc
@@ -425,6 +434,200 @@ enum MarinResearchTools {
             searchResult["note"] = "\(evictedFilesSkipped) vault file(s) are offloaded to iCloud and were not searched. If the expected note is missing, mention this coverage gap to Steph."
         }
         return searchResult
+    }
+
+    // MARK: - 4b. list_cowork_sessions (v16r29, 2026-08-15)
+    //
+    // Marin's live index of Steph's Cowork sessions. Complements
+    // search_obsidian: the `Chat Summaries/` archive only gets written by
+    // the 6pm nightly sweep, so a session from TODAY is invisible to a
+    // vault search — which is exactly the miss Steph hit on 2026-08-15
+    // ("find the dog ball session" → "no session summary found", correct
+    // but useless). This reads the session store directly, so today's
+    // work is findable immediately.
+    //
+    // PERFORMANCE — the reason this reads file heads, not whole files:
+    // measured 2026-08-15, the store holds 1,416 session JSONs totalling
+    // 0.86 GB (median 0.49 MB, largest 1.5 MB). Parsing them all would
+    // repeat the search_obsidian failure that made Marin go silent. But
+    // `title`, `createdAt`, `lastActivityAt` and `isArchived` all sit in
+    // the first ~1.5 KB of every file (verified across samples), so we
+    // sort by mtime (no read at all) and parse an 8 KB head of only the
+    // most recent N. That measured at 9ms for 40 files.
+    //
+    // TIMEZONE — deliberately NOT ISO8601DateFormatter. That defaults to
+    // GMT, which is why this codebase's own diag logs read "17:50:38Z"
+    // for a 10:50am Pacific event. Speaking a UTC timestamp would put
+    // any evening session on the WRONG DAY (a 4:17pm Friday session is
+    // 23:17 Friday UTC — and anything after 5pm rolls to tomorrow).
+    // Timestamps are stored as timezone-neutral epoch milliseconds, so
+    // we format them in the Mac's local zone and hand Marin a plain
+    // local date. No correction note needed — it's just correct.
+
+    /// Formats an epoch-milliseconds timestamp in the Mac's LOCAL timezone
+    /// (Pacific for Steph), plus a spoken-friendly relative label.
+    nonisolated private static func localSessionDateLabels(
+        epochMilliseconds: Double
+    ) -> (absolute: String, relative: String) {
+        let date = Date(timeIntervalSince1970: epochMilliseconds / 1000)
+        var calendar = Calendar.current
+        calendar.timeZone = TimeZone.current
+
+        let formatter = DateFormatter()
+        formatter.timeZone = TimeZone.current
+        formatter.locale = Locale(identifier: "en_US")
+        formatter.dateFormat = "EEEE, MMMM d 'at' h:mm a"
+        let absolute = formatter.string(from: date)
+
+        let dayDifference = calendar.dateComponents(
+            [.day],
+            from: calendar.startOfDay(for: date),
+            to: calendar.startOfDay(for: Date())
+        ).day ?? 0
+        let relative: String
+        switch dayDifference {
+        case ..<0: relative = "in the future (clock skew?)"
+        case 0: relative = "today"
+        case 1: relative = "yesterday"
+        case 2...6: relative = "\(dayDifference) days ago"
+        case 7...13: relative = "last week"
+        default: relative = "\(dayDifference) days ago"
+        }
+        return (absolute, relative)
+    }
+
+    /// Pulls a JSON string value out of a partial (head-only) JSON blob.
+    /// We can't use JSONSerialization here — the head is deliberately a
+    /// truncated, invalid document.
+    nonisolated private static func extractJSONStringValue(
+        forKey key: String,
+        from headText: String
+    ) -> String? {
+        guard let keyRange = headText.range(of: "\"\(key)\":") else { return nil }
+        let afterKey = headText[keyRange.upperBound...]
+        guard let openingQuote = afterKey.firstIndex(of: "\"") else { return nil }
+        var value = ""
+        var index = afterKey.index(after: openingQuote)
+        while index < afterKey.endIndex {
+            let character = afterKey[index]
+            if character == "\\" {
+                // Keep escaped characters (e.g. \" or \\) verbatim-ish so a
+                // quote inside a title doesn't truncate the value early.
+                let next = afterKey.index(after: index)
+                if next < afterKey.endIndex {
+                    value.append(afterKey[next])
+                    index = afterKey.index(after: next)
+                    continue
+                }
+            }
+            if character == "\"" { return value }
+            value.append(character)
+            index = afterKey.index(after: index)
+        }
+        return nil
+    }
+
+    /// Pulls a JSON numeric value out of a partial JSON blob.
+    nonisolated private static func extractJSONNumberValue(
+        forKey key: String,
+        from headText: String
+    ) -> Double? {
+        guard let keyRange = headText.range(of: "\"\(key)\":") else { return nil }
+        let afterKey = headText[keyRange.upperBound...]
+        let digits = afterKey.prefix(while: { $0.isNumber || $0 == "." || $0 == " " })
+        return Double(digits.trimmingCharacters(in: .whitespaces))
+    }
+
+    /// Lists Steph's recent Cowork sessions, newest first, optionally
+    /// filtered by a title keyword.
+    nonisolated static func listCoworkSessions(query: String, limit: Int) -> [String: Any] {
+        let fileManager = FileManager.default
+        guard fileManager.fileExists(atPath: coworkSessionsRootDir) else {
+            return ["status": "error", "reason": "Cowork session store not found at \(coworkSessionsRootDir)"]
+        }
+
+        // Find every session JSON two levels down (<org>/<account>/local_*.json).
+        var sessionFilePaths: [String] = []
+        let orgDirectories = (try? fileManager.contentsOfDirectory(atPath: coworkSessionsRootDir)) ?? []
+        for orgDirectory in orgDirectories {
+            let orgPath = (coworkSessionsRootDir as NSString).appendingPathComponent(orgDirectory)
+            let accountDirectories = (try? fileManager.contentsOfDirectory(atPath: orgPath)) ?? []
+            for accountDirectory in accountDirectories {
+                let accountPath = (orgPath as NSString).appendingPathComponent(accountDirectory)
+                let entries = (try? fileManager.contentsOfDirectory(atPath: accountPath)) ?? []
+                for entry in entries where entry.hasPrefix("local_") && entry.hasSuffix(".json") {
+                    sessionFilePaths.append((accountPath as NSString).appendingPathComponent(entry))
+                }
+            }
+        }
+        guard !sessionFilePaths.isEmpty else {
+            return ["status": "error", "reason": "No Cowork session files found under \(coworkSessionsRootDir)"]
+        }
+
+        // Sort by modification time — newest first. This is the whole reason
+        // the tool is fast: no file contents are read to establish order.
+        let pathsWithModificationDates: [(path: String, modifiedAt: Date)] = sessionFilePaths.map { path in
+            let attributes = try? fileManager.attributesOfItem(atPath: path)
+            let modifiedAt = (attributes?[.modificationDate] as? Date) ?? Date.distantPast
+            return (path, modifiedAt)
+        }.sorted { $0.modifiedAt > $1.modifiedAt }
+
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let isFiltering = !trimmedQuery.isEmpty
+        let queryTerms = Set(
+            trimmedQuery
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { $0.count >= 2 }
+        )
+        let requestedLimit = min(max(limit, 1), 50)
+        // When filtering we scan deeper (titles are cheap) but still bounded.
+        let maximumFilesToInspect = isFiltering ? 400 : requestedLimit * 2
+
+        var sessions: [[String: Any]] = []
+        for (path, _) in pathsWithModificationDates.prefix(maximumFilesToInspect) {
+            guard let fileHandle = FileHandle(forReadingAtPath: path) else { continue }
+            defer { try? fileHandle.close() }
+            guard let headData = try? fileHandle.read(upToCount: 8192),
+                  let headText = String(data: headData, encoding: .utf8) else { continue }
+
+            guard let title = extractJSONStringValue(forKey: "title", from: headText),
+                  !title.isEmpty else { continue }
+            // Skip archived sessions — they're hidden in Steph's sidebar, so
+            // naming one would send him looking for something he can't see.
+            if headText.contains("\"isArchived\":true") { continue }
+
+            if isFiltering {
+                let titleLower = title.lowercased()
+                let matchesPhrase = titleLower.contains(trimmedQuery)
+                let matchesAllTerms = !queryTerms.isEmpty && queryTerms.allSatisfy { titleLower.contains($0) }
+                guard matchesPhrase || matchesAllTerms else { continue }
+            }
+
+            var session: [String: Any] = ["title": title]
+            if let createdAtMilliseconds = extractJSONNumberValue(forKey: "createdAt", from: headText) {
+                let labels = localSessionDateLabels(epochMilliseconds: createdAtMilliseconds)
+                session["started"] = labels.absolute
+                session["started_relative"] = labels.relative
+            }
+            if let lastActivityMilliseconds = extractJSONNumberValue(forKey: "lastActivityAt", from: headText) {
+                let labels = localSessionDateLabels(epochMilliseconds: lastActivityMilliseconds)
+                session["last_active"] = labels.absolute
+                session["last_active_relative"] = labels.relative
+            }
+            sessions.append(session)
+            if sessions.count >= requestedLimit { break }
+        }
+
+        var result: [String: Any] = [
+            "sessions": sessions,
+            "count": sessions.count,
+            "timezone": TimeZone.current.identifier,
+            "note": "Dates are already in Steph's local timezone — read them out as-is, no conversion.",
+        ]
+        if isFiltering && sessions.isEmpty {
+            result["note"] = "No session title matched '\(query)'. Titles are short labels, so try fewer/simpler words, or use search_obsidian for sessions older than a few days. Say out loud that nothing matched — never go silent."
+        }
+        return result
     }
 
     // MARK: - 5. read_obsidian_note
