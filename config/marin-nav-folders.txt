@@ -1,0 +1,28 @@
+# Marin Nav — bookmark folder ALLOWLIST.
+#
+# Bookmarks are NOT a link source (441 total, ~30 actually live). They are a
+# CATEGORY layer: a bookmark only surfaces if Chrome history confirms you are
+# still using it. Intersect, never union.
+#
+# Format:  <folder path> | <category tag spoken aloud>
+# Trailing /** includes subfolders. Paths are Chrome bookmark tree paths.
+# Locked by Steph 2026-08-23.
+
+/Bookmarks Bar/FP&A/** | revenue models
+/Bookmarks Bar/CC/** | dashboards
+/Bookmarks Bar/Amazon/AMZN SC | amazon tools
+/Bookmarks Bar/Pay/Benefits | benefits
+/Bookmarks Bar/GM/P&L | p and l
+
+# === HARD EXCLUSIONS — take precedence over any allow above ===
+!/Bookmarks Bar/OLD/**
+!/Bookmarks Bar/Amazon/GM | Amazon/**
+!/Bookmarks Bar/Amazon/INH | Amazon/**
+
+# Notes:
+# - Amazon/GM|Amazon and Amazon/INH|Amazon dropped by Steph 8/23 (113 links, 7 live).
+# - /OLD/** is ~150 links, 4 live — dead wholesale accounts (Urban Outfitters,
+#   Barnes & Noble, IPSY). Excluded permanently, not merely unlisted, so a future
+#   reorganisation cannot drag it back in.
+# - Pay/Benefits: URLs are query-stripped before writing, so the Guideline 401k
+#   access token never lands in the vault. See marin-nav-deny.txt.

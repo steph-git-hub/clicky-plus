@@ -1,0 +1,56 @@
+# Marin Nav deny-list — one Python regex per line, matched against the URL
+# (case-insensitive). Anything matching never reaches Marin Nav.md.
+# Blank lines and #-comments ignored. Add a line to kill a destination.
+# Seeded 2026-08-23 from a real 60-day history run — every pattern below
+# corresponds to something that actually ranked top-30.
+
+# --- Always-open surfaces. Ranked #1 but you'd never say "open my inbox" ---
+^https://mail\.google\.com/
+^https://calendar\.google\.com/
+
+# --- Auth / MFA / account-settings friction, not destinations ---
+sellercentral\.amazon\.com/ap/mfa
+sellercentral\.amazon\.com/sw/AccountInfo
+/(signin|login|logout|oauth|sso)(/|\?|$)
+accounts\.google\.com
+
+# --- Search-result pages ---
+google\.com/search
+^https://www\.amazon\.com/s(\?|$)
+sellercentral\.amazon\.com/search
+
+# --- CREDENTIALS IN URLs — hard block, never write these anywhere ---
+[?&](token|access_token|key|api_key|secret|session|sid|auth)=
+
+# --- Personal / side-project leaking into the work profile (dog-ball sourcing) ---
+alibaba\.com
+made-in-china\.com
+
+# --- Ephemeral LLM chat threads: dead within a week ---
+^https://grok\.com/c/
+^https://claude\.ai/chat/
+^https://claude\.ai/new
+^https://chatgpt\.com/c/
+
+# --- Sensitive by name (the raise/title-change doc) ---
+docs\.google\.com/document/d/1ArPLX89x_Z3wUzOexX3CR9LTOetkfILyXDVnyP9DLSk
+
+# --- Redirectors, dialogs and bare homepages (found in the 8/23 first run) ---
+^https://www\.google\.com/url
+docs\.google\.com/drivesharing
+docs\.google\.com/(picker|sharing)
+^https://www\.amazon\.com/?$
+^https://(www\.)?google\.com/?$
+
+# --- Health / medical — never surface, never read aloud ---
+doxy\.me
+zocdoc\.com
+mychart
+/patient(portal)?/
+
+# --- Local dev ---
+^https?://(localhost|127\.0\.0\.1)
+
+# === TITLE DENY === matched against page TITLE instead of URL.
+title:Raise/Title Change Request
+title:^Untitled
