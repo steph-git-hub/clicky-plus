@@ -3,7 +3,11 @@
 # the LIVE Surge deployments — no manual list to maintain. Pulls `surge list`,
 # strips ANSI, filters out non-dashboard noise (mocks/dev/versioned/dated/
 # diagnostics/proposals), and writes a clean markdown file Marin reads at runtime.
-# Runs from the surge-deploy skill (post-deploy) + a periodic scheduled task.
+# Invoked BY gen-marin-nav.sh, which is what the surge-deploy skill (Step 6) and
+# the daily-routine `refresh-marin-nav` item call. Do not wire callers directly to
+# this script — it only builds the dashboards tier, not the full nav file.
+# (Corrected 2026-08-23: the previous comment claimed surge-deploy called this
+# post-deploy. It never did — no such step existed in the skill until 8/23.)
 export PATH="$HOME/.npm-global/bin:$PATH"
 OUT="$HOME/Desktop/Claude Cowork/Obsidian/Steph Vault/Claude Memory/Marin Dashboards.md"
 # Fallback to a stable local path if the vault path isn't present.
