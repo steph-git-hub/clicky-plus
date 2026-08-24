@@ -18,6 +18,7 @@ NAV="$MEMDIR/Marin Nav.md"
 DASH="$MEMDIR/Marin Dashboards.md"
 HOT="$MEMDIR/Marin Hot Links.md"
 PINS="$HOME/clicky-plus/config/marin-nav-pins.yaml"
+ALIASES="$HOME/clicky-plus/config/marin-nav-aliases.yaml"
 # NOTE: "Marin Agenda Links.md" is DEPRECATED as of 2026-08-23 — no longer read.
 # Left on disk deliberately as a rollback. Do not delete.
 
@@ -27,6 +28,11 @@ PINS="$HOME/clicky-plus/config/marin-nav-pins.yaml"
 # Refresh the hot tier from browser history.
 if [ -f "$HOME/clicky-plus/scripts/harvest_nav.py" ]; then
   python3 "$HOME/clicky-plus/scripts/harvest_nav.py" || echo "WARN: harvester failed; reusing previous hot links" >&2
+fi
+
+# Learn aliases from any request that took more than one try (autonomous).
+if [ -f "$HOME/clicky-plus/scripts/learn_nav.py" ]; then
+  python3 "$HOME/clicky-plus/scripts/learn_nav.py" || echo "WARN: learner failed; reusing previous aliases" >&2
 fi
 
 # Hard gate: pins are the floor. If we can't read them, don't touch the nav file.
@@ -84,6 +90,32 @@ PY
   echo "## Dashboards (from Surge)"
   if [ -f "$DASH" ]; then
     grep -E '^\- ' "$DASH" 2>/dev/null
+  fi
+
+  # Learned aliases — phrases Steph actually used that MISSED on the first try.
+  # Written autonomously by learn_nav.py. Match these before giving up.
+  if [ -f "$ALIASES" ]; then
+    echo ""
+    echo "## Also called (learned from missed requests)"
+    echo "_If what he said matches a phrase here, open that URL. These are his own"
+    echo "words from times the first attempt went somewhere wrong._"
+    python3 - "$ALIASES" <<'PY'
+import re, sys
+url = name = None
+phrases = []
+def flush():
+    if url and phrases:
+        print(f'- {name or url} → {url}  — also called: ' + ", ".join(f'"{p}"' for p in phrases))
+for line in open(sys.argv[1], encoding="utf-8"):
+    m = re.match(r'\s*- url:\s*"(.*)"', line)
+    if m:
+        flush(); url, name, phrases = m.group(1), None, []; continue
+    m = re.match(r'\s*name:\s*"(.*)"', line)
+    if m: name = m.group(1); continue
+    m = re.match(r'\s*- phrase:\s*"(.*)"', line)
+    if m: phrases.append(m.group(1))
+flush()
+PY
   fi
 } > "$TMP"
 

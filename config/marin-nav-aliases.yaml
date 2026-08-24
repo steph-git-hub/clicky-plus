@@ -1,0 +1,17 @@
+# Marin Nav — LEARNED ALIASES. Written automatically by learn_nav.py.
+# Do not hand-edit: this file is regenerated and your edits will be lost.
+# Steph's hand-owned favorites live in marin-nav-pins.yaml, which this
+# script never opens. Aliases are additive only — nothing is ever removed
+# from the nav list by anything in here.
+#
+# Each phrase is something Steph actually said that did NOT reach the
+# destination on the first try. Unused for 90 days -> dropped.
+aliases:
+  - url: "https://docs.google.com/spreadsheets/d/1pDm6W219FtM0mulHD2WaPxh2lrvaC6D7ZTyrnojqD2M/edit"
+    name: "Amazon Omni Pull - Google Sheets"
+    phrases:
+      - phrase: "amazon omni data sheet"  # last:2026-08-23 hits:2
+  - url: "https://kombo-planogram.surge.sh/"
+    name: "Virtual Planogram Builder — Prototype"
+    phrases:
+      - phrase: "planogram retail"  # last:2026-08-24 hits:2

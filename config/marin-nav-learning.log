@@ -1,0 +1,8 @@
+[2026-08-18 11:25] CONVERGED  dwell=2976s (runner 24s) -> GM | Ulta Revenue Model - Google Sheets  +0 alias(es): 
+[2026-08-23 17:34] CONVERGED  dwell=1007s (runner 31s) -> Amazon  +0 alias(es): 
+[2026-08-23 17:52] MANUAL_FIX  dwell=81s (runner 9s) -> Amazon Omni Pull - Google Sheets  +1 alias(es): "amazon omni data sheet"
+[2026-08-24 10:30] CONVERGED  dwell=407s (runner 14s) -> Virtual Planogram Builder — Prototype  +1 alias(es): "planogram retail"
+[2026-08-18 11:25] CONVERGED  dwell=2976s (runner 24s) -> GM | Ulta Revenue Model - Google Sheets  +0 alias(es): 
+[2026-08-23 17:34] CONVERGED  dwell=1007s (runner 31s) -> Amazon  +0 alias(es): 
+[2026-08-23 17:52] MANUAL_FIX  dwell=81s (runner 9s) -> Amazon Omni Pull - Google Sheets  +0 alias(es): 
+[2026-08-24 10:30] CONVERGED  dwell=407s (runner 14s) -> Virtual Planogram Builder — Prototype  +0 alias(es): 
