@@ -5556,7 +5556,31 @@ final class CompanionManager: ObservableObject {
         }
         request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
 
-        let (responseData, response) = try await URLSession.shared.data(for: request)
+        // v16r31 (2026-09-03): record which wire protocol (h2 vs h3) every
+        // polish request actually rode, and whether it failed. Hypothesis
+        // under test: the 6 polish failures this week ("connection lost" /
+        // "timed out") are the 8/13 Alt-Svc→HTTP/3 UDP-blackhole again —
+        // the v16r27 launch purge was observed being re-learned within
+        // 10s of launch. This log is the proof or the alibi.
+        let transportProbe = PolishTransportProbe()
+        let transportStartedAt = Date()
+        let responseData: Data
+        let response: URLResponse
+        do {
+            (responseData, response) = try await URLSession.shared.data(for: request, delegate: transportProbe)
+        } catch {
+            Self.appendPolishTransportLog(
+                probe: transportProbe, startedAt: transportStartedAt,
+                chars: fieldText.count, hasImage: contextImageJPEG != nil,
+                outcome: "FAIL \((error as NSError).localizedDescription.prefix(60))"
+            )
+            throw error
+        }
+        Self.appendPolishTransportLog(
+            probe: transportProbe, startedAt: transportStartedAt,
+            chars: fieldText.count, hasImage: contextImageJPEG != nil,
+            outcome: "ok status=\((response as? HTTPURLResponse)?.statusCode ?? -1)"
+        )
 
         if let httpResponse = response as? HTTPURLResponse, !(200..<300).contains(httpResponse.statusCode) {
             let bodyText = String(data: responseData, encoding: .utf8) ?? "<binary>"
@@ -5793,6 +5817,49 @@ final class CompanionManager: ObservableObject {
     // latency. Goal: see at-a-glance when polish returned identical-
     // to-input text (no-op), when the model leaked a preamble or
     // reasoning, and what the client-side strip did about it.
+
+    // MARK: - v16r31 polish transport probe (h2 vs h3)
+
+    /// Captures URLSession task metrics for one polish request so the
+    /// transport log can say which protocol CFNetwork actually chose.
+    /// `networkProtocolName` is "h3" when the request rode HTTP/3/QUIC,
+    /// "h2" / "http/1.1" otherwise. `reused` tells us whether it was a
+    /// warm connection. Delegate-per-task; no shared state.
+    final class PolishTransportProbe: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        private(set) var protocolName: String = "?"
+        private(set) var connectionReused: Bool?
+        private(set) var remoteAddress: String = "?"
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+            guard let tx = metrics.transactionMetrics.last else { return }
+            protocolName = tx.networkProtocolName ?? "?"
+            connectionReused = tx.isReusedConnection
+            remoteAddress = tx.remoteAddress ?? "?"
+        }
+    }
+
+    private static let polishTransportLogPath = "/tmp/clicky_polish_transport.log"
+
+    private static func appendPolishTransportLog(
+        probe: PolishTransportProbe, startedAt: Date, chars: Int, hasImage: Bool, outcome: String
+    ) {
+        let ms = Int(Date().timeIntervalSince(startedAt) * 1000)
+        let reused = probe.connectionReused.map { $0 ? "reused" : "fresh" } ?? "?"
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(ts)] proto=\(probe.protocolName) conn=\(reused) remote=\(probe.remoteAddress) chars=\(chars) image=\(hasImage) ms=\(ms) \(outcome)\n"
+        polishOutputDiagLogQueue.async {
+            guard let data = line.data(using: .utf8) else { return }
+            let url = URL(fileURLWithPath: polishTransportLogPath)
+            if FileManager.default.fileExists(atPath: polishTransportLogPath),
+               let handle = try? FileHandle(forWritingTo: url) {
+                defer { try? handle.close() }
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+            } else {
+                try? data.write(to: url)
+            }
+        }
+    }
 
     private static let polishOutputDiagLogPath = "/tmp/clicky_polish_output.log"
     private static let polishOutputDiagLogQueue = DispatchQueue(

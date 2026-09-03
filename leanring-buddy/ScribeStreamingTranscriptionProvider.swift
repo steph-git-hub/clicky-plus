@@ -867,8 +867,35 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
                 if !transcriptText.isEmpty {
                     self.finalizedSegments.append(transcriptText)
                 }
+                // v16r31: one line per commit so a session's shape is
+                // reconstructible (how many segments, how long each).
+                ScribeStreamingTranscriptionProvider.appendSessionDiag(
+                    "COMMIT seg#\(self.finalizedSegments.count) len=\(transcriptText.count) "
+                    + "partialWasLen=\(self.activePartialTranscript.count) reconnects=\(self.totalReconnectCount)"
+                )
                 self.activePartialTranscript = ""
             } else {
+                // v16r31 (2026-09-03): drop-fingerprint log. Steph reports
+                // toggle dictations losing a middle chunk, worse after a
+                // long pause. Under manual commit nothing is finalized
+                // until key-release, so if the server ever RESTARTS its
+                // partial (new text that doesn't continue the old one, or
+                // is much shorter), the replaced partial is gone for good.
+                // Log exactly that shape so the claim can be settled from
+                // /tmp/clicky_scribe_session.log instead of memory.
+                let previous = self.activePartialTranscript
+                if previous.count >= 20 {
+                    let prefix = String(previous.prefix(15))
+                    let shrank = transcriptText.count < Int(Double(previous.count) * 0.6)
+                    let restarted = !transcriptText.hasPrefix(prefix)
+                    if shrank || restarted {
+                        ScribeStreamingTranscriptionProvider.appendSessionDiag(
+                            "PARTIAL-\(shrank ? "SHRINK" : "RESTART") prevLen=\(previous.count) newLen=\(transcriptText.count) "
+                            + "committedSegs=\(self.finalizedSegments.count) reconnects=\(self.totalReconnectCount) "
+                            + "PREV=\"\(previous.suffix(60))\" NEW=\"\(transcriptText.prefix(60))\""
+                        )
+                    }
+                }
                 self.activePartialTranscript = transcriptText
             }
 
