@@ -321,7 +321,13 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         // each posted Cmd+V when the clipboard changed → triple paste.
         // Fix: ignore repeats. The publisher fires only on the initial
         // press.
-        if eventType == .keyDown {
+        // v16r33 (2026-09-03): screenshot-and-paste RETIRED at Steph's
+        // request — macOS's own screenshot settings cover the same job,
+        // and this path kept pasting multiple screenshots. With the flag
+        // off, Cmd+Shift+2 is no longer intercepted or consumed: it
+        // passes through to macOS/the front app like any other key.
+        // Code retained; flip to true to resurrect.
+        if Self.screenshotPasteEnabled, eventType == .keyDown {
             let kc = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
             let f = event.flags
             let isAutorepeat = event.getIntegerValueField(.keyboardEventAutorepeat) != 0
@@ -341,7 +347,7 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
         // "2" character. Without this, a TextEdit / Slack input that has
         // focus would receive "2" between when screencapture exits and
         // when we post Cmd+V.
-        if eventType == .keyUp {
+        if Self.screenshotPasteEnabled, eventType == .keyUp {
             let kc = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
             let f = event.flags
             if kc == Self.screenshotKeyCode2
@@ -763,6 +769,9 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
     /// trigger native macOS screenshot flows on a standard ANSI/ISO layout:
     /// 3 → full screen, 4 → selection (and spacebar window mode), 5 → UI.
     private static let screenshotKeyCode2: UInt16 = 19   // v15p4p: Clicky+ screenshot-and-paste
+    /// v16r33 (2026-09-03): screenshot-and-paste retired (see keyDown
+    /// handler). false = Cmd+Shift+2 is not intercepted at all.
+    static let screenshotPasteEnabled = false
     private static let screenshotKeyCode3: UInt16 = 20
     private static let screenshotKeyCode4: UInt16 = 21
     private static let screenshotKeyCode5: UInt16 = 23
