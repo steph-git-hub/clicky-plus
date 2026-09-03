@@ -426,7 +426,7 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
     }
 
     func open() async throws {
-        let websocketURL = try Self.makeWebsocketURL(token: token)
+        let websocketURL = try Self.makeWebsocketURL(token: token, keyterms: keyterms)
         // Auth is carried in the `token` query param — no header needed.
 
         let channel = makeChannel(websocketURL)
@@ -698,7 +698,7 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
     /// Does NOT touch readyContinuation — that belongs to the original
     /// open() and resolved long ago.
     private func reopenSocket(token freshToken: String) async throws {
-        let websocketURL = try Self.makeWebsocketURL(token: freshToken)
+        let websocketURL = try Self.makeWebsocketURL(token: freshToken, keyterms: keyterms)
         let replacement = makeChannel(websocketURL)
 
         // The token fetch above is a network round-trip. The user may have
@@ -1036,19 +1036,45 @@ final class ScribeStreamingTranscriptionSession: NSObject, BuddyStreamingTranscr
         }
     }
 
-    private static func makeWebsocketURL(token: String) throws -> URL {
+    /// v16r30 (2026-09-03): Scribe v2 Realtime `keyterms` — max 50 terms,
+    /// each ≤20 chars, +20% on Scribe's per-minute rate (~$0.0047 →
+    /// ~$0.0056/min). Wired after the 2026-09-03 Scribe-vs-Parakeet
+    /// bake-off: Scribe missed "Siren's Cove"→"Simon's Cove", "Nerisa"→
+    /// "Nerissa", "Love in Bloom"→"Love & Bloom" with no keyterms. The
+    /// shared list arrives priority-ordered (override + collections first,
+    /// hardcoded tool names last) so truncation drops the terms Scribe
+    /// already gets right natively. Over-length terms are skipped, not
+    /// clipped — a clipped term would bias toward a misspelling.
+    static let scribeKeytermLimit = 50
+    static let scribeKeytermMaxChars = 20
+
+    static func scribeKeyterms(from keyterms: [String]) -> [String] {
+        var out: [String] = []
+        for term in keyterms where term.count <= scribeKeytermMaxChars {
+            out.append(term)
+            if out.count == scribeKeytermLimit { break }
+        }
+        return out
+    }
+
+    private static func makeWebsocketURL(token: String, keyterms: [String]) throws -> URL {
         guard var components = URLComponents(string: websocketBaseURLString) else {
             throw ScribeStreamingTranscriptionProviderError(message: "Scribe websocket URL is invalid.")
         }
-        components.queryItems = [
+        var items = [
             URLQueryItem(name: "model_id", value: "scribe_v2_realtime"),
             URLQueryItem(name: "token", value: token),
             URLQueryItem(name: "commit_strategy", value: "manual"),
             URLQueryItem(name: "include_timestamps", value: "false"),
-            // keyterms intentionally omitted in v1 (20% cost premium +
-            // 20-char cap); downstream correctNames() handles proper
-            // nouns. Revisit if the bake-off shows Scribe needs them.
         ]
+        let selected = scribeKeyterms(from: keyterms)
+        for term in selected {
+            items.append(URLQueryItem(name: "keyterms", value: term))
+        }
+        if !selected.isEmpty {
+            ScribeStreamingTranscriptionProvider.appendSessionDiag("keyterms: sent \(selected.count) of \(keyterms.count) (cap \(scribeKeytermLimit), ≤\(scribeKeytermMaxChars) chars)")
+        }
+        components.queryItems = items
         guard let url = components.url else {
             throw ScribeStreamingTranscriptionProviderError(message: "Scribe websocket URL could not be created.")
         }

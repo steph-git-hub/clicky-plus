@@ -1748,11 +1748,44 @@ final class BuddyDictationManager: NSObject, ObservableObject {
         return extractedTerms
     }
 
+    /// v16r30 (2026-09-03): collection names from the SKU master. The
+    /// Scribe-vs-Parakeet bake-off showed BOTH engines miss collection
+    /// names ("Love in Bloom"→"Love & Bloom", "Siren's Cove"→"Simon's
+    /// Cove") while codes/people were engine-specific. Distinct `parent`
+    /// prefixes (before " - ") of Active rows, so "Glam Icons 2.0 - 4pk"
+    /// yields "Glam Icons 2.0". Missing/unreadable file → empty list.
+    private static let skuMasterPath =
+        NSString("~/clicky-plus/data/sku-master.json").expandingTildeInPath
+
+    private func loadCollectionKeyterms() -> [String] {
+        guard let data = FileManager.default.contents(atPath: Self.skuMasterPath),
+              let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        var seen = Set<String>()
+        var names: [String] = []
+        for row in rows {
+            guard (row["active"] as? String) == "Active",
+                  let parent = row["parent"] as? String else { continue }
+            let name = parent.components(separatedBy: " - ").first?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard name.count >= 4, !seen.contains(name.lowercased()) else { continue }
+            seen.insert(name.lowercased())
+            names.append(name)
+        }
+        return names
+    }
+
     private func buildTranscriptionKeyterms() -> [String] {
         let baseKeyterms = Self.baseTranscriptionKeyterms
         let overrideKeyterms = loadOverrideKeyterms()
+        let collectionKeyterms = loadCollectionKeyterms()
 
-        let combinedKeyterms = baseKeyterms + overrideKeyterms + contextualKeyterms
+        // Order = priority. Scribe v2 Realtime caps keyterms at 50 (see
+        // ScribeStreamingTranscriptionProvider.scribeKeyterms), so the
+        // curated override list (observed mishearings) and collection
+        // names go first; the hardcoded tool/brand base list — which
+        // Scribe already gets right natively — goes last and is what
+        // gets truncated. Parakeet ignores order and takes everything.
+        let combinedKeyterms = overrideKeyterms + collectionKeyterms + contextualKeyterms + baseKeyterms
         var uniqueNormalizedKeyterms = Set<String>()
         var orderedKeyterms: [String] = []
 

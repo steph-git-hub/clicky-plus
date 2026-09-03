@@ -407,6 +407,14 @@ final class ParakeetStreamingTranscriptionSession: BuddyStreamingTranscriptionSe
             ("grock", "Grok"),
             ("Grawk", "Grok"),
             ("grawk", "Grok"),
+            // v16r30 (2026-09-03): Parakeet hears "GrokBot" as "graphbot"
+            // (observed in /tmp/clicky_vtt_output.log, Steph flagged it).
+            // Safe — "graphbot" isn't a word Steph dictates.
+            ("Graphbot", "GrokBot"),
+            ("graphbot", "GrokBot"),
+            ("Graph bot", "GrokBot"),
+            ("graph bot", "GrokBot"),
+            ("Grokbot", "GrokBot"),
             // v15p4dz (2026-06-03): Steph says "D to C" / "D two C"
             // (direct-to-consumer) and wants it written DTC, not "D to C"
             // or "D2C". Cover the connector + capitalization variants the
