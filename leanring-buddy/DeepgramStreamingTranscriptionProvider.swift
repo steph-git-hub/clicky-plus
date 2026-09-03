@@ -496,9 +496,14 @@ private final class DeepgramStreamingTranscriptionSession: NSObject, BuddyStream
         // Deepgram Nova-3 supports keyterm prompting. Send each
         // keyterm as its own query item — multiple `keyterm=` params
         // accumulate server-side.
-        let normalizedKeyterms = keyterms
+        // v16r32 (2026-09-03): defensive cap at 100 after the shared list
+        // grew to 152 and AssemblyAI hard-rejected it. Deepgram's own
+        // keyterm ceiling is NOT verified here — this just keeps the
+        // fallback engine's URL bounded. List is priority-ordered.
+        let normalizedKeyterms = Array(keyterms
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+            .prefix(100))
         for term in normalizedKeyterms {
             queryItems.append(URLQueryItem(name: "keyterm", value: term))
         }

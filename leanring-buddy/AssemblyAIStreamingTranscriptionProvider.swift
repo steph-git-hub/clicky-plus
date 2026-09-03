@@ -736,9 +736,17 @@ private final class AssemblyAIStreamingTranscriptionSession: NSObject, BuddyStre
             URLQueryItem(name: "min_turn_silence", value: "25")
         ]
 
-        let normalizedKeyterms = keyterms
+        // v16r32 (2026-09-03): AssemblyAI rejects the whole session when
+        // keyterms_prompt exceeds 100 items ("User Input Validation
+        // Error: Max 100 items", error_code 3006). v16r30 grew the shared
+        // list to 152 (collection names) and every polish-modifier
+        // capture — which still runs on this provider via the factory
+        // default — died silently: halo appeared, session failed, nothing
+        // heard. The shared list is priority-ordered, so keep the head.
+        let normalizedKeyterms = Array(keyterms
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+            .prefix(100))
 
         if !normalizedKeyterms.isEmpty,
            let keytermsData = try? JSONSerialization.data(withJSONObject: normalizedKeyterms),
