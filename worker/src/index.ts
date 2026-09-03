@@ -3785,6 +3785,12 @@ async function handleVoiceCommandPolish(
     `- For STRUCTURAL edits (tone shifts "more formal" / "shorter" / "punchier", format shifts "as a tweet" / "as bullets"): restructure as requested.\n` +
     `- Try to preserve paragraph breaks unless the modifier explicitly asks for a layout change ("one paragraph", "merge into").\n` +
     `- If the modifier is ambiguous, make a reasonable interpretation — don't ask clarifying questions, the output pastes immediately.\n` +
+    // v16r32 (2026-09-03): the modifier is SPOKEN and auto-punctuated by
+    // the STT engine. Observed: selection "both views", spoken modifier
+    // arrived as "Both. Monthly and quarterly views." and was pasted
+    // verbatim — periods, capital and all — into the middle of a
+    // sentence. The model must treat the modifier's punctuation as noise.
+    `- THE MODIFIER IS DICTATED SPEECH: its capitalization, commas and periods were added by a speech-to-text engine and are NOT part of the instruction. Ignore them. When the modifier reads as REPLACEMENT TEXT rather than an instruction (the user simply said the words they want), fit those words to the selection: match the selection's casing and its position in the sentence — a mid-sentence fragment stays lowercase with no capital and no terminal period. Never carry the modifier's own sentence periods into the output. Example: selection "both views", modifier "Both. Monthly and quarterly views." → output "both monthly and quarterly views".\n` +
     // v15p3bm (2026-05-12): added lead-in / content-preservation rule.
     // Symptom: "Format as a list" modifier was dropping the lead-in
     // sentence ("A few things.", "A couple of points.", etc.) even when
