@@ -783,9 +783,17 @@ final class GlobalPushToTalkShortcutMonitor: ObservableObject {
             let keyCode = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
             let flags = event.flags
             let hasCmdShift = flags.contains(.maskCommand) && flags.contains(.maskShift)
+            // v16r34 (2026-09-03): with Clicky's own Cmd+Shift+2 retired,
+            // Steph bound that chord to a macOS screenshot in System
+            // Settings. The overlay is sharingType=.none, so if it isn't
+            // hidden the window picker lands on it and macOS reports
+            // "Unable to capture window image" (observed 15:35). Treat
+            // "2" as a native screenshot key whenever we're not the one
+            // handling it.
             let isScreenshotKey = keyCode == Self.screenshotKeyCode3
                 || keyCode == Self.screenshotKeyCode4
                 || keyCode == Self.screenshotKeyCode5
+                || (!Self.screenshotPasteEnabled && keyCode == Self.screenshotKeyCode2)
             if isScreenshotKey && hasCmdShift && !isNativeScreenshotSessionActive {
                 beginNativeScreenshotSession()
                 return
